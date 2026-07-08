@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>bxi_hardware</name>
+  <version>0.1.0</version>
+  <description>BXI モーター ros2_control ハードウェアIF（MIT制御 / SocketCAN）</description>
+  <maintainer email="hiratsuka31@gmail.com">mitz</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>hardware_interface</depend>
+  <depend>pluginlib</depend>
+  <depend>rclcpp</depend>
+  <depend>rclcpp_lifecycle</depend>
+  <depend>yaml-cpp</depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_cmake_gtest</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+    <hardware_interface plugin="${prefix}/bxi_hardware.xml"/>
+  </export>
+</package>

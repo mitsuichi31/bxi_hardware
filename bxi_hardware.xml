@@ -1,0 +1,11 @@
+<library path="bxi_hardware">
+  <class
+    name="bxi_hardware/BxiSystemInterface"
+    type="bxi_hardware::BxiSystemInterface"
+    base_class_type="hardware_interface::SystemInterface">
+    <description>
+      BXI モーター用 ros2_control System ハードウェアインターフェース。
+      BXI MIT制御モーターを SocketCAN 経由で駆動する。
+    </description>
+  </class>
+</library>
