@@ -18,7 +18,10 @@ jobs:
       - name: Build Dev Container image
         run: docker build -t bxi-hardware-ci:jazzy -f .devcontainer/Dockerfile .devcontainer
       - name: Load host vcan kernel module
-        run: sudo modprobe vcan
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y "linux-modules-extra-$(uname -r)"
+          sudo modprobe vcan
       - name: Build and test protocol, configuration and vcan lifecycle
         run: |
           docker run --rm --cap-add NET_ADMIN \
