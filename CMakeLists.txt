@@ -16,6 +16,7 @@ find_package(rclcpp_lifecycle REQUIRED)
 find_package(yaml-cpp REQUIRED)
 
 add_library(${PROJECT_NAME} SHARED
+  src/mit_protocol.cpp
   src/socketcan_bus.cpp
   src/bxi_actuator.cpp
   src/bxi_system_interface.cpp
@@ -34,10 +35,27 @@ target_link_libraries(${PROJECT_NAME} yaml-cpp)
 
 pluginlib_export_plugin_description_file(hardware_interface bxi_hardware.xml)
 
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  find_package(ament_cmake_pytest REQUIRED)
+  ament_add_gtest(test_mit_protocol test/test_mit_protocol.cpp)
+  target_link_libraries(test_mit_protocol ${PROJECT_NAME})
+  set_target_properties(test_mit_protocol PROPERTIES BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}")
+  ament_add_gtest(test_bxi_actuator test/test_bxi_actuator.cpp)
+  target_link_libraries(test_bxi_actuator ${PROJECT_NAME})
+  set_target_properties(test_bxi_actuator PROPERTIES BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}")
+  ament_add_gtest(test_vcan_lifecycle test/test_vcan_lifecycle.cpp)
+  target_link_libraries(test_vcan_lifecycle ${PROJECT_NAME})
+  set_target_properties(test_vcan_lifecycle PROPERTIES BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}")
+  ament_add_pytest_test(test_validate_config test/test_validate_config.py)
+endif()
+
 install(
   DIRECTORY include/
   DESTINATION include
 )
+install(DIRECTORY config/ DESTINATION share/${PROJECT_NAME}/config)
+install(PROGRAMS scripts/validate_config.py DESTINATION lib/${PROJECT_NAME})
 install(
   TARGETS ${PROJECT_NAME}
   EXPORT export_${PROJECT_NAME}

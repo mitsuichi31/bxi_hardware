@@ -38,6 +38,7 @@ struct JointRuntime
   std::string motor_type;
   std::unique_ptr<ActuatorDriver> actuator;
   bool overheated = false;
+  bool communication_fault = false;
 };
 
 class BxiSystemInterface : public hardware_interface::SystemInterface
@@ -80,6 +81,7 @@ private:
   int can_hz_ = 200;  // 初期 200Hz、YAMLで上書き可
   int main_can_id_ = 254;
   int control_timeout_ms_ = 3;
+  uint32_t maximum_consecutive_timeouts_ = 3;
 
   std::mutex data_mutex_;
   std::vector<double> tgt_pos_, tgt_vel_, tgt_kp_, tgt_kd_, tgt_eff_;
@@ -88,6 +90,7 @@ private:
   std::vector<std::thread> workers_;
   std::map<std::string, std::vector<size_t>> live_joints_;
   std::atomic<bool> running_{false};
+  std::atomic<bool> safe_stopped_{false};
 };
 
 }  // namespace bxi_hardware

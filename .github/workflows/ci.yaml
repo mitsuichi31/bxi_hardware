@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  protocol-and-vcan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Dev Container image
+        run: docker build -t bxi-hardware-ci:jazzy -f .devcontainer/Dockerfile .devcontainer
+      - name: Load host vcan kernel module
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y "linux-modules-extra-$(uname -r)"
+          sudo modprobe vcan
+      - name: Build and test protocol, configuration and vcan lifecycle
+        run: |
+          docker run --rm --cap-add NET_ADMIN \
+            --volume "$GITHUB_WORKSPACE:/workspace" --workdir /workspace \
+            bxi-hardware-ci:jazzy bash -lc '
+              set -eo pipefail
+              source /opt/ros/jazzy/setup.bash
+              ip link add dev vcan0 type vcan
+              ip link set up vcan0
+              export BXI_VCAN_IFACE=vcan0
+              python3 scripts/validate_config.py test/config/valid.yaml
+              colcon --log-base /tmp/log build \
+                --build-base /tmp/build --install-base /tmp/install
+              source /tmp/install/setup.bash
+              colcon --log-base /tmp/test-log test \
+                --build-base /tmp/build --install-base /tmp/install
+              colcon --log-base /tmp/result-log test-result \
+                --test-result-base /tmp/build --verbose
+            '
