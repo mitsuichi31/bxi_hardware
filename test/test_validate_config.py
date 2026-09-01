@@ -41,3 +41,13 @@ joints:
     assert any("unknown or inactive bus" in error for error in errors)
     assert any("lower must" in error for error in errors)
     assert any("missing motor spec" in error for error in errors)
+
+
+def test_rejects_invalid_motor_direction(tmp_path):
+    errors = run(tmp_path / "invalid_direction.yaml", tmp_path, """
+active_can_buses: [can0]
+defaults: {control_timeout_ms: 3, maximum_consecutive_timeouts: 3, can_hz: 200}
+joints:
+  a: {enabled: true, can_bus: can0, can_id: 1, motor_dir: 0, motor_type: MOTOR_70, lower: -1, upper: 1}
+""")
+    assert any("not one of [-1, 1]" in error for error in errors)
