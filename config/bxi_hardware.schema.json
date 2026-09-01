@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "BXI machine-independent hardware configuration",
+  "type": "object",
+  "required": ["active_can_buses", "defaults", "joints"],
+  "additionalProperties": false,
+  "properties": {
+    "active_can_buses": {
+      "type": "array", "minItems": 1, "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "defaults": {
+      "type": "object",
+      "required": ["control_timeout_ms", "maximum_consecutive_timeouts", "can_hz"],
+      "additionalProperties": true,
+      "properties": {
+        "control_timeout_ms": {"type": "integer", "minimum": 1},
+        "maximum_consecutive_timeouts": {"type": "integer", "minimum": 1},
+        "can_hz": {"type": "integer", "minimum": 1}
+      }
+    },
+    "joints": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {"$ref": "#/$defs/joint"}
+    }
+  },
+  "$defs": {
+    "joint": {
+      "type": "object",
+      "required": ["enabled"],
+      "additionalProperties": true,
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "can_bus": {"type": "string"},
+        "can_id": {"type": "integer", "minimum": 1, "maximum": 2031},
+        "motor_dir": {"type": "integer", "enum": [-1, 1]},
+        "motor_type": {"type": "string", "minLength": 1},
+        "lower": {"type": "number"},
+        "upper": {"type": "number"},
+        "default_kp": {"type": "number", "minimum": 0},
+        "default_kd": {"type": "number", "minimum": 0}
+      }
+    }
+  }
+}

@@ -3,6 +3,8 @@
 #ifndef BXI_HARDWARE__ACTUATOR__ACTUATOR_DRIVER_HPP_
 #define BXI_HARDWARE__ACTUATOR__ACTUATOR_DRIVER_HPP_
 
+#include <cstdint>
+
 namespace bxi_hardware
 {
 
@@ -12,6 +14,8 @@ struct ActuatorFeedback
   double velocity = 0.0;     // [rad/s]
   double effort = 0.0;       // [Nm]
   double temperature = 0.0;  // [degC]
+  double motor_temperature = 0.0;  // [degC]
+  uint32_t consecutive_timeouts = 0;
   bool valid = false;
 };
 

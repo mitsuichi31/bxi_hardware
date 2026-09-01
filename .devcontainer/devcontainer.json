@@ -1,0 +1,8 @@
+{
+  "name": "bxi_hardware",
+  "build": {"dockerfile": "Dockerfile"},
+  "workspaceFolder": "/workspace",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind",
+  "runArgs": ["--cap-add=NET_ADMIN"],
+  "postCreateCommand": "bash -lc 'source /opt/ros/jazzy/setup.bash && colcon build --symlink-install'"
+}

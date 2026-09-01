@@ -1,0 +1,22 @@
+active_can_buses: [vcan0]
+defaults:
+  control_timeout_ms: 3
+  maximum_consecutive_timeouts: 3
+  can_hz: 200
+joints:
+  joint1:
+    enabled: true
+    can_bus: vcan0
+    can_id: 1
+    motor_dir: 1
+    motor_type: MOTOR_70
+    lower: -1.0
+    upper: 1.0
+  joint2:
+    enabled: true
+    can_bus: vcan0
+    can_id: 2
+    motor_dir: -1
+    motor_type: MOTOR_50_L
+    lower: -2.0
+    upper: 2.0

@@ -1,12 +1,11 @@
-// mevius2_hardware/RobstrideSystemInterface を雛形に BXI 用に改修。
-// Phase 0: 全関節 enabled:false のため、on_activate は CAN を開かず即 SUCCESS を返す。
-// Phase 2: BXI プロトコル仕様確認後に bxi_actuator.cpp の NOOP を実装に置き換える。
+// mevius2_hardware/RobstrideSystemInterface を雛形に BXI MIT protocol用へ改修。
 #include "bxi_hardware/bxi_system_interface.hpp"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <limits>
+#include <set>
 
 #include <yaml-cpp/yaml.h>
 
@@ -98,7 +97,21 @@ bool BxiSystemInterface::parseConfig()
     auto d = root["defaults"];
     if (d["main_can_id"]) main_can_id_ = d["main_can_id"].as<int>();
     if (d["control_timeout_ms"]) control_timeout_ms_ = d["control_timeout_ms"].as<int>();
+    if (d["maximum_consecutive_timeouts"]) {
+      maximum_consecutive_timeouts_ = d["maximum_consecutive_timeouts"].as<uint32_t>();
+    }
     if (d["can_hz"]) can_hz_ = d["can_hz"].as<int>();
+  }
+  if (active_buses_.empty() || control_timeout_ms_ <= 0 ||
+    maximum_consecutive_timeouts_ == 0 || can_hz_ <= 0)
+  {
+    RCLCPP_ERROR(logger(), "defaults/active_can_buses の値が不正です");
+    return false;
+  }
+  const std::set<std::string> active_bus_set(active_buses_.begin(), active_buses_.end());
+  if (active_bus_set.size() != active_buses_.size()) {
+    RCLCPP_ERROR(logger(), "active_can_buses に重複があります");
+    return false;
   }
 
   YAML::Node jnodes = root["joints"];
@@ -107,6 +120,7 @@ bool BxiSystemInterface::parseConfig()
     return false;
   }
 
+  std::set<std::pair<std::string, int>> bus_can_ids;
   for (size_t i = 0; i < n_joints_; ++i) {
     const std::string & name = info_.joints[i].name;
     JointRuntime & jr = joints_[i];
@@ -130,11 +144,35 @@ bool BxiSystemInterface::parseConfig()
     jr.lower = jn["lower"] ? jn["lower"].as<double>() : -1.0e9;
     jr.upper = jn["upper"] ? jn["upper"].as<double>() : 1.0e9;
     jr.motor_type = jn["motor_type"] ? jn["motor_type"].as<std::string>() : "TBD";
+    if (!jr.enabled) {
+      continue;
+    }
+    if (active_bus_set.count(jr.can_bus) == 0) {
+      RCLCPP_ERROR(logger(), "joint '%s': 未知またはinactiveなCAN bus '%s'", name.c_str(),
+        jr.can_bus.c_str());
+      return false;
+    }
+    if (jr.can_id <= 0 || jr.can_id > 0x7EF || !bus_can_ids.emplace(jr.can_bus, jr.can_id).second) {
+      RCLCPP_ERROR(logger(), "joint '%s': CAN IDが範囲外またはbus内で重複", name.c_str());
+      return false;
+    }
+    if (jr.motor_dir != -1 && jr.motor_dir != 1) {
+      RCLCPP_ERROR(logger(), "joint '%s': motor_dirは-1または1が必要", name.c_str());
+      return false;
+    }
+    if (!std::isfinite(jr.lower) || !std::isfinite(jr.upper) || jr.lower >= jr.upper) {
+      RCLCPP_ERROR(logger(), "joint '%s': lower/upper limitが不正", name.c_str());
+      return false;
+    }
+    if (jr.motor_type.empty() || jr.motor_type == "TBD") {
+      RCLCPP_ERROR(logger(), "joint '%s': motor_type specが未確定", name.c_str());
+      return false;
+    }
   }
   return true;
 }
 
-// Phase 2 で BXI 機種 spec yaml から物理範囲を読み込む。
+// 実プロトコル実装時にBXI機種spec yamlから物理範囲を読み込む。
 bool BxiSystemInterface::loadSpec(const std::string & motor_type)
 {
   if (specs_.count(motor_type)) {
@@ -160,6 +198,16 @@ bool BxiSystemInterface::loadSpec(const std::string & motor_type)
     s.t_max = n["t_max"].as<double>();
   } catch (const std::exception & e) {
     RCLCPP_ERROR(logger(), "機種spec '%s' のキー不足: %s", path.c_str(), e.what());
+    return false;
+  }
+  std::string reason;
+  protocol::MitLimits limits;
+  limits.p_min = s.p_min; limits.p_max = s.p_max;
+  limits.v_min = s.v_min; limits.v_max = s.v_max;
+  limits.kp_max = s.kp_max; limits.kd_max = s.kd_max;
+  limits.torque_min = s.t_min; limits.torque_max = s.t_max;
+  if (!protocol::validateLimits(limits, &reason)) {
+    RCLCPP_ERROR(logger(), "機種spec '%s' のrange不正: %s", path.c_str(), reason.c_str());
     return false;
   }
   specs_[motor_type] = s;
@@ -217,7 +265,7 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_activate(
   }
 
   if (bus_joints.empty()) {
-    // Phase 0: 全関節 enabled:false なので CAN を開かず成功を返す
+    // 全関節disabledのprofileは、実機I/Oを行わない明示的な構成として許可する。
     RCLCPP_WARN(logger(),
                 "有効な関節がありません（bxi_hardware.yaml の enabled を確認）。"
                 "HW無しのインターフェースのみで起動します。");
@@ -225,7 +273,7 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_activate(
     return hardware_interface::CallbackReturn::SUCCESS;
   }
 
-  // Phase 2 以降: 有効な関節が存在する場合の処理
+  safe_stopped_ = false;
   for (auto & [bus_name, indices] : bus_joints) {
     auto bus = std::make_shared<SocketCanBus>();
     if (!bus->open(bus_name)) {
@@ -248,7 +296,7 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_activate(
         bus.get(), joints_[i].can_id, joints_[i].motor_dir,
         joints_[i].offset_angle, joints_[i].lower, joints_[i].upper,
         joints_[i].default_kp, joints_[i].default_kd,
-        specs_[joints_[i].motor_type]);
+        specs_[joints_[i].motor_type], control_timeout_ms_, maximum_consecutive_timeouts_);
 
       ActuatorFeedback fb;
       for (int attempt = 0; attempt < kEnableRetries; ++attempt) {
@@ -382,7 +430,15 @@ void BxiSystemInterface::workerLoop(std::string bus_name, std::vector<size_t> in
                        bus_name.c_str(), joints_[i].name.c_str(), fb.temperature);
           joints_[i].actuator->disable();
           joints_[i].overheated = true;
+          safe_stopped_ = true;
         }
+      } else if (auto * actuator = dynamic_cast<BxiActuatorDriver *>(joints_[i].actuator.get());
+        actuator != nullptr && actuator->state() == ActuatorState::kSafeStopped)
+      {
+        joints_[i].communication_fault = true;
+        safe_stopped_ = true;
+        RCLCPP_ERROR(logger(), "[%s] %s communication timeout; commands stopped",
+          bus_name.c_str(), joints_[i].name.c_str());
       }
     }
 
@@ -412,12 +468,16 @@ hardware_interface::return_type BxiSystemInterface::read(
     st_eff_[i] = fb_eff_[i];
     st_temp_[i] = fb_temp_[i];
   }
-  return hardware_interface::return_type::OK;
+  return safe_stopped_ ? hardware_interface::return_type::ERROR :
+         hardware_interface::return_type::OK;
 }
 
 hardware_interface::return_type BxiSystemInterface::write(
   const rclcpp::Time & /*time*/, const rclcpp::Duration & /*period*/)
 {
+  if (safe_stopped_) {
+    return hardware_interface::return_type::ERROR;
+  }
   std::lock_guard<std::mutex> lk(data_mutex_);
   for (size_t i = 0; i < n_joints_; ++i) {
     if (!joints_[i].actuator) {

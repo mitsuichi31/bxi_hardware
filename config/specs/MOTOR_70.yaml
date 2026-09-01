@@ -1,0 +1,8 @@
+p_min: -12.5
+p_max: 12.5
+v_min: -45.0
+v_max: 45.0
+kp_max: 500.0
+kd_max: 5.0
+t_min: -80.0
+t_max: 80.0
