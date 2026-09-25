@@ -2,7 +2,8 @@
 """joint1 の目標位置を少しずつ動かす（1軸の実機試験用）。
 
 /joint_states で今の位置を読み、目標位置を --speed [rad/s] で目標まで動かしながら
-/joint1_command/commands（data = [position, kp, kd]）を送る。
+/joint1_command/commands（data = [position, velocity, kp, kd, effort]）を送る。
+velocity には目標位置の動く速さ（到達後は 0）を送る。effort（トルクの上乗せ）は常に 0。
 
 次のときは中止し、Kp=0 の指令（その場で力を抜く）を送って終わる:
   - Kp × |目標 − 位置| が --max-torque [N·m] を超えた
@@ -32,7 +33,8 @@ class Ramp(Node):
         self.position = None
         self.stamp = 0.0
         self.pub = self.create_publisher(Float64MultiArray, "/joint1_command/commands", 10)
-        self.create_subscription(JointState, "/joint_states", self.on_state, 10)
+        # 深さ 1: 受信キューに古い状態がたまると、spin_once が古い値から読んでしまう
+        self.create_subscription(JointState, "/joint_states", self.on_state, 1)
 
     def on_state(self, msg):
         if self.args.joint in msg.name:
@@ -41,8 +43,8 @@ class Ramp(Node):
                 self.position = value
                 self.stamp = time.monotonic()
 
-    def send(self, position, kp, kd):
-        self.pub.publish(Float64MultiArray(data=[position, kp, kd]))
+    def send(self, position, velocity, kp, kd):
+        self.pub.publish(Float64MultiArray(data=[position, velocity, kp, kd, 0.0]))
 
     def wait_state(self, timeout):
         end = time.monotonic() + timeout
@@ -91,8 +93,10 @@ def main():
             elapsed = time.monotonic() - t0
             if elapsed < ramp_time:
                 p_des = start + direction * args.speed * elapsed
+                v_des = direction * args.speed
             else:
                 p_des = args.target
+                v_des = 0.0
                 if elapsed >= ramp_time + args.hold:
                     break
             rclpy.spin_once(node, timeout_sec=0.0)
@@ -103,7 +107,7 @@ def main():
             if est > args.max_torque:
                 aborted = f"位置の誤差が大きい（Kp×誤差 = {est:.2f} N·m > {args.max_torque}）"
                 break
-            node.send(p_des, args.kp, args.kd)
+            node.send(p_des, v_des, args.kp, args.kd)
             if elapsed - last_print >= 0.2:
                 print(f"  t={elapsed:5.2f}s  目標 {p_des:+.4f}  位置 {node.position:+.4f}")
                 last_print = elapsed
@@ -114,7 +118,7 @@ def main():
     rclpy.spin_once(node, timeout_sec=0.05)
     if aborted or args.release:
         for _ in range(5):
-            node.send(node.position, 0.0, 0.0)
+            node.send(node.position, 0.0, 0.0, 0.0)
             time.sleep(0.02)
     if aborted:
         print(f"\n[中止] {aborted}。Kp=Kd=0 を送って力を抜いた")
