@@ -109,11 +109,6 @@ std::optional<MitFeedback> decodeFeedback(
     setReason(reason, "feedback motor ID does not match the requested actuator");
     return std::nullopt;
   }
-  if (data[6] > 150U || data[7] > 150U) {
-    setReason(reason, "feedback temperature is outside the documented communication range");
-    return std::nullopt;
-  }
-
   const uint32_t p = static_cast<uint32_t>(data[1]) << 8 | data[2];
   const uint32_t v = static_cast<uint32_t>(data[3]) << 4 | (data[4] >> 4);
   const uint32_t torque = static_cast<uint32_t>(data[4] & 0xFU) << 8 | data[5];
@@ -122,9 +117,14 @@ std::optional<MitFeedback> decodeFeedback(
   feedback.position = uintToFloat(p, limits.p_min, limits.p_max, 16);
   feedback.velocity = uintToFloat(v, limits.v_min, limits.v_max, 12);
   feedback.torque = uintToFloat(torque, limits.torque_min, limits.torque_max, 12);
-  feedback.mos_temperature = data[6];
-  feedback.motor_temperature = data[7];
+  feedback.mos_temperature = decodeTemperature(data[6]);
+  feedback.motor_temperature = decodeTemperature(data[7]);
   return feedback;
+}
+
+double decodeTemperature(uint8_t raw)
+{
+  return static_cast<double>(raw) * kTemperatureSpanC / 255.0 + kTemperatureMinC;
 }
 
 std::array<uint8_t, 8> encodeSpecialCommand(SpecialCommand command)

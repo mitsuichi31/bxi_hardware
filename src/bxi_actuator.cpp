@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 
 #include <rclcpp/rclcpp.hpp>
@@ -18,16 +19,18 @@ rclcpp::Logger logger() {return rclcpp::get_logger("BxiActuator");}
 BxiActuatorDriver::BxiActuatorDriver(
   CanBus * bus, int can_id, int motor_dir, double offset_angle, double lower, double upper,
   double default_kp, double default_kd, const BxiSpec & spec, int response_timeout_ms,
-  uint32_t maximum_consecutive_timeouts)
+  uint32_t maximum_consecutive_timeouts, double temperature_sensor_fault_below_c)
 : bus_(bus), can_id_(can_id), motor_dir_(motor_dir), offset_angle_(offset_angle), lower_(lower),
   upper_(upper), default_kp_(default_kp), default_kd_(default_kd), spec_(spec),
   response_timeout_ms_(response_timeout_ms),
-  maximum_consecutive_timeouts_(maximum_consecutive_timeouts)
+  maximum_consecutive_timeouts_(maximum_consecutive_timeouts),
+  temperature_sensor_fault_below_c_(temperature_sensor_fault_below_c)
 {
   std::string reason;
   if (bus_ == nullptr || can_id_ <= 0 || can_id_ > 0x7EF ||
     (motor_dir_ != -1 && motor_dir_ != 1) || response_timeout_ms_ <= 0 ||
     maximum_consecutive_timeouts_ == 0 || lower_ >= upper_ ||
+    !std::isfinite(temperature_sensor_fault_below_c_) ||
     !protocol::validateLimits(limits(), &reason))
   {
     throw std::invalid_argument("invalid BXI actuator configuration: " + reason);
@@ -72,8 +75,7 @@ ActuatorFeedback BxiActuatorDriver::transact(const CanFrame & request)
     result.position = (decoded->position - offset_angle_) * motor_dir_;
     result.velocity = decoded->velocity * motor_dir_;
     result.effort = decoded->torque * motor_dir_;
-    result.temperature = std::max(decoded->mos_temperature, decoded->motor_temperature);
-    result.motor_temperature = decoded->motor_temperature;
+    updateTemperature(*decoded, result);
     result.valid = true;
     return result;
   }
@@ -87,6 +89,35 @@ ActuatorFeedback BxiActuatorDriver::transact(const CanFrame & request)
       consecutive_timeouts_);
   }
   return result;
+}
+
+void BxiActuatorDriver::updateTemperature(
+  const protocol::MitFeedback & decoded, ActuatorFeedback & result)
+{
+  // Faulted sensors are excluded rather than stopping the actuator; the remaining sensor keeps
+  // driving the over-temperature check. The warning is logged once per fault transition.
+  const auto check = [&](double value, bool & fault, const char * sensor) {
+      const bool now_fault = value < temperature_sensor_fault_below_c_;
+      if (now_fault && !fault) {
+        RCLCPP_WARN(
+          logger(), "motor id=%d %s reads %.1f degC; treating it as a sensor fault and "
+          "excluding it from the temperature check", can_id_, sensor, value);
+      } else if (!now_fault && fault) {
+        RCLCPP_INFO(logger(), "motor id=%d %s recovered (%.1f degC)", can_id_, sensor, value);
+      }
+      fault = now_fault;
+      return now_fault ? std::numeric_limits<double>::quiet_NaN() : value;
+    };
+  const double mos = check(decoded.mos_temperature, mos_sensor_fault_, "NTC1 (byte 6)");
+  const double motor = check(decoded.motor_temperature, motor_sensor_fault_, "NTC2 (byte 7)");
+  if (std::isnan(mos)) {
+    result.temperature = motor;
+  } else if (std::isnan(motor)) {
+    result.temperature = mos;
+  } else {
+    result.temperature = std::max(mos, motor);
+  }
+  result.motor_temperature = motor;
 }
 
 ActuatorFeedback BxiActuatorDriver::sendSpecial(

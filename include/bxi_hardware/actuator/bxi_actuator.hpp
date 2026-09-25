@@ -45,7 +45,12 @@ public:
     double default_kd,
     const BxiSpec & spec,
     int response_timeout_ms = 3,
-    uint32_t maximum_consecutive_timeouts = 3);
+    uint32_t maximum_consecutive_timeouts = 3,
+    double temperature_sensor_fault_below_c = kDefaultTemperatureSensorFaultBelowC);
+
+  // A reading below this is treated as a disconnected or failed NTC (the raw value sits at the
+  // bottom of the -30 degC range). Such a sensor is excluded from the reported temperature.
+  static constexpr double kDefaultTemperatureSensorFaultBelowC = -20.0;
 
   ActuatorFeedback enable() override;
   ActuatorFeedback disable() override;
@@ -60,11 +65,14 @@ public:
 
   ActuatorState state() const {return state_;}
   uint32_t consecutiveTimeouts() const {return consecutive_timeouts_;}
+  bool mosTemperatureSensorFault() const {return mos_sensor_fault_;}
+  bool motorTemperatureSensorFault() const {return motor_sensor_fault_;}
 
 private:
   ActuatorFeedback sendSpecial(protocol::SpecialCommand command, bool enables_motor);
   ActuatorFeedback transact(const CanFrame & request);
   protocol::MitLimits limits() const;
+  void updateTemperature(const protocol::MitFeedback & decoded, ActuatorFeedback & result);
 
   CanBus * bus_;
   int can_id_;
@@ -77,7 +85,10 @@ private:
   BxiSpec spec_;
   int response_timeout_ms_;
   uint32_t maximum_consecutive_timeouts_;
+  double temperature_sensor_fault_below_c_;
   uint32_t consecutive_timeouts_{0};
+  bool mos_sensor_fault_{false};
+  bool motor_sensor_fault_{false};
   ActuatorState state_{ActuatorState::kDisabled};
 };
 

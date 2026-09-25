@@ -101,9 +101,13 @@ bool BxiSystemInterface::parseConfig()
       maximum_consecutive_timeouts_ = d["maximum_consecutive_timeouts"].as<uint32_t>();
     }
     if (d["can_hz"]) can_hz_ = d["can_hz"].as<int>();
+    if (d["temperature_sensor_fault_below_c"]) {
+      temperature_sensor_fault_below_c_ = d["temperature_sensor_fault_below_c"].as<double>();
+    }
   }
   if (active_buses_.empty() || control_timeout_ms_ <= 0 ||
-    maximum_consecutive_timeouts_ == 0 || can_hz_ <= 0)
+    maximum_consecutive_timeouts_ == 0 || can_hz_ <= 0 ||
+    !std::isfinite(temperature_sensor_fault_below_c_))
   {
     RCLCPP_ERROR(logger(), "defaults/active_can_buses の値が不正です");
     return false;
@@ -112,6 +116,32 @@ bool BxiSystemInterface::parseConfig()
   if (active_bus_set.size() != active_buses_.size()) {
     RCLCPP_ERROR(logger(), "active_can_buses に重複があります");
     return false;
+  }
+
+  // Optional per-bus frame format. Buses not listed use classic CAN.
+  for (const auto & bus : active_buses_) {
+    bus_formats_[bus] = CanFrameFormat::kClassic;
+  }
+  if (root["can_frame_format"]) {
+    for (const auto & entry : root["can_frame_format"]) {
+      const auto bus = entry.first.as<std::string>();
+      const auto value = entry.second.as<std::string>();
+      if (active_bus_set.count(bus) == 0) {
+        RCLCPP_ERROR(logger(), "can_frame_format: 未知またはinactiveなCAN bus '%s'", bus.c_str());
+        return false;
+      }
+      if (value == "classic") {
+        bus_formats_[bus] = CanFrameFormat::kClassic;
+      } else if (value == "fd") {
+        bus_formats_[bus] = CanFrameFormat::kFd;
+      } else if (value == "fd_brs") {
+        bus_formats_[bus] = CanFrameFormat::kFdBrs;
+      } else {
+        RCLCPP_ERROR(logger(), "can_frame_format.%s: classic / fd / fd_brs のいずれかが必要 ('%s')",
+          bus.c_str(), value.c_str());
+        return false;
+      }
+    }
   }
 
   YAML::Node jnodes = root["joints"];
@@ -275,7 +305,7 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_activate(
 
   safe_stopped_ = false;
   for (auto & [bus_name, indices] : bus_joints) {
-    auto bus = std::make_shared<SocketCanBus>();
+    auto bus = std::make_shared<SocketCanBus>(bus_formats_[bus_name]);
     if (!bus->open(bus_name)) {
       RCLCPP_ERROR(logger(), "CANオープン失敗: %s", bus_name.c_str());
       stopWorkers();
@@ -296,7 +326,8 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_activate(
         bus.get(), joints_[i].can_id, joints_[i].motor_dir,
         joints_[i].offset_angle, joints_[i].lower, joints_[i].upper,
         joints_[i].default_kp, joints_[i].default_kd,
-        specs_[joints_[i].motor_type], control_timeout_ms_, maximum_consecutive_timeouts_);
+        specs_[joints_[i].motor_type], control_timeout_ms_, maximum_consecutive_timeouts_,
+        temperature_sensor_fault_below_c_);
 
       ActuatorFeedback fb;
       for (int attempt = 0; attempt < kEnableRetries; ++attempt) {

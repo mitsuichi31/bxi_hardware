@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cmath>
 #include <deque>
 #include <limits>
 
@@ -39,17 +40,19 @@ public:
     return true;
   }
 
-  static CanFrame feedbackFrame(uint8_t motor_id)
+  CanFrame feedbackFrame(uint8_t motor_id) const
   {
     CanFrame frame;
     frame.id = protocol::defaultMasterId(motor_id);
     frame.extended = false;
     frame.dlc = 8;
-    frame.data = {{motor_id, 0x7F, 0xFF, 0x7F, 0xF7, 0xFF, 35, 36}};
+    frame.data = {{motor_id, 0x7F, 0xFF, 0x7F, 0xF7, 0xFF, ntc1_raw_, ntc2_raw_}};
     return frame;
   }
 
   bool respond_{true};
+  uint8_t ntc1_raw_{0x55};  // 30 degC
+  uint8_t ntc2_raw_{0x5A};  // about 33.5 degC
   std::vector<CanFrame> sent_;
 
 private:
@@ -79,7 +82,9 @@ TEST(BxiActuator, ReproducesActivateCommandFeedbackDeactivateLifecycle)
   const auto feedback = driver.sendControl(0.2, 0.1, 20.0, 1.0, 0.5);
   EXPECT_TRUE(feedback.valid);
   EXPECT_NEAR(feedback.position, 0.0, 0.001);
-  EXPECT_DOUBLE_EQ(feedback.temperature, 36.0);
+  EXPECT_NEAR(feedback.temperature, 33.53, 0.01);
+  EXPECT_FALSE(driver.mosTemperatureSensorFault());
+  EXPECT_FALSE(driver.motorTemperatureSensorFault());
   EXPECT_TRUE(driver.disable().valid);
   EXPECT_EQ(driver.state(), ActuatorState::kDisabled);
 
@@ -87,6 +92,32 @@ TEST(BxiActuator, ReproducesActivateCommandFeedbackDeactivateLifecycle)
   EXPECT_EQ(bus.sent_[0].data[7], 0xFC);
   EXPECT_EQ(bus.sent_[2].data[7], 0xFD);
   EXPECT_FALSE(bus.sent_[0].extended);
+}
+
+TEST(BxiActuator, ExcludesTemperatureSensorsStuckAtTheBottomOfTheRange)
+{
+  EmulatedBus bus;
+  ASSERT_TRUE(bus.open("emulated0"));
+  auto driver = makeDriver(bus);
+  bus.ntc2_raw_ = 0x02;  // -28.6 degC: the NTC2 FAIL pattern seen on the HIL motor
+  const auto one_fault = driver.enable();
+  ASSERT_TRUE(one_fault.valid);
+  EXPECT_NEAR(one_fault.temperature, 30.0, 1e-9);
+  EXPECT_TRUE(std::isnan(one_fault.motor_temperature));
+  EXPECT_TRUE(driver.motorTemperatureSensorFault());
+  EXPECT_FALSE(driver.mosTemperatureSensorFault());
+
+  bus.ntc1_raw_ = 0x00;
+  const auto both_faults = driver.sendControl(0.0, 0.0, 0.0, 0.0, 0.0);
+  ASSERT_TRUE(both_faults.valid);
+  EXPECT_TRUE(std::isnan(both_faults.temperature));
+  EXPECT_TRUE(driver.mosTemperatureSensorFault());
+
+  bus.ntc1_raw_ = 0x55;
+  bus.ntc2_raw_ = 0x5A;
+  const auto recovered = driver.sendControl(0.0, 0.0, 0.0, 0.0, 0.0);
+  EXPECT_NEAR(recovered.temperature, 33.53, 0.01);
+  EXPECT_FALSE(driver.motorTemperatureSensorFault());
 }
 
 TEST(BxiActuator, SaturatesFiniteRuntimeCommandsBeforePacking)

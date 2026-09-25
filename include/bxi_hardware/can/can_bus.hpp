@@ -16,6 +16,18 @@ struct CanFrame
   bool extended = true;
   uint8_t dlc = 0;
   std::array<uint8_t, 8> data{};
+  // Set on received frames. Outgoing frames use the bus-wide format (see SocketCanBus).
+  bool fd = false;
+  bool brs = false;
+};
+
+// Frame format used for every transmitted frame on a bus. BXI motors reply in the format they
+// received (confirmed on hardware 2026-09-25), so the whole bus uses one format.
+enum class CanFrameFormat
+{
+  kClassic,
+  kFd,       // CAN FD, nominal bit rate for the data phase
+  kFdBrs,    // CAN FD with bit rate switch
 };
 
 class CanBus
