@@ -19,6 +19,9 @@ def validate(config_path: Path, schema_path: Path, spec_dir: Path) -> list[str]:
         return errors
 
     active_buses = set(config["active_can_buses"])
+    for bus in config.get("can_frame_format", {}):
+        if bus not in active_buses:
+            errors.append(f"can_frame_format: unknown or inactive bus {bus!r}")
     used_ids: set[tuple[str, int]] = set()
     for name, joint in config["joints"].items():
         if not joint["enabled"]:

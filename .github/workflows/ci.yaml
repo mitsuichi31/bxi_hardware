@@ -30,8 +30,13 @@ jobs:
               set -eo pipefail
               source /opt/ros/jazzy/setup.bash
               ip link add dev vcan0 type vcan
+              ip link set vcan0 mtu 72
               ip link set up vcan0
+              ip link add dev vcan1 type vcan
+              ip link set vcan1 mtu 16
+              ip link set up vcan1
               export BXI_VCAN_IFACE=vcan0
+              export BXI_VCAN_CLASSIC_IFACE=vcan1
               python3 scripts/validate_config.py test/config/valid.yaml
               colcon --log-base /tmp/log build \
                 --build-base /tmp/build --install-base /tmp/install

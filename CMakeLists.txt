@@ -35,6 +35,10 @@ target_link_libraries(${PROJECT_NAME} yaml-cpp)
 
 pluginlib_export_plugin_description_file(hardware_interface bxi_hardware.xml)
 
+# 実機の前提確認ツール（1軸）
+add_executable(bxi_probe tools/bxi_probe.cpp)
+target_link_libraries(bxi_probe ${PROJECT_NAME})
+
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
   find_package(ament_cmake_pytest REQUIRED)
@@ -56,6 +60,13 @@ install(
 )
 install(DIRECTORY config/ DESTINATION share/${PROJECT_NAME}/config)
 install(PROGRAMS scripts/validate_config.py DESTINATION lib/${PROJECT_NAME})
+# 1軸の実機試験（ベンチ）用の設定・launch・指令スクリプト
+install(DIRECTORY hil/ DESTINATION share/${PROJECT_NAME}/hil
+  PATTERN "*.py" EXCLUDE PATTERN "__pycache__" EXCLUDE)
+install(FILES hil/single_joint/single_joint_hil.launch.py
+  DESTINATION share/${PROJECT_NAME}/hil/single_joint)
+install(PROGRAMS hil/single_joint/ramp_command.py DESTINATION lib/${PROJECT_NAME})
+install(TARGETS bxi_probe DESTINATION lib/${PROJECT_NAME})
 install(
   TARGETS ${PROJECT_NAME}
   EXPORT export_${PROJECT_NAME}

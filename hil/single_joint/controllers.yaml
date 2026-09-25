@@ -1,0 +1,15 @@
+controller_manager:
+  ros__parameters:
+    update_rate: 200
+
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+
+    joint1_command:
+      type: forward_command_controller/MultiInterfaceForwardCommandController
+
+joint1_command:
+  ros__parameters:
+    joint: joint1
+    # /joint1_command/commands（std_msgs/Float64MultiArray）の data = [position, kp, kd]
+    interface_names: [position, kp, kd]

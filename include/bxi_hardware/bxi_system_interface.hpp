@@ -74,6 +74,7 @@ private:
   std::vector<JointRuntime> joints_;
   std::map<std::string, std::shared_ptr<SocketCanBus>> buses_;
   std::vector<std::string> active_buses_;
+  std::map<std::string, CanFrameFormat> bus_formats_;
   std::map<std::string, BxiSpec> specs_;
 
   std::string config_file_;
@@ -82,6 +83,8 @@ private:
   int main_can_id_ = 254;
   int control_timeout_ms_ = 3;
   uint32_t maximum_consecutive_timeouts_ = 3;
+  double temperature_sensor_fault_below_c_ =
+    BxiActuatorDriver::kDefaultTemperatureSensorFaultBelowC;
 
   std::mutex data_mutex_;
   std::vector<double> tgt_pos_, tgt_vel_, tgt_kp_, tgt_kd_, tgt_eff_;

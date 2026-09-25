@@ -14,7 +14,8 @@ namespace bxi_hardware
 class SocketCanBus : public CanBus
 {
 public:
-  SocketCanBus() = default;
+  explicit SocketCanBus(CanFrameFormat format = CanFrameFormat::kClassic)
+  : format_(format) {}
   ~SocketCanBus() override;
 
   bool open(const std::string & ifname) override;
@@ -26,8 +27,10 @@ public:
   void flushRx() override;
 
   const std::string & name() const override { return ifname_; }
+  CanFrameFormat format() const { return format_; }
 
 private:
+  CanFrameFormat format_;
   int fd_ = -1;
   std::string ifname_;
   std::mutex io_mutex_;

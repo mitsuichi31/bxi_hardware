@@ -32,14 +32,20 @@ struct MitCommand
   double torque{0.0};
 };
 
+// Feedback bytes 6 and 7 carry temperatures as raw 8-bit values. HIL on 2026-09-25
+// (BXI7010-19, FW 0.2.2) matched raw * 180 / 255 - 30 against the motor's own NTC1/NTC2
+// readout, so the documented range is -30 to 150 degC.
+inline constexpr double kTemperatureMinC = -30.0;
+inline constexpr double kTemperatureSpanC = 180.0;
+
 struct MitFeedback
 {
   uint8_t motor_id{0};
   double position{0.0};
   double velocity{0.0};
   double torque{0.0};
-  double mos_temperature{0.0};
-  double motor_temperature{0.0};
+  double mos_temperature{0.0};    // byte 6 (NTC1) [degC]
+  double motor_temperature{0.0};  // byte 7 (NTC2) [degC]
 };
 
 enum class SpecialCommand : uint8_t
@@ -64,6 +70,7 @@ std::optional<MitFeedback> decodeFeedback(
   std::optional<uint8_t> expected_motor_id = std::nullopt,
   std::string * reason = nullptr);
 
+double decodeTemperature(uint8_t raw);
 std::array<uint8_t, 8> encodeSpecialCommand(SpecialCommand command);
 uint32_t defaultMasterId(uint32_t motor_can_id);
 
