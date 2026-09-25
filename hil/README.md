@@ -81,6 +81,83 @@ ros2 run bxi_hardware ramp_command.py 0.0 --kp 20 --kd 2 --release   # 戻して
 - 終了は端末1で Ctrl+C。ハードウェアの deactivate で disable（FD）が送られる。
 
 CAN FD で動かすときは、`bxi_hardware.yaml` の `can_frame_format` を `fd` または `fd_brs` にする（can0 が fd on であること）。
+既定の `classic` では、can0 が fd on でも MIT パケットは通常の CAN（8 バイト）で送る。
+
+`joint1_command` の指令は `data = [position, velocity, kp, kd, effort]`（`controllers.yaml` の `interface_names`）。
+velocity は MIT の目標速度で、0 のままだと Kd の項が動きを妨げるため、`ramp_command.py` / `sine_command.py` は軌道の速度を送る。
+effort は MIT のトルク（フィードフォワード）で、`sine_command.py --friction-ff` の摩擦の打ち消しに使う（`ramp_command.py` は常に 0）。
+
+## 2b. SIN 波で動かす（sine_command.py）
+
+手順 2 の launch を起動したまま、端末2で実行する。
+
+```bash
+ros2 run bxi_hardware ramp_command.py 0.0 --kp 20 --kd 1              # 中心（例: 0 rad）へ移動
+ros2 run bxi_hardware sine_command.py --amplitude 0.1 --frequency 0.5 --cycles 5
+ros2 run bxi_hardware sine_command.py --amplitude 0.2 --frequency 1.0 --kp 30 --max-kp 40 --release
+```
+
+- 中心は実行時の位置。振幅は最初と最後の 1 周期（`--ramp-cycles`）で 0 からなめらかに増減する。
+- 実行前に止める条件: 中心 ± 振幅が `--lower` / `--upper`（既定 ±0.5 rad、`bxi_hardware.yaml` と合わせる）をはみ出す、
+  最大速度（振幅 × 2π × 周波数）が `--max-velocity`（既定 2 rad/s）を超える、`--center` が今の位置と違う。
+- 実行中に中止して力を抜く条件: `Kp × 誤差` が `--max-torque`（既定 5 N·m）を超える、`/joint_states` が 0.2 秒以上途切れる、Ctrl+C。
+- 目標・位置・速度・トルクを `/ws/log/sine_<日時>.csv` に保存し、振幅一定の区間の追従誤差、振幅比、位相の遅れを表示する。
+- 表示される位相の遅れには、ROS 内の遅れ（指令 → controller_manager → 状態 → `/joint_states`）が含まれる。
+  mock_components で約 13 ms（200 Hz、1 Hz の SIN 波で 4.5°）。
+- 静止摩擦（約 1 N·m）があるため、`Kp × 振幅` が小さいと、SIN 波の頂点付近で止まったり、動き出しが遅れたりする（stick-slip）。
+  まず Kp 20、振幅 0.1 rad、0.5 Hz 程度から始める。
+  2026-09-25 の実機（Kp 20、振幅 0.1 rad、0.5 Hz、打ち消しなし）では、目標が動いているのに止まっている時間が約 25 %、
+  軸の最大速度は目標の 2 倍以上（0.7 rad/s）で、止まっては急に動く動きになった。
+- 摩擦の打ち消し（Stribeck モデル）: 目標速度 v の向きにトルクを上乗せする。
+  `effort = (Fc + (Fs − Fc) × exp(−|v| / vs)) × tanh(v / v0)`
+  （Fc: 動摩擦 `--friction-ff`、Fs: 静止摩擦 `--friction-static`（省略時 = Fc、一定値の上乗せ）、
+  vs: `--stribeck-velocity` 既定 0.2 rad/s、v0: 向きの切り替え幅 `--friction-velocity` 既定 0.05 rad/s）。
+  実測速度ではなく目標速度を使うので、折り返し点で振動しにくい。上限は `--max-friction-ff`（既定 2 N·m）。
+  大きすぎると、目標を追い越したり、折り返し点で押し戻されたりする。
+  安全チェックは `Kp × 誤差 + |上乗せトルク|` で判定する。
+- Stribeck モデルを使うときは、v0 を 0.02 程度に狭める。既定の 0.05 のままだと、低速で tanh が上乗せを削り、
+  静止摩擦に近い大きさが出ない（Fc 0.6 / Fs 1.0 のとき、目標速度 0.05 rad/s で v0 0.05 なら 0.69、v0 0.02 なら 0.90 N·m）。
+- 集計の「引っかかり」は、目標が動いているのに軸が止まっている時間の割合と軸の最大速度。打ち消しの効果の比較に使う。
+
+```bash
+ros2 run bxi_hardware sine_command.py --amplitude 0.3 --frequency 0.2 --cycles 5                    # 打ち消しなし（比較用）
+ros2 run bxi_hardware sine_command.py --amplitude 0.3 --frequency 0.2 --cycles 5 --friction-ff 0.9  # 一定値
+ros2 run bxi_hardware sine_command.py --amplitude 0.3 --frequency 0.2 --cycles 5 \
+  --friction-ff 0.6 --friction-static 1.0 --friction-velocity 0.02                                   # Stribeck
+```
+
+### SIN 波の結果（2026-09-25、Kp 20 / Kd 1、classic 200 Hz）
+
+| 条件 | 摩擦の打ち消し | 誤差 RMS / 最大 [rad] | 振幅比 | 位相の遅れ | 止まっている時間 |
+|---|---|---|---|---|---|
+| 振幅 0.1 rad、0.5 Hz | なし | 0.037 / 0.068 | 0.69 | 27.6° | 46 % |
+| 〃 | 一定 0.6 N·m | 0.015 / 0.037 | 0.94 | 9.3° | 30 % |
+| 〃 | 一定 0.9 N·m | 0.0075 / 0.020 | 1.00 | -2.8° | 19 % |
+| 振幅 0.3 rad、0.2 Hz | なし | 0.035 / 0.064 | 0.94 | 8.4° | 25 % |
+| 〃 | 一定 0.6 N·m | 0.012 / 0.036 | 0.99 | 2.0° | 17 % |
+| 〃 | 一定 0.9 N·m | 0.0092 / 0.022 | 1.01 | -1.5° | 14 % |
+| 〃（Kp 30） | なし | 0.026 / 0.050 | 0.97 | 6.5° | 19 % |
+| 〃 | Stribeck（Fc 0.6 / Fs 1.0、v0 0.02） | 0.0090 / 0.033 | 1.00 | 1.0° | 15 % |
+| 〃 | Stribeck（Fc 0.8 / Fs 1.0、v0 0.02） | 0.0093 / 0.025 | 1.01 | -0.8° | 15 % |
+| 〃（Kp 40） | Stribeck（Fc 0.8 / Fs 1.0、v0 0.02） | 0.0058 / 0.018 | 1.00 | 0.2° | 10 % |
+
+- 一定 0.9 N·m の上乗せで、追従誤差は 1/3〜1/5、振幅比はほぼ 1 になった。Kp を 30 に上げるより効果が大きい。
+- 打ち消しなしの記録から: 動いている間のトルク（動摩擦）は ＋方向 +0.55 / −方向 −0.60 N·m、
+  止まった状態から動き出す直前のトルク（静止摩擦）は平均 0.96、最大 1.31 N·m。
+- 一定値では、0.9 N·m は動いている間に多すぎ（位相がわずかに進む）、0.6 N·m は動き出しに足りない。
+  残った「止まっている時間」の多くは、折り返し後の低速（目標速度 0.1 rad/s 前後）で起きていた。これが Stribeck モデルを入れた理由。
+- Stribeck（Fc 0.6 / Fs 1.0）では、低速（目標速度 0.04〜0.10 rad/s）で止まっている割合が 55 % → 35 % に減り、
+  位相の進みもなくなった。一方、中速（0.1〜0.3 rad/s）では上乗せが一定 0.9 より小さく、止まっている割合が増えた
+  （0.10〜0.20: 28 % → 37 %）。最大誤差は目標速度が最大の中心通過で出た。
+  打ち消しなしの記録から出した動摩擦 0.6 N·m は、速く滑っている区間を多く含むため小さめの見積もりとみられる。
+- Stribeck（Fc 0.8 / Fs 1.0）は、最大誤差を 0.025 rad に抑えつつ位相の遅れをほぼ 0 にした。ただし RMS（約 0.009 rad）と
+  止まっている時間（14〜15 %）は一定 0.9 N·m と同程度で、上乗せの形の調整による改善はここで頭打ち。
+  軸の最大速度は目標の 2 倍（0.76 rad/s）のままで、止まっては滑る動きが少し残る。次の手は Kp を上げること
+  （止まっている間にたまる誤差を小さくし、滑る幅を縮める）と、減速機のガタ（ENC1 と ENC2 の差 約 0.6°）の影響の確認。
+- Kp を 40 に上げると（Stribeck Fc 0.8 / Fs 1.0 のまま）、RMS 0.0058 rad、最大 0.018 rad（約 1.0°）、止まっている時間 10 % と、
+  すべての指標がこれまでで最もよくなった（打ち消しなし Kp 20 の約 1/6）。軸の最大速度は 0.74 rad/s のままで、
+  止まっては滑る動きは少し残る。安全チェックの値（Kp × 誤差 + 上乗せ）は最大約 1.7 N·m。
+- 現時点の推奨: `--kp 40 --max-kp 40 --friction-ff 0.8 --friction-static 1.0 --friction-velocity 0.02`（Kd 1）。
 
 ## 3. 結果（2026-09-25、BXI7010-19、can0 classic、200 Hz）
 

@@ -52,6 +52,7 @@ if(BUILD_TESTING)
   target_link_libraries(test_vcan_lifecycle ${PROJECT_NAME})
   set_target_properties(test_vcan_lifecycle PROPERTIES BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}")
   ament_add_pytest_test(test_validate_config test/test_validate_config.py)
+  ament_add_pytest_test(test_sine_trajectory test/test_sine_trajectory.py)
 endif()
 
 install(
@@ -65,7 +66,8 @@ install(DIRECTORY hil/ DESTINATION share/${PROJECT_NAME}/hil
   PATTERN "*.py" EXCLUDE PATTERN "__pycache__" EXCLUDE)
 install(FILES hil/single_joint/single_joint_hil.launch.py
   DESTINATION share/${PROJECT_NAME}/hil/single_joint)
-install(PROGRAMS hil/single_joint/ramp_command.py DESTINATION lib/${PROJECT_NAME})
+install(PROGRAMS hil/single_joint/ramp_command.py hil/single_joint/sine_command.py
+  DESTINATION lib/${PROJECT_NAME})
 install(TARGETS bxi_probe DESTINATION lib/${PROJECT_NAME})
 install(
   TARGETS ${PROJECT_NAME}

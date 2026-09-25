@@ -11,5 +11,7 @@ controller_manager:
 joint1_command:
   ros__parameters:
     joint: joint1
-    # /joint1_command/commands（std_msgs/Float64MultiArray）の data = [position, kp, kd]
-    interface_names: [position, kp, kd]
+    # /joint1_command/commands（std_msgs/Float64MultiArray）の data = [position, velocity, kp, kd, effort]
+    # velocity は MIT の目標速度。0 のままだと Kd の項が動きを妨げるので、軌道の速度を送る。
+    # effort は MIT のトルク（フィードフォワード）。摩擦を打ち消すトルクの上乗せに使う。
+    interface_names: [position, velocity, kp, kd, effort]
