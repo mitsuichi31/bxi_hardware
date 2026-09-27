@@ -13,6 +13,8 @@ find_package(hardware_interface REQUIRED)
 find_package(pluginlib REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_lifecycle REQUIRED)
+find_package(sensor_msgs REQUIRED)
+find_package(std_msgs REQUIRED)
 find_package(yaml-cpp REQUIRED)
 
 add_library(${PROJECT_NAME} SHARED
@@ -39,6 +41,9 @@ pluginlib_export_plugin_description_file(hardware_interface bxi_hardware.xml)
 add_executable(bxi_probe tools/bxi_probe.cpp)
 target_link_libraries(bxi_probe ${PROJECT_NAME})
 
+add_executable(sine_command_cpp hil/single_joint/sine_command.cpp)
+ament_target_dependencies(sine_command_cpp rclcpp sensor_msgs std_msgs)
+
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
   find_package(ament_cmake_pytest REQUIRED)
@@ -63,12 +68,12 @@ install(DIRECTORY config/ DESTINATION share/${PROJECT_NAME}/config)
 install(PROGRAMS scripts/validate_config.py DESTINATION lib/${PROJECT_NAME})
 # 1軸の実機試験（ベンチ）用の設定・launch・指令スクリプト
 install(DIRECTORY hil/ DESTINATION share/${PROJECT_NAME}/hil
-  PATTERN "*.py" EXCLUDE PATTERN "__pycache__" EXCLUDE)
+  PATTERN "*.py" EXCLUDE PATTERN "*.cpp" EXCLUDE PATTERN "__pycache__" EXCLUDE)
 install(FILES hil/single_joint/single_joint_hil.launch.py
   DESTINATION share/${PROJECT_NAME}/hil/single_joint)
 install(PROGRAMS hil/single_joint/ramp_command.py hil/single_joint/sine_command.py
   DESTINATION lib/${PROJECT_NAME})
-install(TARGETS bxi_probe DESTINATION lib/${PROJECT_NAME})
+install(TARGETS bxi_probe sine_command_cpp DESTINATION lib/${PROJECT_NAME})
 install(
   TARGETS ${PROJECT_NAME}
   EXPORT export_${PROJECT_NAME}

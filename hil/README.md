@@ -126,6 +126,24 @@ ros2 run bxi_hardware sine_command.py --amplitude 0.3 --frequency 0.2 --cycles 5
   --friction-ff 0.6 --friction-static 1.0 --friction-velocity 0.02                                   # Stribeck
 ```
 
+### C++ 版: 等周期の SIN 波指令
+
+同じ launch を起動した状態で、`colcon build --packages-select bxi_hardware --symlink-install` 後に別の端末から実行する。
+
+```bash
+source /ws/install/setup.bash
+ros2 run bxi_hardware sine_command_cpp --amplitude 0.1 --frequency 0.5 --cycles 5 \
+  --kp 20 --kd 1 --rate 200 --release
+ros2 run bxi_hardware sine_command_cpp --amplitude 0.3 --frequency 0.2 --cycles 5 \
+  --kp 20 --kd 1 --rate 200 --release
+```
+
+既定の中心は開始時の現在位置。目標位置・目標速度は Python 版と同じ立ち上げ／立ち下げ付きの SIN 波で、`/joint1_command/commands` に送る。`--friction-ff` などの摩擦補償オプション、位置・速度・トルクの上限も Python 版に合わせてある。`--help` で引数一覧を確認できる。
+
+送信予定は `steady_clock` の絶対時刻で 5 ms 間隔に置く。処理が遅れて次の予定を過ぎた場合は古い指令を連続送信せず、その周期を飛ばして現時刻の目標を送る。実行後に予定時刻を過ぎた周期数と最大遅れを表示する。実際の指令時刻・状態を `sine_cpp_<日時>.csv` に記録する。CSV の先頭 7 列は Python 版と同じで、末尾の `lateness_ms` は予定時刻からの遅れ。振幅一定区間の RMS 誤差、最大誤差、振幅比、位相遅れも表示する。
+
+状態が 0.2 秒以上届かない、指令の上限を超える、Ctrl+C の場合は Kp=Kd=0 の指令を 5 回送って終了する。通常終了時は中心位置を保持し、`--release` を指定すると力を抜く。C++ と `sleep_until` だけでハードリアルタイムになるわけではない。ROS 2 の配送、controller_manager と CAN の周期も独立しているため、CSV の時刻は CAN バス上の送信時刻を表さない。最初は可動範囲と荷重を確認して小振幅から実行する。
+
 ### SIN 波の結果（2026-09-25、Kp 20 / Kd 1、classic 200 Hz）
 
 | 条件 | 摩擦の打ち消し | 誤差 RMS / 最大 [rad] | 振幅比 | 位相の遅れ | 止まっている時間 |
