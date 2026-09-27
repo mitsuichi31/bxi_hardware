@@ -1,113 +1,71 @@
-# BXI MIT protocol and safety decisions
+# BXI MIT プロトコルと安全上の判断
 
-## Confirmed protocol
+## 仕様書で確認したプロトコル
 
-Source: BXI CAN Communication Guide, section 5.3, archived in
-`minibexkai_docs/reference/bxi/CAN Communication Guide - BXI_Wiki.pdf`.
+出典: `minibexkai_docs/reference/bxi/CAN Communication Guide - BXI_Wiki.pdf` に保存した BXI CAN Communication Guide の 5.3 節。
 
-- Classic CAN uses an 8-byte standard frame addressed to the motor `can_id`.
-- Command fields are big-endian bit streams: position 16 bit; velocity, Kp, Kd and torque 12 bit each.
-- Feedback uses byte 0 motor ID, then position 16 bit, velocity/torque 12 bit, MOS and motor temperatures.
-- Default response ID is `can_id | 0x010`.
-- Enable, disable and save-zero are seven `0xFF` bytes followed by `0xFC`, `0xFD` and `0xFE` respectively.
+- Classic CAN では、モーターの `can_id` 宛てに 8 バイトの標準フレームを送る。
+- 指令フィールドはビッグエンディアンのビット列で、位置が 16 ビット、速度・Kp・Kd・トルクがそれぞれ 12 ビット。
+- フィードバックは先頭バイトがモーター ID で、続いて位置 16 ビット、速度・トルク各 12 ビット、MOS 温度、モーター温度を格納する。
+- デフォルトの応答 ID は `can_id | 0x010`。
+- enable、disable、ゼロ位置保存は、それぞれ 7 個の `0xFF` に `0xFC`、`0xFD`、`0xFE` を続けたフレームを使う。
 
-## Confirmed on hardware (2026-09-25)
+## 実機で確認した事項（2026-09-25）
 
-One BXI7010-19 (FW code 0.2.2 / config 0.2, `can_id` 1, `master_id` 0x11) on PCAN-M.2 `can0`
-via SocketCAN, without bxi_usb2can. Details: `minibexkai_docs/research/20260925_bxi_motor_pcan_socketcan_verification.md`.
+PCAN-M.2 の `can0` から SocketCAN で BXI7010-19 を 1 台確認した。ファームウェアは code 0.2.2 / config 0.2、`can_id` は 1、`master_id` は 0x11。bxi_usb2can は使用していない。詳細は `minibexkai_docs/research/20260925_bxi_motor_pcan_socketcan_verification.md` を参照。
 
-- With `can_id` 1, the observed reply ID was 0x011 and byte 0 was 0x01 (`can_id`, not
-  `master_id`). This observation alone cannot distinguish bitwise OR from addition.
-- One reply per MIT command (148/150 at 50 Hz classic, 1000/1000 with FD+BRS).
-- The motor replies in the format it received: classic, CAN FD, or CAN FD with BRS.
-  1 Mbps / 5 Mbps FD+BRS ran 1000 frames with zero bus errors.
-- MIT replies are also returned in the MENU state, so a reply alone does not prove that the
-  motor is in Motor Mode.
-- Temperature bytes 6 and 7 are raw values: degC = raw * 180 / 255 - 30 (range -30 to 150).
-  Reply `55 02` matched the motor's own readout NTC1 30.5 degC / NTC2 FAIL (-27.8 degC).
-  An earlier revision read the raw byte as degC, which reported 85 degC and would have tripped
-  the 80 degC over-temperature stop on the first reply.
-- The MIT position is the output-shaft angle in rad relative to the user zero point.
-- The motor also exposes a text console: input on `0x7E0 + can_id`, output on `0x7F0 + can_id`
-  (ASCII, 8 bytes per frame). The driver does not use it; `bxi_probe` reads the `STATE` lines.
-- The motor's `can_timeout` register is 0: it keeps applying the last command if traffic stops.
+- `can_id` が 1 のとき、応答 ID は 0x011、応答の先頭バイトは `master_id` ではなく `can_id` の 0x01 だった。この観測だけでは、応答 ID の計算がビット OR か加算かは区別できない。
+- MIT 指令 1 回につき応答 1 回を確認した（Classic CAN の 50 Hz では 150 回中 148 回、FD+BRS では 1000 回中 1000 回）。
+- モーターは受信したフレームと同じ形式（Classic CAN、CAN FD、CAN FD+BRS）で応答する。1 Mbps / 5 Mbps の FD+BRS では 1000 フレームを送受信し、バスエラーは 0 件だった。
+- MENU 状態でも MIT 応答が返る。このため、応答があるだけでは Motor Mode に入ったことは証明できない。
+- 温度バイト 6、7 は生値で、℃ への換算式は `raw * 180 / 255 - 30`（範囲 -30〜150 ℃）。応答の `55 02` は、モーター自身の表示である NTC1 30.5 ℃ / NTC2 FAIL（-27.8 ℃）と一致した。以前の実装では生値をそのまま ℃ として扱い、最初の応答で 85 ℃ と誤認して 80 ℃ の過熱停止条件に達する状態だった。
+- MIT の位置は、ユーザーゼロ点を基準とする出力軸角度（rad）。
+- モーターには文字コンソールもあり、入力 ID は `0x7E0 + can_id`、出力 ID は `0x7F0 + can_id`（ASCII、1 フレーム 8 バイト）。ドライバは使用しないが、`bxi_probe` は `STATE` 行の読取に使用する。
+- モーターの `can_timeout` レジスタは 0。通信が止まっても最後の指令を適用し続ける。
 
-Measured with `tools/bxi_probe` (2026-09-25, classic and FD+BRS, 500 zero-gain commands each at
-200 Hz, user-space send-to-receive time in the Dev Container):
+`tools/bxi_probe` で測定した結果（2026-09-25、Classic CAN と FD+BRS。各形式でゲイン 0 の指令を 200 Hz で 500 回送信。開発コンテナのユーザー空間で送信から受信までの時間を測定）:
 
-| | enable (FC) | Motor Mode after FC | disable (FD) | reply latency min / median / 99 % / max [us] |
+| 形式 | enable（FC） | FC 後の Motor Mode | disable（FD） | 応答時間の最小値 / 中央値 / 99 パーセンタイル / 最大値 [µs] |
 |---|---|---|---|---|
-| classic | reply (1433 us) | `STATE : 02 MOTOR` | reply, `STATE : 01 MENU` | MENU 1206 / 1284 / 1416 / 1423, enabled 1235 / 1292 / 1424 / 1438 |
-| FD+BRS | reply (1299 us) | `STATE : 02 MOTOR` | reply, `STATE : 01 MENU` | MENU 1133 / 1235 / 1347 / 1424, enabled 1153 / 1232 / 1360 / 1593 |
+| Classic CAN | 応答あり（1433 µs） | `STATE : 02 MOTOR` | 応答あり、`STATE : 01 MENU` | MENU 1206 / 1284 / 1416 / 1423、有効化後 1235 / 1292 / 1424 / 1438 |
+| FD+BRS | 応答あり（1299 µs） | `STATE : 02 MOTOR` | 応答あり、`STATE : 01 MENU` | MENU 1133 / 1235 / 1347 / 1424、有効化後 1153 / 1232 / 1360 / 1593 |
 
-- Enable and disable special frames each produce one MIT reply and switch between MENU and
-  Motor Mode, which is what `BxiActuatorDriver::enable()` / `disable()` assume.
-- No timeouts in 2000 commands. The worst reply (1.6 ms) is inside the default
-  `control_timeout_ms` of 3 ms.
-- The reply takes about 1.2-1.3 ms although a classic frame lasts about 0.13 ms at 1 Mbps, and
-  FD+BRS only saves about 0.05 ms. The time is dominated by the motor's processing, not the bus.
-  Because the worker talks to the motors on one bus one after another, a bus can serve at most
-  about 3 motors at 200 Hz (3 x 1.3 ms < 5 ms); 1 kHz needs a different scheme (C-08).
+- enable と disable の特殊フレームにはそれぞれ MIT 応答が 1 回返り、状態は MENU と Motor Mode の間で切り替わる。`BxiActuatorDriver::enable()` / `disable()` はこの動作を前提にしている。
+- 2000 回の指令でタイムアウトは 0 件だった。最も遅い応答（1.6 ms）も、デフォルトの `control_timeout_ms` である 3 ms 以内だった。
+- Classic CAN のフレーム長は 1 Mbps で約 0.13 ms だが、応答には約 1.2〜1.3 ms かかった。FD+BRS による短縮も約 0.05 ms にとどまり、所要時間の大半はバス上の転送ではなくモーター側の処理が占める。1 つのバスの worker はモーターと順番に通信するため、200 Hz では 1 バスにつき約 3 軸が上限となる（3 × 1.3 ms < 5 ms）。1 kHz には別の方式が必要（C-08）。
 
-## Supported motor CAN IDs
+## 対応するモーター CAN ID
 
-The vendor guide defines the default relationship as `master_id = can_id | 0x010` and allows
-`master_id` to be configured independently. The driver assumes the motor still uses that default.
-For `can_id=0x11`, the documented OR gives 0x11 whereas addition would give 0x21. Hardware has
-only been checked at `can_id=1`, where both formulas give 0x11. Until ID 16 or higher and its
-response behavior are verified on hardware, configuration, the actuator constructor, and
-`bxi_probe` accept motor IDs 1 through 15 only. In this range, request IDs 0x01–0x0F and
-default reply IDs 0x11–0x1F do not overlap.
+ベンダー資料ではデフォルトの関係式を `master_id = can_id | 0x010` と定め、`master_id` を独立して設定することも認めている。ドライバはモーターがこのデフォルト設定を使っていることを前提とする。`can_id=0x11` の場合、資料にある OR の結果は 0x11 だが、加算なら 0x21 になる。実機で確認したのは両式が同じ 0x11 になる `can_id=1` だけである。
 
-## Temperature sensor faults
+ID 16 以上の応答動作を実機で確認するまで、設定、アクチュエーターのコンストラクタ、`bxi_probe` はモーター ID 1〜15 だけを受け付ける。この範囲では指令 ID 0x01〜0x0F とデフォルトの応答 ID 0x11〜0x1F が重ならない。
 
-A reading below `defaults.temperature_sensor_fault_below_c` (default -20 degC) is treated as a
-disconnected or failed NTC. That sensor is excluded from the reported temperature and a warning
-is logged once; the remaining sensor keeps driving the 80 degC over-temperature stop. If both
-sensors are faulted the reported temperature is NaN. Activation then fails and rolls back, or an
-active SystemInterface stops every bus and attempts to disable every motor. A single failed NTC
-does not stop the HIL motor whose NTC2 reads about -29 degC while BXI is investigating it.
+## 温度センサー故障
 
-## CAN frame format
+`defaults.temperature_sensor_fault_below_c`（デフォルト -20 ℃）を下回る値は、NTC の断線または故障として扱う。そのセンサーを報告温度から除外し、故障への遷移時に警告を 1 回記録する。残るセンサーの値で 80 ℃ の過熱停止を判定し続ける。
 
-`can_frame_format` selects `classic`, `fd` or `fd_brs` per bus (default `classic`). Every frame
-transmitted on that bus uses the selected format; FD requires the interface to be configured with
-`fd on` (MTU 72) or the bus refuses to open. Received classic and FD frames are both accepted.
+両センサーが故障すると、報告温度は NaN になる。起動中なら有効化を失敗としてロールバックし、運転中なら全バスの制御を止めて全モーターの disable を試みる。NTC2 が約 -29 ℃ を示す HIL モーターについては、BXI に調査を依頼している間も、単一センサー故障だけでは停止しない。
 
-## Input policy
+## CAN フレーム形式
 
-- The pure codec rejects NaN, infinity, inconsistent limits and out-of-range physical values.
-- The actuator boundary rejects non-finite commands and saturates finite runtime commands to both joint and motor limits before calling the strict codec.
-- Configuration validation rejects duplicate CAN IDs on a bus, inactive/unknown buses, invalid joint limits, invalid direction, missing motor type and missing spec.
+`can_frame_format` でバスごとに `classic`、`fd`、`fd_brs` を選ぶ（デフォルトは `classic`）。そのバスから送信する全フレームに選択した形式を使用する。FD を使うには、インターフェース側で `fd on`（MTU 72）を設定する必要があり、未設定ならバスの open に失敗する。受信時は Classic CAN と FD の両形式を受け付ける。
 
-## Lifecycle and safety
+## 入力の扱い
 
-Every joint marked `enabled: true` on an active bus is required for activation. If opening a
-later bus, loading a motor spec, enabling any required joint, entering run mode, or reading
-initial feedback fails, activation returns `ERROR`. The driver attempts to disable every actuator
-it constructed, then closes all opened buses and clears the partial activation state. A profile
-with no enabled joints is explicitly allowed as an interface-only configuration.
+- プロトコルのコーデックは、NaN、無限大、矛盾する物理範囲、範囲外の物理値を拒否する。
+- アクチュエーター境界では有限でない指令を拒否し、有限の指令値は関節限界とモーター限界の両方に収めてからコーデックへ渡す。
+- 設定検証では、同一バス内の CAN ID 重複、未知または無効なバス、不正な関節限界や回転方向、モーター型式や spec の不足を拒否する。
 
-The lifecycle is `disabled -> enabled -> disabled`. A failed CAN send or consecutive response
-timeouts latch `safe-stopped`. The driver then tries one disable frame without waiting for its
-reply; it does not transmit further control commands. A worker detecting this fault or an
-over-temperature reading sets the SystemInterface-wide stop flag. Every worker stops issuing
-control commands and tries to disable its own active motors before exiting. `read()` and
-`write()` report `ERROR` while the stop is latched. A command already in flight on another bus
-may complete before that worker observes the flag. Recovery requires lifecycle teardown and
-reconstruction rather than an implicit command retry.
+## ライフサイクルと安全動作
 
-`control_timeout_ms` sets one deadline for accepting a command reply. The deadline is set after
-the request is sent, and each receive call uses the remaining time, rounded up to milliseconds.
-Unrelated CAN frames cannot restart the response timeout. A final receive may finish less than
-one millisecond after the deadline because the bus API accepts whole milliseconds. The SocketCAN
-receive loop also checks its own deadline while discarding frames longer than eight bytes.
+有効なバス上で `enabled: true` とした関節は、すべて起動に必須とする。後続バスの open、モーター spec の読込、必須軸の enable、run mode への遷移、初期フィードバックの取得のいずれかに失敗したら、起動は `ERROR` を返す。構築済みの全アクチュエーターに disable を試みてから、開いたバスをすべて閉じ、起動途中の状態を消去する。有効な関節が 1 つもないプロファイルは、インターフェースのみを使う構成として明示的に許可する。
 
-The disable is best effort. A failed bus cannot carry it, and a missing reply cannot prove that
-the motor received it. The tested motor has `can_timeout=0` and can hold its last command after
-communication stops. Physical integration therefore needs a verified motor communication
-watchdog or an independent stop path before this software stop can be relied on for bus failure.
+状態遷移は `disabled -> enabled -> disabled`。CAN 送信の失敗または連続した応答タイムアウトで `safe-stopped` を保持し、ドライバは応答を待たずに disable フレームを 1 回送る。その後は制御指令を送らない。worker がこの通信異常または過熱を検出すると、SystemInterface 全体の停止フラグを立てる。各 worker は制御指令の送信を止め、終了前に担当する有効なモーターの disable を試みる。停止状態の間、`read()` と `write()` は `ERROR` を返す。別バスですでに送信中の指令は、そちらの worker が停止フラグを確認する前に完了する可能性がある。復帰には、暗黙の指令再試行ではなく、ライフサイクルの終了処理と再構築が必要になる。
 
-## Deliberately unresolved
+`control_timeout_ms` は、指令の応答を受け付ける期限を 1 回だけ定める。期限は送信直後に設定し、各受信呼び出しには残り時間をミリ秒単位に切り上げて渡す。無関係な CAN フレームを受信しても期限は延びない。バス API は整数ミリ秒を受け取るため、最後の受信呼び出しは期限より 1 ms 未満遅れて完了する場合がある。SocketCAN の受信ループでも、8 バイトを超えるフレームを読み捨てる間に独自の期限を確認する。
 
-The acquired guide does not define a separate error frame or a run-mode selection frame. No guessed CAN frame is emitted for either. `setRunMode()` only confirms that the documented enable transition succeeded. Fault coverage in Stage 1 is therefore response timeout, malformed/mismatched feedback and reported temperature. Vendor confirmation and HIL error injection remain prerequisites for the physical safety gate.
+disable は可能な範囲での試行にとどまる。バスが故障していれば送れず、応答がなくてもモーターが受信したかどうかは確認できない。試験したモーターの `can_timeout=0` では、通信が止まっても最後の指令が保持される。そのため、物理統合でバス故障時の停止を成立させるには、検証済みのモーター通信ウォッチドッグまたは独立した停止経路が必要になる。
+
+## 未解決事項
+
+入手した資料には、独立したエラーフレームや run mode 選択フレームの定義がない。どちらについても、推測した CAN フレームは送信しない。`setRunMode()` は、資料に記載された enable による遷移が成功したことだけを確認する。このため Stage 1 で対象とする故障は、応答タイムアウト、不正または対象外のフィードバック、報告温度に関する異常である。物理的な安全性の判定には、ベンダー確認と HIL での異常注入試験が引き続き必要になる。
