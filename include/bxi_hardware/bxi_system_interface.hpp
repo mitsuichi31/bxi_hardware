@@ -38,6 +38,7 @@ struct JointRuntime
   std::string motor_type;
   std::unique_ptr<ActuatorDriver> actuator;
   bool overheated = false;
+  bool temperature_sensor_fault = false;
   bool communication_fault = false;
 };
 

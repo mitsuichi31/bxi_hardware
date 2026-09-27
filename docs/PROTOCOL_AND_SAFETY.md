@@ -52,9 +52,9 @@ Measured with `tools/bxi_probe` (2026-09-25, classic and FD+BRS, 500 zero-gain c
 A reading below `defaults.temperature_sensor_fault_below_c` (default -20 degC) is treated as a
 disconnected or failed NTC. That sensor is excluded from the reported temperature and a warning
 is logged once; the remaining sensor keeps driving the 80 degC over-temperature stop. If both
-sensors are faulted the reported temperature is NaN and no over-temperature stop can trigger.
-This follows the project decision to keep operating the HIL motor whose NTC2 reads about -29 degC
-while BXI is investigating it.
+sensors are faulted the reported temperature is NaN. Activation then fails and rolls back, or an
+active SystemInterface stops every bus and attempts to disable every motor. A single failed NTC
+does not stop the HIL motor whose NTC2 reads about -29 degC while BXI is investigating it.
 
 ## CAN frame format
 

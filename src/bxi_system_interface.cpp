@@ -295,11 +295,15 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_activate(
 
   std::map<std::string, std::vector<size_t>> bus_joints;
   for (size_t i = 0; i < n_joints_; ++i) {
+    joints_[i].overheated = false;
+    joints_[i].temperature_sensor_fault = false;
+    joints_[i].communication_fault = false;
     if (joints_[i].enabled && is_active(joints_[i].can_bus)) {
       bus_joints[joints_[i].can_bus].push_back(i);
     }
   }
 
+  safe_stopped_ = false;
   if (bus_joints.empty()) {
     // 全関節disabledのprofileは、実機I/Oを行わない明示的な構成として許可する。
     RCLCPP_WARN(logger(),
@@ -309,7 +313,6 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_activate(
     return hardware_interface::CallbackReturn::SUCCESS;
   }
 
-  safe_stopped_ = false;
   auto fail_activation = [&]() {
     releaseResources();
     return hardware_interface::CallbackReturn::ERROR;
@@ -352,6 +355,12 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_activate(
                        bus_name.c_str(), joints_[i].name.c_str());
           return fail_activation();
         }
+        if (!std::isfinite(fb.temperature)) {
+          RCLCPP_ERROR(logger(), "[%s] %s 両温度センサー故障。起動を中止します。",
+            bus_name.c_str(), joints_[i].name.c_str());
+          joints_[i].temperature_sensor_fault = true;
+          return fail_activation();
+        }
         RCLCPP_INFO(logger(), "[%s] Enable %s pos=%.3f temp=%.1f",
                     bus_name.c_str(), joints_[i].name.c_str(),
                     fb.position, fb.temperature);
@@ -380,6 +389,12 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_activate(
         if (!fb.valid) {
           RCLCPP_ERROR(logger(), "[%s] %s 初期フィードバック取得失敗", bus_name.c_str(),
             joints_[i].name.c_str());
+          return fail_activation();
+        }
+        if (!std::isfinite(fb.temperature)) {
+          RCLCPP_ERROR(logger(), "[%s] %s 両温度センサー故障。起動を中止します。",
+            bus_name.c_str(), joints_[i].name.c_str());
+          joints_[i].temperature_sensor_fault = true;
           return fail_activation();
         }
         st_pos_[i] = fb_pos_[i] = tgt_pos_[i] = fb.position;
@@ -486,7 +501,12 @@ void BxiSystemInterface::workerLoop(std::string bus_name, std::vector<size_t> in
       auto fb = joints_[i].actuator->sendControl(lp[k], lv[k], lkp[k], lkd[k], leff[k]);
       if (fb.valid) {
         ofp[k] = fb.position; ofv[k] = fb.velocity; ofe[k] = fb.effort; oft[k] = fb.temperature;
-        if (fb.temperature > 80.0) {
+        if (!std::isfinite(fb.temperature)) {
+          RCLCPP_ERROR(logger(), "[%s] %s 両温度センサー故障。全軸を停止します。",
+            bus_name.c_str(), joints_[i].name.c_str());
+          joints_[i].temperature_sensor_fault = true;
+          safe_stopped_ = true;
+        } else if (fb.temperature > 80.0) {
           RCLCPP_ERROR(logger(), "[%s] %s 過熱(%.1f)。全軸を停止します。",
                        bus_name.c_str(), joints_[i].name.c_str(), fb.temperature);
           joints_[i].overheated = true;
