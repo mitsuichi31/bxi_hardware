@@ -176,5 +176,21 @@ TEST(BxiActuator, TriesDisableWhenControlSendFails)
   EXPECT_EQ(bus.sent_.size(), 3U);
 }
 
+TEST(BxiActuator, RetryingDisableKeepsSafeStopLatched)
+{
+  EmulatedBus bus;
+  ASSERT_TRUE(bus.open("emulated0"));
+  auto driver = makeDriver(bus, 1);
+  ASSERT_TRUE(driver.enable().valid);
+  bus.respond_ = false;
+  EXPECT_FALSE(driver.sendControl(0.0, 0.0, 0.0, 0.0, 0.0).valid);
+  ASSERT_EQ(driver.state(), ActuatorState::kSafeStopped);
+  const size_t sends_before_retry = bus.sent_.size();
+  EXPECT_FALSE(driver.disable().valid);
+  EXPECT_EQ(bus.sent_.size(), sends_before_retry + 1);
+  EXPECT_EQ(bus.sent_.back().data, protocol::encodeSpecialCommand(protocol::SpecialCommand::kDisable));
+  EXPECT_EQ(driver.state(), ActuatorState::kSafeStopped);
+}
+
 }  // namespace
 }  // namespace bxi_hardware

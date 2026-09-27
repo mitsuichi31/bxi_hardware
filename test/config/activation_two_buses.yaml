@@ -1,0 +1,22 @@
+active_can_buses: [bus_a, bus_b]
+defaults:
+  control_timeout_ms: 1
+  maximum_consecutive_timeouts: 3
+  can_hz: 200
+joints:
+  joint1:
+    enabled: true
+    can_bus: bus_a
+    can_id: 1
+    motor_dir: 1
+    motor_type: MOTOR_70
+    lower: -1.0
+    upper: 1.0
+  joint2:
+    enabled: true
+    can_bus: bus_b
+    can_id: 2
+    motor_dir: 1
+    motor_type: MOTOR_70
+    lower: -1.0
+    upper: 1.0

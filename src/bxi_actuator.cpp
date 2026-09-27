@@ -102,6 +102,11 @@ void BxiActuatorDriver::latchSafeStop()
   state_ = ActuatorState::kSafeStopped;
   // A lost reply does not prove the request was lost. Try to clear the motor's latched command
   // without waiting for an acknowledgement, which may be the part of the link that has failed.
+  trySendDisable();
+}
+
+void BxiActuatorDriver::trySendDisable()
+{
   CanFrame disable_frame;
   disable_frame.id = static_cast<uint32_t>(can_id_);
   disable_frame.extended = false;
@@ -166,17 +171,12 @@ ActuatorFeedback BxiActuatorDriver::enable()
 
 ActuatorFeedback BxiActuatorDriver::disable()
 {
-  // A disable frame is still allowed while safe-stopped. A missing disable acknowledgement does
-  // not clear the latched safe state.
-  const bool was_safe_stopped = state_ == ActuatorState::kSafeStopped;
-  if (was_safe_stopped) {
-    state_ = ActuatorState::kDisabled;
+  // Keep the safe-stop latch intact while retrying disable during lifecycle cleanup.
+  if (state_ == ActuatorState::kSafeStopped) {
+    trySendDisable();
+    return {};
   }
-  auto feedback = sendSpecial(protocol::SpecialCommand::kDisable, false);
-  if (was_safe_stopped) {
-    state_ = ActuatorState::kSafeStopped;
-  }
-  return feedback;
+  return sendSpecial(protocol::SpecialCommand::kDisable, false);
 }
 
 bool BxiActuatorDriver::setRunMode()

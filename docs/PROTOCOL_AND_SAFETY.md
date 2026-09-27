@@ -70,6 +70,13 @@ transmitted on that bus uses the selected format; FD requires the interface to b
 
 ## Lifecycle and safety
 
+Every joint marked `enabled: true` on an active bus is required for activation. If opening a
+later bus, loading a motor spec, enabling any required joint, entering run mode, or reading
+initial feedback fails, activation returns `ERROR`. The driver attempts to disable every actuator
+it constructed, then
+closes all opened buses and clears the partial activation state. A profile with no enabled joints
+is explicitly allowed as an interface-only configuration.
+
 The lifecycle is `disabled -> enabled -> disabled`. A failed CAN send or consecutive response
 timeouts latch `safe-stopped`. The driver then tries one disable frame without waiting for its
 reply; it does not transmit further control commands. A worker detecting this fault or an

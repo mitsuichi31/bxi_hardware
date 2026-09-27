@@ -72,6 +72,7 @@ private:
   ActuatorFeedback sendSpecial(protocol::SpecialCommand command, bool enables_motor);
   ActuatorFeedback transact(const CanFrame & request);
   void latchSafeStop();
+  void trySendDisable();
   protocol::MitLimits limits() const;
   void updateTemperature(const protocol::MitFeedback & decoded, ActuatorFeedback & result);
 

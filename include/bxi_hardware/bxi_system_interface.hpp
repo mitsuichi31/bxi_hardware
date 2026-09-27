@@ -60,11 +60,15 @@ public:
   hardware_interface::return_type write(
     const rclcpp::Time & time, const rclcpp::Duration & period) override;
 
+protected:
+  virtual std::shared_ptr<CanBus> makeBus(CanFrameFormat format);
+
 private:
   bool parseConfig();
   bool loadSpec(const std::string & motor_type);
   void workerLoop(std::string bus_name, std::vector<size_t> indices);
   void stopWorkers();
+  void releaseResources();
 
   size_t n_joints_ = 0;
 
@@ -72,7 +76,7 @@ private:
   std::vector<double> cmd_pos_, cmd_vel_, cmd_kp_, cmd_kd_, cmd_eff_;
 
   std::vector<JointRuntime> joints_;
-  std::map<std::string, std::shared_ptr<SocketCanBus>> buses_;
+  std::map<std::string, std::shared_ptr<CanBus>> buses_;
   std::vector<std::string> active_buses_;
   std::map<std::string, CanFrameFormat> bus_formats_;
   std::map<std::string, BxiSpec> specs_;

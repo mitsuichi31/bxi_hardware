@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <exception>
 #include <limits>
 #include <set>
 
@@ -280,6 +281,11 @@ BxiSystemInterface::export_command_interfaces()
 // ---------------------------------------------------------------------------
 // on_activate
 // ---------------------------------------------------------------------------
+std::shared_ptr<CanBus> BxiSystemInterface::makeBus(CanFrameFormat format)
+{
+  return std::make_shared<SocketCanBus>(format);
+}
+
 hardware_interface::CallbackReturn BxiSystemInterface::on_activate(
   const rclcpp_lifecycle::State & /*previous_state*/)
 {
@@ -304,83 +310,96 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_activate(
   }
 
   safe_stopped_ = false;
-  for (auto & [bus_name, indices] : bus_joints) {
-    auto bus = std::make_shared<SocketCanBus>(bus_formats_[bus_name]);
-    if (!bus->open(bus_name)) {
-      RCLCPP_ERROR(logger(), "CANオープン失敗: %s", bus_name.c_str());
-      stopWorkers();
-      return hardware_interface::CallbackReturn::ERROR;
-    }
-    buses_[bus_name] = bus;
-
-    constexpr int kEnableRetries = 3;
-    std::map<size_t, double> enable_pos;
-    std::vector<size_t> live;
-
-    for (size_t i : indices) {
-      if (!loadSpec(joints_[i].motor_type)) {
-        stopWorkers();
-        return hardware_interface::CallbackReturn::ERROR;
+  auto fail_activation = [&]() {
+    releaseResources();
+    return hardware_interface::CallbackReturn::ERROR;
+  };
+  try {
+    for (auto & [bus_name, indices] : bus_joints) {
+      auto bus = makeBus(bus_formats_[bus_name]);
+      if (!bus->open(bus_name)) {
+        RCLCPP_ERROR(logger(), "CANオープン失敗: %s", bus_name.c_str());
+        return fail_activation();
       }
-      joints_[i].actuator = std::make_unique<BxiActuatorDriver>(
-        bus.get(), joints_[i].can_id, joints_[i].motor_dir,
-        joints_[i].offset_angle, joints_[i].lower, joints_[i].upper,
-        joints_[i].default_kp, joints_[i].default_kd,
-        specs_[joints_[i].motor_type], control_timeout_ms_, maximum_consecutive_timeouts_,
-        temperature_sensor_fault_below_c_);
+      buses_[bus_name] = bus;
 
-      ActuatorFeedback fb;
-      for (int attempt = 0; attempt < kEnableRetries; ++attempt) {
-        fb = joints_[i].actuator->enable();
-        if (fb.valid) {
-          break;
+      constexpr int kEnableRetries = 3;
+      std::map<size_t, double> enable_pos;
+      std::vector<size_t> live;
+
+      for (size_t i : indices) {
+        if (!loadSpec(joints_[i].motor_type)) {
+          return fail_activation();
         }
-        RCLCPP_WARN(logger(), "[%s] %s enable応答なし（試行 %d/%d）",
-                    bus_name.c_str(), joints_[i].name.c_str(), attempt + 1, kEnableRetries);
-      }
-      if (!fb.valid) {
-        RCLCPP_ERROR(logger(), "[%s] %s enable失敗。スキップします。",
-                     bus_name.c_str(), joints_[i].name.c_str());
-        joints_[i].actuator.reset();
-        continue;
-      }
-      RCLCPP_INFO(logger(), "[%s] Enable %s pos=%.3f temp=%.1f",
-                  bus_name.c_str(), joints_[i].name.c_str(),
-                  fb.position, fb.temperature);
-      enable_pos[i] = fb.position;
-      joints_[i].actuator->setRunMode();
-      live.push_back(i);
-    }
+        joints_[i].actuator = std::make_unique<BxiActuatorDriver>(
+          bus.get(), joints_[i].can_id, joints_[i].motor_dir,
+          joints_[i].offset_angle, joints_[i].lower, joints_[i].upper,
+          joints_[i].default_kp, joints_[i].default_kd,
+          specs_[joints_[i].motor_type], control_timeout_ms_, maximum_consecutive_timeouts_,
+          temperature_sensor_fault_below_c_);
 
-    for (size_t i : live) {
-      const double pos_orig = enable_pos[i] * joints_[i].motor_dir;
-      double offset = 0.0;
-      if (joints_[i].offset_thre.has_value() && pos_orig > joints_[i].offset_thre.value()) {
-        offset = -2.0 * M_PI * joints_[i].motor_dir;
+        ActuatorFeedback fb;
+        for (int attempt = 0; attempt < kEnableRetries; ++attempt) {
+          fb = joints_[i].actuator->enable();
+          if (fb.valid) {
+            break;
+          }
+          RCLCPP_WARN(logger(), "[%s] %s enable応答なし（試行 %d/%d）",
+                      bus_name.c_str(), joints_[i].name.c_str(), attempt + 1, kEnableRetries);
+        }
+        if (!fb.valid) {
+          RCLCPP_ERROR(logger(), "[%s] %s enable失敗。起動を中止します。",
+                       bus_name.c_str(), joints_[i].name.c_str());
+          return fail_activation();
+        }
+        RCLCPP_INFO(logger(), "[%s] Enable %s pos=%.3f temp=%.1f",
+                    bus_name.c_str(), joints_[i].name.c_str(),
+                    fb.position, fb.temperature);
+        enable_pos[i] = fb.position;
+        if (!joints_[i].actuator->setRunMode()) {
+          RCLCPP_ERROR(logger(), "[%s] %s run modeへの遷移失敗", bus_name.c_str(),
+            joints_[i].name.c_str());
+          return fail_activation();
+        }
+        live.push_back(i);
       }
-      offset += joints_[i].offset_angle;
-      joints_[i].actuator->setAngleOffset(offset);
-      joints_[i].actuator->setAngleRange(joints_[i].lower, joints_[i].upper);
-    }
 
-    for (size_t i : live) {
-      auto fb = joints_[i].actuator->sendControl(0, 0, 0, 0, 0);
-      if (fb.valid) {
+      for (size_t i : live) {
+        const double pos_orig = enable_pos[i] * joints_[i].motor_dir;
+        double offset = 0.0;
+        if (joints_[i].offset_thre.has_value() && pos_orig > joints_[i].offset_thre.value()) {
+          offset = -2.0 * M_PI * joints_[i].motor_dir;
+        }
+        offset += joints_[i].offset_angle;
+        joints_[i].actuator->setAngleOffset(offset);
+        joints_[i].actuator->setAngleRange(joints_[i].lower, joints_[i].upper);
+      }
+
+      for (size_t i : live) {
+        auto fb = joints_[i].actuator->sendControl(0, 0, 0, 0, 0);
+        if (!fb.valid) {
+          RCLCPP_ERROR(logger(), "[%s] %s 初期フィードバック取得失敗", bus_name.c_str(),
+            joints_[i].name.c_str());
+          return fail_activation();
+        }
         st_pos_[i] = fb_pos_[i] = tgt_pos_[i] = fb.position;
         st_vel_[i] = fb_vel_[i] = fb.velocity;
         st_eff_[i] = fb_eff_[i] = fb.effort;
         st_temp_[i] = fb_temp_[i] = fb.temperature;
         tgt_kp_[i] = tgt_kd_[i] = 0.0;
       }
+      if (!live.empty()) {
+        live_joints_[bus_name] = live;
+      }
     }
-    if (!live.empty()) {
-      live_joints_[bus_name] = live;
-    }
-  }
 
-  running_ = true;
-  for (auto & [bus_name, live] : live_joints_) {
-    workers_.emplace_back(&BxiSystemInterface::workerLoop, this, bus_name, live);
+    running_ = true;
+    for (auto & [bus_name, live] : live_joints_) {
+      workers_.emplace_back(&BxiSystemInterface::workerLoop, this, bus_name, live);
+    }
+  } catch (const std::exception & e) {
+    RCLCPP_ERROR(logger(), "起動中に例外: %s", e.what());
+    return fail_activation();
   }
   RCLCPP_INFO(logger(), "on_activate 完了: %zu バスで worker 起動", workers_.size());
   return hardware_interface::CallbackReturn::SUCCESS;
@@ -391,6 +410,13 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_activate(
 // ---------------------------------------------------------------------------
 hardware_interface::CallbackReturn BxiSystemInterface::on_deactivate(
   const rclcpp_lifecycle::State & /*previous_state*/)
+{
+  releaseResources();
+  RCLCPP_INFO(logger(), "on_deactivate 完了");
+  return hardware_interface::CallbackReturn::SUCCESS;
+}
+
+void BxiSystemInterface::releaseResources()
 {
   stopWorkers();
   for (auto & jr : joints_) {
@@ -406,8 +432,6 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_deactivate(
   for (auto & jr : joints_) {
     jr.actuator.reset();
   }
-  RCLCPP_INFO(logger(), "on_deactivate 完了");
-  return hardware_interface::CallbackReturn::SUCCESS;
 }
 
 void BxiSystemInterface::stopWorkers()
