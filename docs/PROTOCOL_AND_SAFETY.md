@@ -73,9 +73,8 @@ transmitted on that bus uses the selected format; FD requires the interface to b
 Every joint marked `enabled: true` on an active bus is required for activation. If opening a
 later bus, loading a motor spec, enabling any required joint, entering run mode, or reading
 initial feedback fails, activation returns `ERROR`. The driver attempts to disable every actuator
-it constructed, then
-closes all opened buses and clears the partial activation state. A profile with no enabled joints
-is explicitly allowed as an interface-only configuration.
+it constructed, then closes all opened buses and clears the partial activation state. A profile
+with no enabled joints is explicitly allowed as an interface-only configuration.
 
 The lifecycle is `disabled -> enabled -> disabled`. A failed CAN send or consecutive response
 timeouts latch `safe-stopped`. The driver then tries one disable frame without waiting for its
@@ -85,6 +84,12 @@ control commands and tries to disable its own active motors before exiting. `rea
 `write()` report `ERROR` while the stop is latched. A command already in flight on another bus
 may complete before that worker observes the flag. Recovery requires lifecycle teardown and
 reconstruction rather than an implicit command retry.
+
+`control_timeout_ms` sets one deadline for accepting a command reply. The deadline is set after
+the request is sent, and each receive call uses the remaining time, rounded up to milliseconds.
+Unrelated CAN frames cannot restart the response timeout. A final receive may finish less than
+one millisecond after the deadline because the bus API accepts whole milliseconds. The SocketCAN
+receive loop also checks its own deadline while discarding frames longer than eight bytes.
 
 The disable is best effort. A failed bus cannot carry it, and a missing reply cannot prove that
 the motor received it. The tested motor has `can_timeout=0` and can hold its last command after

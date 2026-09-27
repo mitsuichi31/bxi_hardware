@@ -1,7 +1,9 @@
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <deque>
 #include <limits>
+#include <thread>
 
 #include <gtest/gtest.h>
 
@@ -32,6 +34,13 @@ public:
 
   bool recv(CanFrame & out, int) override
   {
+    if (unrelated_remaining_ > 0) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      --unrelated_remaining_;
+      ++unrelated_delivered_;
+      out = feedbackFrame(2);
+      return true;
+    }
     if (responses_.empty()) {
       return false;
     }
@@ -51,6 +60,8 @@ public:
   }
 
   bool respond_{true};
+  int unrelated_remaining_{0};
+  int unrelated_delivered_{0};
   uint8_t ntc1_raw_{0x55};  // 30 degC
   uint8_t ntc2_raw_{0x5A};  // about 33.5 degC
   std::vector<CanFrame> sent_;
@@ -190,6 +201,22 @@ TEST(BxiActuator, RetryingDisableKeepsSafeStopLatched)
   EXPECT_EQ(bus.sent_.size(), sends_before_retry + 1);
   EXPECT_EQ(bus.sent_.back().data, protocol::encodeSpecialCommand(protocol::SpecialCommand::kDisable));
   EXPECT_EQ(driver.state(), ActuatorState::kSafeStopped);
+}
+
+TEST(BxiActuator, UnrelatedFramesCannotExtendTransactionDeadline)
+{
+  EmulatedBus bus;
+  ASSERT_TRUE(bus.open("emulated0"));
+  auto driver = makeDriver(bus, 1);
+  ASSERT_TRUE(driver.enable().valid);
+  bus.respond_ = false;
+  bus.unrelated_remaining_ = 10;
+
+  EXPECT_FALSE(driver.sendControl(0.0, 0.0, 0.0, 0.0, 0.0).valid);
+  EXPECT_LT(bus.unrelated_delivered_, 10);
+  EXPECT_EQ(driver.state(), ActuatorState::kSafeStopped);
+  EXPECT_EQ(bus.sent_.back().data,
+    protocol::encodeSpecialCommand(protocol::SpecialCommand::kDisable));
 }
 
 }  // namespace

@@ -140,6 +140,11 @@ bool SocketCanBus::recv(CanFrame & out, int timeout_ms)
   using clock = std::chrono::steady_clock;
   const auto deadline = clock::now() + std::chrono::milliseconds(std::max(timeout_ms, 0));
   while (true) {
+    // select() can keep reporting a busy bus as readable even after the deadline.
+    // Keep the zero-timeout probe used by flushRx() nonblocking but still able to read a frame.
+    if (timeout_ms > 0 && clock::now() >= deadline) {
+      return false;
+    }
     if (timeout_ms >= 0) {
       const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(
         deadline - clock::now()).count();

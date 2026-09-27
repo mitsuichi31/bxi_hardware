@@ -1,6 +1,7 @@
 #include "bxi_hardware/actuator/bxi_actuator.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
@@ -62,8 +63,20 @@ ActuatorFeedback BxiActuatorDriver::transact(const CanFrame & request)
     return result;
   }
 
+  using clock = std::chrono::steady_clock;
+  const auto deadline = clock::now() + std::chrono::milliseconds(response_timeout_ms_);
   CanFrame response;
-  while (bus_->recv(response, response_timeout_ms_)) {
+  while (true) {
+    const auto now = clock::now();
+    if (now >= deadline) {
+      break;
+    }
+    const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(deadline - now);
+    if (!bus_->recv(response, static_cast<int>(remaining.count())) ||
+      clock::now() >= deadline)
+    {
+      break;
+    }
     if (response.extended || response.dlc != 8 ||
       response.id != protocol::defaultMasterId(static_cast<uint32_t>(can_id_)))
     {
