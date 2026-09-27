@@ -432,6 +432,9 @@ void BxiSystemInterface::workerLoop(std::string bus_name, std::vector<size_t> in
               bus_name.c_str(), indices.size(), can_hz_);
 
   while (running_) {
+    if (safe_stopped_) {
+      break;
+    }
     const auto t0 = clock::now();
 
     std::vector<double> lp(indices.size()), lv(indices.size()), lkp(indices.size()),
@@ -449,6 +452,9 @@ void BxiSystemInterface::workerLoop(std::string bus_name, std::vector<size_t> in
     }
 
     for (size_t k = 0; k < indices.size(); ++k) {
+      if (safe_stopped_) {
+        break;
+      }
       size_t i = indices[k];
       if (joints_[i].overheated) {
         continue;
@@ -457,9 +463,8 @@ void BxiSystemInterface::workerLoop(std::string bus_name, std::vector<size_t> in
       if (fb.valid) {
         ofp[k] = fb.position; ofv[k] = fb.velocity; ofe[k] = fb.effort; oft[k] = fb.temperature;
         if (fb.temperature > 80.0) {
-          RCLCPP_ERROR(logger(), "[%s] %s 過熱(%.1f)。disable。",
+          RCLCPP_ERROR(logger(), "[%s] %s 過熱(%.1f)。全軸を停止します。",
                        bus_name.c_str(), joints_[i].name.c_str(), fb.temperature);
-          joints_[i].actuator->disable();
           joints_[i].overheated = true;
           safe_stopped_ = true;
         }
@@ -468,7 +473,7 @@ void BxiSystemInterface::workerLoop(std::string bus_name, std::vector<size_t> in
       {
         joints_[i].communication_fault = true;
         safe_stopped_ = true;
-        RCLCPP_ERROR(logger(), "[%s] %s communication timeout; commands stopped",
+        RCLCPP_ERROR(logger(), "[%s] %s communication fault; stopping all motors",
           bus_name.c_str(), joints_[i].name.c_str());
       }
     }
@@ -481,7 +486,25 @@ void BxiSystemInterface::workerLoop(std::string bus_name, std::vector<size_t> in
       }
     }
 
+    if (safe_stopped_) {
+      break;
+    }
+
     std::this_thread::sleep_until(t0 + period);
+  }
+  if (safe_stopped_) {
+    // Each worker owns its bus. Disable every actuator on that bus before exiting, including
+    // actuators whose most recent target was supplied before another bus reported the fault.
+    for (size_t i : indices) {
+      auto * actuator = dynamic_cast<BxiActuatorDriver *>(joints_[i].actuator.get());
+      if (actuator != nullptr && actuator->state() == ActuatorState::kSafeStopped) {
+        continue;  // The driver already sent a best-effort disable on this transition.
+      }
+      if (!joints_[i].actuator->disable().valid) {
+        RCLCPP_ERROR(logger(), "[%s] %s disable acknowledgement missing",
+          bus_name.c_str(), joints_[i].name.c_str());
+      }
+    }
   }
   RCLCPP_INFO(logger(), "[%s] worker終了", bus_name.c_str());
 }

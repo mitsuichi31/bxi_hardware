@@ -154,9 +154,26 @@ TEST(BxiActuator, LatchesSafeStopAndStopsNewCommandsAfterTimeouts)
   EXPECT_EQ(driver.state(), ActuatorState::kEnabled);
   EXPECT_FALSE(driver.sendControl(0.0, 0.0, 0.0, 0.0, 0.0).valid);
   EXPECT_EQ(driver.state(), ActuatorState::kSafeStopped);
+  ASSERT_EQ(bus.sent_.size(), 4U);
+  EXPECT_EQ(bus.sent_.back().data, protocol::encodeSpecialCommand(protocol::SpecialCommand::kDisable));
   const size_t sends_at_stop = bus.sent_.size();
   EXPECT_FALSE(driver.sendControl(0.0, 0.0, 0.0, 0.0, 0.0).valid);
   EXPECT_EQ(bus.sent_.size(), sends_at_stop);
+}
+
+TEST(BxiActuator, TriesDisableWhenControlSendFails)
+{
+  EmulatedBus bus;
+  ASSERT_TRUE(bus.open("emulated0"));
+  auto driver = makeDriver(bus);
+  ASSERT_TRUE(driver.enable().valid);
+  bus.close();
+  EXPECT_FALSE(driver.sendControl(0.0, 0.0, 0.0, 0.0, 0.0).valid);
+  EXPECT_EQ(driver.state(), ActuatorState::kSafeStopped);
+  ASSERT_EQ(bus.sent_.size(), 3U);
+  EXPECT_EQ(bus.sent_.back().data, protocol::encodeSpecialCommand(protocol::SpecialCommand::kDisable));
+  EXPECT_FALSE(driver.sendControl(0.0, 0.0, 0.0, 0.0, 0.0).valid);
+  EXPECT_EQ(bus.sent_.size(), 3U);
 }
 
 }  // namespace

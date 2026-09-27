@@ -54,8 +54,11 @@ protocol::MitLimits BxiActuatorDriver::limits() const
 ActuatorFeedback BxiActuatorDriver::transact(const CanFrame & request)
 {
   ActuatorFeedback result;
-  if (state_ == ActuatorState::kSafeStopped || !bus_->send(request)) {
-    state_ = ActuatorState::kSafeStopped;
+  if (state_ == ActuatorState::kSafeStopped) {
+    return result;
+  }
+  if (!bus_->send(request)) {
+    latchSafeStop();
     return result;
   }
 
@@ -83,12 +86,30 @@ ActuatorFeedback BxiActuatorDriver::transact(const CanFrame & request)
   ++consecutive_timeouts_;
   result.consecutive_timeouts = consecutive_timeouts_;
   if (consecutive_timeouts_ >= maximum_consecutive_timeouts_) {
-    state_ = ActuatorState::kSafeStopped;
+    latchSafeStop();
     RCLCPP_ERROR(
       logger(), "motor id=%d entered safe-stop after %u consecutive timeouts", can_id_,
       consecutive_timeouts_);
   }
   return result;
+}
+
+void BxiActuatorDriver::latchSafeStop()
+{
+  if (state_ == ActuatorState::kSafeStopped) {
+    return;
+  }
+  state_ = ActuatorState::kSafeStopped;
+  // A lost reply does not prove the request was lost. Try to clear the motor's latched command
+  // without waiting for an acknowledgement, which may be the part of the link that has failed.
+  CanFrame disable_frame;
+  disable_frame.id = static_cast<uint32_t>(can_id_);
+  disable_frame.extended = false;
+  disable_frame.dlc = 8;
+  disable_frame.data = protocol::encodeSpecialCommand(protocol::SpecialCommand::kDisable);
+  if (!bus_->send(disable_frame)) {
+    RCLCPP_ERROR(logger(), "motor id=%d disable frame could not be sent", can_id_);
+  }
 }
 
 void BxiActuatorDriver::updateTemperature(

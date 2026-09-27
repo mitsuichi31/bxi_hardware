@@ -70,7 +70,19 @@ transmitted on that bus uses the selected format; FD requires the interface to b
 
 ## Lifecycle and safety
 
-The lifecycle is `disabled -> enabled -> disabled`. Consecutive response timeouts latch `safe-stopped`; once latched, new command frames are not transmitted. Recovery requires lifecycle teardown and reconstruction rather than an implicit command retry. MOS temperature over 80 degrees also stops the SystemInterface and sends disable.
+The lifecycle is `disabled -> enabled -> disabled`. A failed CAN send or consecutive response
+timeouts latch `safe-stopped`. The driver then tries one disable frame without waiting for its
+reply; it does not transmit further control commands. A worker detecting this fault or an
+over-temperature reading sets the SystemInterface-wide stop flag. Every worker stops issuing
+control commands and tries to disable its own active motors before exiting. `read()` and
+`write()` report `ERROR` while the stop is latched. A command already in flight on another bus
+may complete before that worker observes the flag. Recovery requires lifecycle teardown and
+reconstruction rather than an implicit command retry.
+
+The disable is best effort. A failed bus cannot carry it, and a missing reply cannot prove that
+the motor received it. The tested motor has `can_timeout=0` and can hold its last command after
+communication stops. Physical integration therefore needs a verified motor communication
+watchdog or an independent stop path before this software stop can be relied on for bus failure.
 
 ## Deliberately unresolved
 
