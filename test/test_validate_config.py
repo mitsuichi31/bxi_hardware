@@ -20,6 +20,22 @@ def test_valid_fixture():
     ) == []
 
 
+def test_rejects_motor_can_id_16():
+    errors = validate(
+        ROOT / "test/config/invalid_can_id16.yaml",
+        ROOT / "config/bxi_hardware.schema.json",
+        ROOT / "config/specs",
+    )
+    assert any("greater than the maximum of 15" in error for error in errors)
+
+
+def test_accepts_motor_can_id_15(tmp_path):
+    valid = (ROOT / "test/config/valid.yaml").read_text()
+    config = tmp_path / "id15.yaml"
+    config.write_text(valid.replace("can_id: 1\n", "can_id: 15\n", 1))
+    assert validate(config, ROOT / "config/bxi_hardware.schema.json", ROOT / "config/specs") == []
+
+
 def test_rejects_duplicate_can_id(tmp_path):
     errors = run(tmp_path / "duplicate.yaml", tmp_path, """
 active_can_buses: [can0]

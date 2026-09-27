@@ -256,7 +256,8 @@ std::optional<Options> parse(int argc, char ** argv)
       return std::nullopt;
     }
   }
-  if (o.can_id < 1 || o.can_id > 0xF || o.count < 1 || o.rate_hz < 1 || o.rate_hz > 2000 ||
+  if (o.can_id < 1 || o.can_id > static_cast<int>(protocol::kMaxSupportedMotorCanId) ||
+    o.count < 1 || o.rate_hz < 1 || o.rate_hz > 2000 ||
     o.timeout_ms < 1)
   {
     return std::nullopt;

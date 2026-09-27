@@ -28,7 +28,8 @@ BxiActuatorDriver::BxiActuatorDriver(
   temperature_sensor_fault_below_c_(temperature_sensor_fault_below_c)
 {
   std::string reason;
-  if (bus_ == nullptr || can_id_ <= 0 || can_id_ > 0x7EF ||
+  if (bus_ == nullptr || can_id_ <= 0 ||
+    can_id_ > static_cast<int>(protocol::kMaxSupportedMotorCanId) ||
     (motor_dir_ != -1 && motor_dir_ != 1) || response_timeout_ms_ <= 0 ||
     maximum_consecutive_timeouts_ == 0 || lower_ >= upper_ ||
     !std::isfinite(temperature_sensor_fault_below_c_) ||

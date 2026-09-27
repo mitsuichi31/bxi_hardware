@@ -183,7 +183,9 @@ bool BxiSystemInterface::parseConfig()
         jr.can_bus.c_str());
       return false;
     }
-    if (jr.can_id <= 0 || jr.can_id > 0x7EF || !bus_can_ids.emplace(jr.can_bus, jr.can_id).second) {
+    if (jr.can_id <= 0 || jr.can_id > static_cast<int>(protocol::kMaxSupportedMotorCanId) ||
+      !bus_can_ids.emplace(jr.can_bus, jr.can_id).second)
+    {
       RCLCPP_ERROR(logger(), "joint '%s': CAN IDが範囲外またはbus内で重複", name.c_str());
       return false;
     }

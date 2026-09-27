@@ -2,7 +2,8 @@
 
 ## Confirmed protocol
 
-Source: BXI CAN Communication Guide summarized in the parent workspace's `BXI_Actuators_Motor_Info.md`.
+Source: BXI CAN Communication Guide, section 5.3, archived in
+`minibexkai_docs/reference/bxi/CAN Communication Guide - BXI_Wiki.pdf`.
 
 - Classic CAN uses an 8-byte standard frame addressed to the motor `can_id`.
 - Command fields are big-endian bit streams: position 16 bit; velocity, Kp, Kd and torque 12 bit each.
@@ -15,7 +16,8 @@ Source: BXI CAN Communication Guide summarized in the parent workspace's `BXI_Ac
 One BXI7010-19 (FW code 0.2.2 / config 0.2, `can_id` 1, `master_id` 0x11) on PCAN-M.2 `can0`
 via SocketCAN, without bxi_usb2can. Details: `minibexkai_docs/research/20260925_bxi_motor_pcan_socketcan_verification.md`.
 
-- Reply ID is `0x010 + can_id` (0x011) and byte 0 of the reply is `can_id` (0x01), not `master_id`.
+- With `can_id` 1, the observed reply ID was 0x011 and byte 0 was 0x01 (`can_id`, not
+  `master_id`). This observation alone cannot distinguish bitwise OR from addition.
 - One reply per MIT command (148/150 at 50 Hz classic, 1000/1000 with FD+BRS).
 - The motor replies in the format it received: classic, CAN FD, or CAN FD with BRS.
   1 Mbps / 5 Mbps FD+BRS ran 1000 frames with zero bus errors.
@@ -46,6 +48,16 @@ Measured with `tools/bxi_probe` (2026-09-25, classic and FD+BRS, 500 zero-gain c
   FD+BRS only saves about 0.05 ms. The time is dominated by the motor's processing, not the bus.
   Because the worker talks to the motors on one bus one after another, a bus can serve at most
   about 3 motors at 200 Hz (3 x 1.3 ms < 5 ms); 1 kHz needs a different scheme (C-08).
+
+## Supported motor CAN IDs
+
+The vendor guide defines the default relationship as `master_id = can_id | 0x010` and allows
+`master_id` to be configured independently. The driver assumes the motor still uses that default.
+For `can_id=0x11`, the documented OR gives 0x11 whereas addition would give 0x21. Hardware has
+only been checked at `can_id=1`, where both formulas give 0x11. Until ID 16 or higher and its
+response behavior are verified on hardware, configuration, the actuator constructor, and
+`bxi_probe` accept motor IDs 1 through 15 only. In this range, request IDs 0x01–0x0F and
+default reply IDs 0x11–0x1F do not overlap.
 
 ## Temperature sensor faults
 

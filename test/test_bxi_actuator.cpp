@@ -3,6 +3,7 @@
 #include <cmath>
 #include <deque>
 #include <limits>
+#include <stdexcept>
 #include <thread>
 
 #include <gtest/gtest.h>
@@ -152,6 +153,17 @@ TEST(BxiActuator, RejectsNanWithoutTransmitting)
   EXPECT_FALSE(driver.sendControl(
     std::numeric_limits<double>::quiet_NaN(), 0.0, 0.0, 0.0, 0.0).valid);
   EXPECT_EQ(bus.sent_.size(), sends_before);
+}
+
+TEST(BxiActuator, RejectsMotorCanId16)
+{
+  EmulatedBus bus;
+  ASSERT_TRUE(bus.open("emulated0"));
+  BxiSpec spec;
+  EXPECT_NO_THROW(BxiActuatorDriver(&bus, 15, 1, 0.0, -1.0, 1.0, 20.0, 1.0, spec));
+  EXPECT_THROW(
+    BxiActuatorDriver(&bus, 16, 1, 0.0, -1.0, 1.0, 20.0, 1.0, spec),
+    std::invalid_argument);
 }
 
 TEST(BxiActuator, LatchesSafeStopAndStopsNewCommandsAfterTimeouts)

@@ -78,4 +78,6 @@ TEST(MitProtocol, UsesStandardMasterIdRelationship)
 {
   EXPECT_EQ(protocol::defaultMasterId(1), 0x11U);
   EXPECT_EQ(protocol::defaultMasterId(7), 0x17U);
+  EXPECT_EQ(protocol::defaultMasterId(0x0F), 0x1FU);
+  EXPECT_EQ(protocol::defaultMasterId(0x11), 0x11U);  // OR differs from addition above ID 15.
 }

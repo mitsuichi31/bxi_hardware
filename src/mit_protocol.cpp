@@ -134,6 +134,7 @@ std::array<uint8_t, 8> encodeSpecialCommand(SpecialCommand command)
 
 uint32_t defaultMasterId(uint32_t motor_can_id)
 {
+  // BXI CAN Communication Guide §5.3 defines a bitwise OR, not addition.
   return motor_can_id | 0x010U;
 }
 

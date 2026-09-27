@@ -148,6 +148,14 @@ TEST(ActivationRollback, FailedRequiredJointDisablesEarlierJointAndClosesBus)
   EXPECT_GT(system.created_buses[0]->close_count, 0);
 }
 
+TEST(Configuration, RejectsMotorCanId16BeforeOpeningBus)
+{
+  TestSystemInterface system;
+  EXPECT_EQ(system.on_init(hardwareInfo("invalid_can_id16.yaml")),
+    hardware_interface::CallbackReturn::ERROR);
+  EXPECT_TRUE(system.created_buses.empty());
+}
+
 TEST(ActivationRollback, LaterBusOpenFailureDisablesEarlierBusAndClosesIt)
 {
   TestSystemInterface system;

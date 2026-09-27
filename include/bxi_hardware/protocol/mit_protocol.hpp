@@ -9,6 +9,10 @@
 namespace bxi_hardware::protocol
 {
 
+// Higher motor IDs are not enabled until the default master-ID relationship is verified on
+// hardware; IDs 1..15 also keep command IDs separate from the 0x10..0x1F reply-ID block.
+inline constexpr uint32_t kMaxSupportedMotorCanId = 0x0FU;
+
 struct MitLimits
 {
   double p_min{-12.5};
