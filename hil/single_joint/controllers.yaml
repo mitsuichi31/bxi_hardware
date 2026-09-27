@@ -1,6 +1,8 @@
 controller_manager:
   ros__parameters:
     update_rate: 200
+    thread_priority: 50
+    lock_memory: true
 
     joint_state_broadcaster:
       type: joint_state_broadcaster/JointStateBroadcaster

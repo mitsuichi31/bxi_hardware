@@ -35,6 +35,36 @@ source install/setup.bash
 apt 版は apt の `controller_interface` に合わせてビルドされていて、ワークスペースの fork の ros2_control と ABI が合わず、`joint1_command` の有効化で `ros2_control_node` が落ちる（2026-09-25 に発生）。
 ワークスペース側の `infrastructure/apply_colcon_ignore.sh` でビルド対象に戻している。
 
+### controller_manager の RT 更新スレッド
+
+`hil/single_joint/controllers.yaml` は更新周期 200 Hz、`SCHED_FIFO` 優先度 50、メモリ固定を指定する。
+`docker/compose.yaml` の `ulimits.rtprio: 99` と `ulimits.memlock: -1` が、非 root の `ros` ユーザーに RT 優先度とメモリ固定を許可する。`cap_add: SYS_NICE` だけでは、`ros` ユーザーの実効 capability は増えない。
+
+Compose の変更を適用するには、コンテナの**再作成**が必要。VS Code Dev Container を使っている場合は VS Code の「Dev Containers: Rebuild Container」で再作成する（作業中のターミナル接続は切れる）。通常の Compose 起動なら、ホストで `cd docker && docker compose up -d --force-recreate minibex_dev` を実行する。再作成後、コンテナ内で次を確認する。
+
+```bash
+uname -r                 # ホストと同じ realtime カーネル
+cat /sys/kernel/realtime # 1
+ulimit -r                # 99
+ulimit -l                # unlimited
+```
+
+`ros2 launch bxi_hardware single_joint_hil.launch.py` の起動ログに `Successful set up FIFO RT scheduling policy with priority 50.` があり、`Unable to lock the memory` がないことを確認する。ログに出る `Spawning ... RT thread` は起動の宣言であり、成功の証拠ではない。別端末でプロセスと各スレッドを調べる。
+
+```bash
+pgrep -af '/controller_manager/ros2_control_node' # PID を確認
+cm_pid=12345                                      # 上で確認した PID に置き換える
+ps -T -p "$cm_pid" -o pid,tid,cls,rtprio,comm     # FF / 50 の TID を確認
+chrt -p 12346                                     # FF / 50 の TID に置き換える
+sed -n '/^VmLck:/p' "/proc/$cm_pid/status"        # メモリ固定量を確認
+```
+
+2026-09-27 の設定変更前、稼働中の Dev Container では `ulimit -r` が 0、`ulimit -l` が 8192 KiB で、モーターを使わない `controller_manager` 単体起動はメモリ固定と FIFO 設定の両方に失敗した。再作成後の Dev Container では `ulimit -r` が 99、`ulimit -l` が unlimited。HIL の `controllers.yaml` を使った単体起動で更新周期 200 Hz が読み込まれ、更新スレッドが OS 上で `FF / 50`、`chrt -p` で `SCHED_FIFO / 50`、`VmLck` は約 1.9 GiB だった。実機や CAN を使わない `minibexkai_bringup mock.launch.py` も 200 Hz で起動し、mock hardware と controller 2件が有効化された。約 12 秒の観測では overrun 警告は出ていない。単体起動には robot description を渡しておらず、mock は BXI の CAN worker を含まないため、実機 HIL でも確認した。
+
+同日、`can0` が `ERROR-ACTIVE` で競合する制御プロセスがないことを確認し、`single_joint_hil.launch.py` を指令トピックへの送信なしで約 14 秒起動した。`BxiSystemInterface` がロードされ、`joint1` の enable、CAN worker の 200 Hz 起動、2つの controller の有効化に成功。更新スレッドは `ps` で `FF / 50`、`chrt -p` で `SCHED_FIFO / 50`、`VmLck` は 2,567,316 kB だった。メモリ固定失敗と overrun の警告は出なかった。SIGINT で終了し、worker 停止と `on_deactivate` を経て `ros2_control_node` は正常終了した。指令は送っておらず、実機制御中の周期遅れの分布と CAN worker の遅れはまだ測定していない。
+
+`BxiSystemInterface` の CAN worker はこの更新スレッドとは別で、今回の RT 設定の対象外。CAN 送信周期や指令から実機応答までの遅延は、別途測定する。
+
 ## 1. 前提の確認（bxi_probe、モーターは力を出さない）
 
 ```bash
