@@ -65,6 +65,22 @@ sed -n '/^VmLck:/p' "/proc/$cm_pid/status"        # メモリ固定量を確認
 
 `BxiSystemInterface` の CAN worker はこの更新スレッドとは別で、今回の RT 設定の対象外。CAN 送信周期や指令から実機応答までの遅延は、別途測定する。
 
+### CAN worker の周期を計測する
+
+CAN worker は現在 `SCHED_OTHER`。計測時だけ `BXI_WORKER_TIMING_DIR` に書き込み可能な既存ディレクトリを指定する。周期中は事前確保したバッファへ記録し、軸の disable と CAN バスの close が終わった後に、バスごとの `*_cycles.csv` と `*_transactions.csv` を保存する。通常の起動では計測を行わない。1バスあたり20,000周期分を確保し、超過したサンプル数は CSV 先頭の `dropped_*` に残す。強制終了時は CSV を保存できないため、通常の SIGINT で停止する。
+
+```bash
+mkdir -p /ws/log
+BXI_WORKER_TIMING_DIR=/ws/log ros2 launch bxi_hardware single_joint_hil.launch.py
+# Ctrl+C で停止後、ログに表示されたファイル名の末尾 _cycles.csv / _transactions.csv を確認する。
+python3 /ws/src/bxi_hardware/hil/single_joint/analyze_worker_timing.py \
+  /ws/log/bxi_worker_can0_1790496612659  # 番号は今回の起動ログに合わせる
+```
+
+2026-09-27 の指令なし1軸 HIL ベースラインでは、6,756周期の平均開始間隔が5.1108 ms（約195.7 Hz）、worker 作業時間の中央値1.3127 ms・最大1.5377 ms、CAN 取引時間の中央値1.3082 ms・最大1.5330 msだった。5 msを超えた作業周期、無効応答、計測バッファ欠測は0。計測オン・オフの短い CAN 時刻比較では明確な悪化は観測されなかった。条件、p99などの分布、生データはワークスペース側の `docs/test-reports/2026-09-27-bxi-worker-baseline.md` に記録した。これは worker の優先度を変更する前の値で、指令送信時やタイムアウト時の遅れは含まない。
+
+同じ条件で `can_frame_format.can0` だけを変えた CAN FD / CAN FD+BRS の実測は、ワークスペース側の `docs/test-reports/2026-09-27-bxi-worker-can-fd.md` に記録した。CAN取引時間の中央値は、Classic 1.3082 ms、FD（BRSなし）1.3272 ms、FD+BRS 1.2572 ms。3モードとも worker の作業時間は5 ms以内だが、周期開始間隔は約5.1 msのままだった。既定の `bxi_hardware.yaml` は Classic CAN のままにしている。
+
 ## 1. 前提の確認（bxi_probe、モーターは力を出さない）
 
 ```bash

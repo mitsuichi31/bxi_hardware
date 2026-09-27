@@ -4,9 +4,15 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <exception>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <set>
+
+#include <pthread.h>
+#include <unistd.h>
 
 #include <yaml-cpp/yaml.h>
 
@@ -320,6 +326,17 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_activate(
     return hardware_interface::CallbackReturn::ERROR;
   };
   try {
+    const char * timing_dir = std::getenv("BXI_WORKER_TIMING_DIR");
+    worker_timing_dir_ = timing_dir == nullptr ? "" : timing_dir;
+    if (!worker_timing_dir_.empty() &&
+      (!std::filesystem::is_directory(worker_timing_dir_) ||
+      ::access(worker_timing_dir_.c_str(), W_OK) != 0))
+    {
+      RCLCPP_ERROR(logger(), "worker timing directory is missing or not writable: %s",
+        worker_timing_dir_.c_str());
+      return fail_activation();
+    }
+
     for (auto & [bus_name, indices] : bus_joints) {
       auto bus = makeBus(bus_formats_[bus_name]);
       if (!bus->open(bus_name)) {
@@ -412,7 +429,17 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_activate(
 
     running_ = true;
     for (auto & [bus_name, live] : live_joints_) {
-      workers_.emplace_back(&BxiSystemInterface::workerLoop, this, bus_name, live);
+      WorkerTimingTrace * timing = nullptr;
+      if (!worker_timing_dir_.empty()) {
+        constexpr size_t kTimingCycleCapacity = 20000;
+        auto trace = std::make_unique<WorkerTimingTrace>();
+        trace->cycles.resize(kTimingCycleCapacity);
+        trace->transactions.resize(kTimingCycleCapacity * live.size());
+        trace->period_ns = static_cast<int64_t>(1e9 / can_hz_);
+        timing = trace.get();
+        worker_timing_.emplace(bus_name, std::move(trace));
+      }
+      workers_.emplace_back(&BxiSystemInterface::workerLoop, this, bus_name, live, timing);
     }
   } catch (const std::exception & e) {
     RCLCPP_ERROR(logger(), "起動中に例外: %s", e.what());
@@ -444,6 +471,7 @@ void BxiSystemInterface::releaseResources()
   for (auto & [name, bus] : buses_) {
     bus->close();
   }
+  writeWorkerTiming();
   buses_.clear();
   live_joints_.clear();
   for (auto & jr : joints_) {
@@ -462,13 +490,91 @@ void BxiSystemInterface::stopWorkers()
   workers_.clear();
 }
 
+void BxiSystemInterface::writeWorkerTiming()
+{
+  // Called only after the workers have joined and every actuator has been disabled.
+  const auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+    std::chrono::system_clock::now().time_since_epoch()).count();
+  for (const auto & [bus_name, trace_ptr] : worker_timing_) {
+    const auto & trace = *trace_ptr;
+    std::string safe_bus_name = bus_name;
+    for (char & ch : safe_bus_name) {
+      if (!((ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'Z') ||
+        (ch >= 'a' && ch <= 'z') || ch == '_' || ch == '-'))
+      {
+        ch = '_';
+      }
+    }
+    const auto stem = std::filesystem::path(worker_timing_dir_) /
+      ("bxi_worker_" + safe_bus_name + "_" + std::to_string(timestamp));
+    const auto cycle_path = stem.string() + "_cycles.csv";
+    const auto transaction_path = stem.string() + "_transactions.csv";
+
+    std::ofstream cycle_file(cycle_path);
+    if (!cycle_file) {
+      RCLCPP_ERROR(logger(), "worker timing CSV を開けません: %s", cycle_path.c_str());
+    } else {
+      cycle_file << "#period_ns=" << trace.period_ns << ",dropped_cycles=" <<
+        trace.dropped_cycles << ",dropped_transactions=" << trace.dropped_transactions << '\n';
+      cycle_file << "cycle,start_lateness_ns,interval_ns,allocation_ns,"
+        "target_lock_wait_ns,target_lock_hold_ns,can_ns,feedback_lock_wait_ns,"
+        "feedback_lock_hold_ns,work_ns,transactions,invalid_responses\n";
+      const auto count = std::min(trace.cycle_count, trace.cycles.size());
+      for (size_t i = 0; i < count; ++i) {
+        const auto & row = trace.cycles[i];
+        cycle_file << row.cycle << ',' << row.start_lateness_ns << ',' << row.interval_ns << ',' <<
+          row.allocation_ns << ',' << row.target_lock_wait_ns << ',' <<
+          row.target_lock_hold_ns << ',' << row.can_ns << ',' << row.feedback_lock_wait_ns << ',' <<
+          row.feedback_lock_hold_ns << ',' << row.work_ns << ',' << row.transactions << ',' <<
+          row.invalid_responses << '\n';
+      }
+      cycle_file.flush();
+      if (!cycle_file) {
+        RCLCPP_ERROR(logger(), "worker timing CSV 書込失敗: %s", cycle_path.c_str());
+      }
+    }
+
+    std::ofstream transaction_file(transaction_path);
+    if (!transaction_file) {
+      RCLCPP_ERROR(logger(), "worker timing CSV を開けません: %s", transaction_path.c_str());
+    } else {
+      transaction_file << "cycle,joint_index,duration_ns,valid\n";
+      const auto count = std::min(trace.transaction_count, trace.transactions.size());
+      for (size_t i = 0; i < count; ++i) {
+        const auto & row = trace.transactions[i];
+        transaction_file << row.cycle << ',' << row.joint_index << ',' << row.duration_ns << ',' <<
+          (row.valid ? 1 : 0) << '\n';
+      }
+      transaction_file.flush();
+      if (!transaction_file) {
+        RCLCPP_ERROR(logger(), "worker timing CSV 書込失敗: %s", transaction_path.c_str());
+      }
+    }
+    RCLCPP_INFO(logger(), "[%s] worker timing: %zu cycles, %zu transactions, %llu/%llu dropped; %s",
+      bus_name.c_str(), trace.cycle_count, trace.transaction_count,
+      static_cast<unsigned long long>(trace.dropped_cycles),
+      static_cast<unsigned long long>(trace.dropped_transactions), stem.string().c_str());
+  }
+  worker_timing_.clear();
+  worker_timing_dir_.clear();
+}
+
 // ---------------------------------------------------------------------------
 // workerLoop
 // ---------------------------------------------------------------------------
-void BxiSystemInterface::workerLoop(std::string bus_name, std::vector<size_t> indices)
+void BxiSystemInterface::workerLoop(
+  std::string bus_name, std::vector<size_t> indices, WorkerTimingTrace * timing)
 {
   using clock = std::chrono::steady_clock;
+  const auto elapsed_ns = [](clock::time_point start, clock::time_point end) {
+      return std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+    };
   const auto period = std::chrono::nanoseconds(static_cast<int64_t>(1e9 / can_hz_));
+  clock::time_point previous_start{};
+  const auto thread_name = ("bxi_" + bus_name).substr(0, 15);
+  if (pthread_setname_np(pthread_self(), thread_name.c_str()) != 0) {
+    RCLCPP_WARN(logger(), "[%s] worker thread name could not be set", bus_name.c_str());
+  }
   RCLCPP_INFO(logger(), "[%s] worker開始 (%zu motors, %dHz)",
               bus_name.c_str(), indices.size(), can_hz_);
 
@@ -477,21 +583,42 @@ void BxiSystemInterface::workerLoop(std::string bus_name, std::vector<size_t> in
       break;
     }
     const auto t0 = clock::now();
+    WorkerTimingCycle sample;
+    if (timing != nullptr) {
+      sample.cycle = timing->cycle_count;
+      if (previous_start != clock::time_point{}) {
+        sample.interval_ns = elapsed_ns(previous_start, t0);
+        sample.start_lateness_ns = std::max<int64_t>(0, sample.interval_ns - period.count());
+      }
+      previous_start = t0;
+    }
 
     std::vector<double> lp(indices.size()), lv(indices.size()), lkp(indices.size()),
       lkd(indices.size()), leff(indices.size());
     std::vector<double> ofp(indices.size()), ofv(indices.size()), ofe(indices.size()),
       oft(indices.size());
+    if (timing != nullptr) {
+      sample.allocation_ns = elapsed_ns(t0, clock::now());
+    }
+    const auto target_lock_start = timing != nullptr ? clock::now() : t0;
     {
       std::lock_guard<std::mutex> lk(data_mutex_);
+      const auto target_lock_acquired = timing != nullptr ? clock::now() : t0;
+      if (timing != nullptr) {
+        sample.target_lock_wait_ns = elapsed_ns(target_lock_start, target_lock_acquired);
+      }
       for (size_t k = 0; k < indices.size(); ++k) {
         size_t i = indices[k];
         lp[k] = tgt_pos_[i]; lv[k] = tgt_vel_[i]; lkp[k] = tgt_kp_[i];
         lkd[k] = tgt_kd_[i]; leff[k] = tgt_eff_[i];
         ofp[k] = fb_pos_[i]; ofv[k] = fb_vel_[i]; ofe[k] = fb_eff_[i]; oft[k] = fb_temp_[i];
       }
+      if (timing != nullptr) {
+        sample.target_lock_hold_ns = elapsed_ns(target_lock_acquired, clock::now());
+      }
     }
 
+    const auto can_start = timing != nullptr ? clock::now() : t0;
     for (size_t k = 0; k < indices.size(); ++k) {
       if (safe_stopped_) {
         break;
@@ -500,7 +627,25 @@ void BxiSystemInterface::workerLoop(std::string bus_name, std::vector<size_t> in
       if (joints_[i].overheated) {
         continue;
       }
+      const auto transaction_start = timing != nullptr ? clock::now() : t0;
       auto fb = joints_[i].actuator->sendControl(lp[k], lv[k], lkp[k], lkd[k], leff[k]);
+      if (timing != nullptr) {
+        WorkerTimingTransaction transaction;
+        transaction.cycle = sample.cycle;
+        transaction.joint_index = i;
+        transaction.duration_ns = elapsed_ns(transaction_start, clock::now());
+        transaction.valid = fb.valid;
+        if (timing->transaction_count < timing->transactions.size()) {
+          timing->transactions[timing->transaction_count] = transaction;
+        } else {
+          ++timing->dropped_transactions;
+        }
+        ++timing->transaction_count;
+        ++sample.transactions;
+        if (!fb.valid) {
+          ++sample.invalid_responses;
+        }
+      }
       if (fb.valid) {
         ofp[k] = fb.position; ofv[k] = fb.velocity; ofe[k] = fb.effort; oft[k] = fb.temperature;
         if (!std::isfinite(fb.temperature)) {
@@ -523,13 +668,33 @@ void BxiSystemInterface::workerLoop(std::string bus_name, std::vector<size_t> in
           bus_name.c_str(), joints_[i].name.c_str());
       }
     }
+    if (timing != nullptr) {
+      sample.can_ns = elapsed_ns(can_start, clock::now());
+    }
 
+    const auto feedback_lock_start = timing != nullptr ? clock::now() : t0;
     {
       std::lock_guard<std::mutex> lk(data_mutex_);
+      const auto feedback_lock_acquired = timing != nullptr ? clock::now() : t0;
+      if (timing != nullptr) {
+        sample.feedback_lock_wait_ns = elapsed_ns(feedback_lock_start, feedback_lock_acquired);
+      }
       for (size_t k = 0; k < indices.size(); ++k) {
         size_t i = indices[k];
         fb_pos_[i] = ofp[k]; fb_vel_[i] = ofv[k]; fb_eff_[i] = ofe[k]; fb_temp_[i] = oft[k];
       }
+      if (timing != nullptr) {
+        sample.feedback_lock_hold_ns = elapsed_ns(feedback_lock_acquired, clock::now());
+      }
+    }
+    if (timing != nullptr) {
+      sample.work_ns = elapsed_ns(t0, clock::now());
+      if (timing->cycle_count < timing->cycles.size()) {
+        timing->cycles[timing->cycle_count] = sample;
+      } else {
+        ++timing->dropped_cycles;
+      }
+      ++timing->cycle_count;
     }
 
     if (safe_stopped_) {

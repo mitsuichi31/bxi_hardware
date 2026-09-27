@@ -4,6 +4,7 @@
 #define BXI_HARDWARE__BXI_SYSTEM_INTERFACE_HPP_
 
 #include <atomic>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -65,11 +66,47 @@ protected:
   virtual std::shared_ptr<CanBus> makeBus(CanFrameFormat format);
 
 private:
+  struct WorkerTimingCycle
+  {
+    uint64_t cycle = 0;
+    int64_t start_lateness_ns = 0;
+    int64_t interval_ns = 0;
+    int64_t allocation_ns = 0;
+    int64_t target_lock_wait_ns = 0;
+    int64_t target_lock_hold_ns = 0;
+    int64_t can_ns = 0;
+    int64_t feedback_lock_wait_ns = 0;
+    int64_t feedback_lock_hold_ns = 0;
+    int64_t work_ns = 0;
+    uint32_t transactions = 0;
+    uint32_t invalid_responses = 0;
+  };
+
+  struct WorkerTimingTransaction
+  {
+    uint64_t cycle = 0;
+    size_t joint_index = 0;
+    int64_t duration_ns = 0;
+    bool valid = false;
+  };
+
+  struct WorkerTimingTrace
+  {
+    std::vector<WorkerTimingCycle> cycles;
+    std::vector<WorkerTimingTransaction> transactions;
+    size_t cycle_count = 0;
+    size_t transaction_count = 0;
+    uint64_t dropped_cycles = 0;
+    uint64_t dropped_transactions = 0;
+    int64_t period_ns = 0;
+  };
+
   bool parseConfig();
   bool loadSpec(const std::string & motor_type);
-  void workerLoop(std::string bus_name, std::vector<size_t> indices);
+  void workerLoop(std::string bus_name, std::vector<size_t> indices, WorkerTimingTrace * timing);
   void stopWorkers();
   void releaseResources();
+  void writeWorkerTiming();
 
   size_t n_joints_ = 0;
 
@@ -97,6 +134,8 @@ private:
 
   std::vector<std::thread> workers_;
   std::map<std::string, std::vector<size_t>> live_joints_;
+  std::map<std::string, std::unique_ptr<WorkerTimingTrace>> worker_timing_;
+  std::string worker_timing_dir_;
   std::atomic<bool> running_{false};
   std::atomic<bool> safe_stopped_{false};
 };
