@@ -231,5 +231,101 @@ TEST(BxiActuator, UnrelatedFramesCannotExtendTransactionDeadline)
     protocol::encodeSpecialCommand(protocol::SpecialCommand::kDisable));
 }
 
+TEST(BxiActuator, EncodeControlBlockMatchesTheFrameSentBySendControl)
+{
+  EmulatedBus bus;
+  ASSERT_TRUE(bus.open("emulated0"));
+  auto driver = makeDriver(bus);
+  ASSERT_TRUE(driver.enable().valid);
+  const auto block = driver.encodeControlBlock(100.0, -3.0, 1000.0, 0.5, -2.0);
+  ASSERT_TRUE(block.has_value());
+  const size_t sends_before = bus.sent_.size();
+  ASSERT_TRUE(driver.sendControl(100.0, -3.0, 1000.0, 0.5, -2.0).valid);
+  ASSERT_EQ(bus.sent_.size(), sends_before + 1);
+  EXPECT_EQ(bus.sent_.back().data8(), *block);
+  EXPECT_EQ(bus.sent_.back().dlc, 8U);
+}
+
+TEST(BxiActuator, EncodeControlBlockRequiresEnableAndFiniteInputsAndSendsNothing)
+{
+  EmulatedBus bus;
+  ASSERT_TRUE(bus.open("emulated0"));
+  auto driver = makeDriver(bus);
+  EXPECT_FALSE(driver.encodeControlBlock(0.0, 0.0, 0.0, 0.0, 0.0).has_value());
+  ASSERT_TRUE(driver.enable().valid);
+  const size_t sends_after_enable = bus.sent_.size();
+  EXPECT_TRUE(driver.encodeControlBlock(0.0, 0.0, 0.0, 0.0, 0.0).has_value());
+  EXPECT_FALSE(driver.encodeControlBlock(
+    0.0, std::numeric_limits<double>::infinity(), 0.0, 0.0, 0.0).has_value());
+  EXPECT_EQ(bus.sent_.size(), sends_after_enable);
+}
+
+TEST(BxiActuator, DecodeMotorReplyChecksIdLengthAndPayloadMotorId)
+{
+  EmulatedBus bus;
+  const protocol::MitLimits limits;
+  const auto reply = bus.feedbackFrame(1);
+  const auto decoded = decodeMotorReply(reply, 1, limits);
+  ASSERT_TRUE(decoded.has_value());
+  EXPECT_EQ(decoded->motor_id, 1U);
+
+  EXPECT_FALSE(decodeMotorReply(bus.feedbackFrame(2), 1, limits).has_value());
+  auto extended = reply;
+  extended.extended = true;
+  EXPECT_FALSE(decodeMotorReply(extended, 1, limits).has_value());
+  auto long_frame = reply;
+  long_frame.dlc = 24;
+  EXPECT_FALSE(decodeMotorReply(long_frame, 1, limits).has_value());
+  auto wrong_payload_id = reply;
+  wrong_payload_id.data[0] = 2;  // reply ID of motor 1, payload naming motor 2
+  EXPECT_FALSE(decodeMotorReply(wrong_payload_id, 1, limits).has_value());
+}
+
+TEST(BxiActuator, ApplyFeedbackMatchesTheSequentialTransactionResult)
+{
+  EmulatedBus bus;
+  ASSERT_TRUE(bus.open("emulated0"));
+  BxiSpec spec;
+  spec.t_min = -80.0;
+  spec.t_max = 80.0;
+  BxiActuatorDriver driver(&bus, 1, -1, 0.3, -1.0, 1.0, 20.0, 1.0, spec, 1, 3);
+  ASSERT_TRUE(driver.enable().valid);
+  bus.ntc2_raw_ = 0x02;  // NTC2 sensor fault
+  const auto sequential = driver.sendControl(0.0, 0.0, 0.0, 0.0, 0.0);
+  ASSERT_TRUE(sequential.valid);
+
+  const auto decoded = decodeMotorReply(bus.feedbackFrame(1), 1, driver.limits());
+  ASSERT_TRUE(decoded.has_value());
+  const auto applied = driver.applyFeedback(*decoded);
+  EXPECT_TRUE(applied.valid);
+  EXPECT_DOUBLE_EQ(applied.position, sequential.position);
+  EXPECT_DOUBLE_EQ(applied.velocity, sequential.velocity);
+  EXPECT_DOUBLE_EQ(applied.effort, sequential.effort);
+  EXPECT_DOUBLE_EQ(applied.temperature, sequential.temperature);
+  EXPECT_TRUE(std::isnan(applied.motor_temperature));
+  EXPECT_TRUE(driver.motorTemperatureSensorFault());
+
+  bus.ntc2_raw_ = 0x5A;
+  driver.applyFeedback(*decodeMotorReply(bus.feedbackFrame(1), 1, driver.limits()));
+  EXPECT_FALSE(driver.motorTemperatureSensorFault());
+}
+
+TEST(BxiActuator, CommunicationFaultLatchesSafeStopOnce)
+{
+  EmulatedBus bus;
+  ASSERT_TRUE(bus.open("emulated0"));
+  auto driver = makeDriver(bus);
+  ASSERT_TRUE(driver.enable().valid);
+  const size_t sends_before = bus.sent_.size();
+  driver.latchCommunicationFault();
+  EXPECT_EQ(driver.state(), ActuatorState::kSafeStopped);
+  ASSERT_EQ(bus.sent_.size(), sends_before + 1);
+  EXPECT_EQ(bus.sent_.back().data8(),
+    protocol::encodeSpecialCommand(protocol::SpecialCommand::kDisable));
+  EXPECT_FALSE(driver.encodeControlBlock(0.0, 0.0, 0.0, 0.0, 0.0).has_value());
+  driver.latchCommunicationFault();
+  EXPECT_EQ(bus.sent_.size(), sends_before + 1);
+}
+
 }  // namespace
 }  // namespace bxi_hardware

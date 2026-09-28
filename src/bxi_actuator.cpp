@@ -39,6 +39,17 @@ BxiActuatorDriver::BxiActuatorDriver(
   }
 }
 
+std::optional<protocol::MitFeedback> decodeMotorReply(
+  const CanFrame & frame, int can_id, const protocol::MitLimits & limits)
+{
+  if (frame.extended || frame.dlc != 8 ||
+    frame.id != protocol::defaultMasterId(static_cast<uint32_t>(can_id)))
+  {
+    return std::nullopt;
+  }
+  return protocol::decodeFeedback(frame.data8(), limits, static_cast<uint8_t>(can_id));
+}
+
 protocol::MitLimits BxiActuatorDriver::limits() const
 {
   protocol::MitLimits value;
@@ -78,22 +89,12 @@ ActuatorFeedback BxiActuatorDriver::transact(const CanFrame & request)
     {
       break;
     }
-    if (response.extended || response.dlc != 8 ||
-      response.id != protocol::defaultMasterId(static_cast<uint32_t>(can_id_)))
-    {
-      continue;
-    }
-    const auto decoded = protocol::decodeFeedback(
-      response.data8(), limits(), static_cast<uint8_t>(can_id_));
+    const auto decoded = decodeMotorReply(response, can_id_, limits());
     if (!decoded.has_value()) {
       continue;
     }
     consecutive_timeouts_ = 0;
-    result.position = (decoded->position - offset_angle_) * motor_dir_;
-    result.velocity = decoded->velocity * motor_dir_;
-    result.effort = decoded->torque * motor_dir_;
-    updateTemperature(*decoded, result);
-    result.valid = true;
+    result = applyFeedback(*decoded);
     result.rx_kernel_realtime_ns = response.rx_kernel_realtime_ns;
     result.rx_userspace_realtime_ns = response.rx_userspace_realtime_ns;
     return result;
@@ -107,6 +108,17 @@ ActuatorFeedback BxiActuatorDriver::transact(const CanFrame & request)
       logger(), "motor id=%d entered safe-stop after %u consecutive timeouts", can_id_,
       consecutive_timeouts_);
   }
+  return result;
+}
+
+ActuatorFeedback BxiActuatorDriver::applyFeedback(const protocol::MitFeedback & decoded)
+{
+  ActuatorFeedback result;
+  result.position = (decoded.position - offset_angle_) * motor_dir_;
+  result.velocity = decoded.velocity * motor_dir_;
+  result.effort = decoded.torque * motor_dir_;
+  updateTemperature(decoded, result);
+  result.valid = true;
   return result;
 }
 
@@ -222,14 +234,14 @@ void BxiActuatorDriver::setAngleRange(double lower, double upper)
   upper_ = upper;
 }
 
-ActuatorFeedback BxiActuatorDriver::sendControl(
-  double p_ref, double v_ref, double kp, double kd, double tau_ff)
+std::optional<std::array<uint8_t, 8>> BxiActuatorDriver::encodeControlBlock(
+  double p_ref, double v_ref, double kp, double kd, double tau_ff) const
 {
   if (state_ != ActuatorState::kEnabled || !std::isfinite(p_ref) ||
     !std::isfinite(v_ref) || !std::isfinite(kp) || !std::isfinite(kd) ||
     !std::isfinite(tau_ff))
   {
-    return {};
+    return std::nullopt;
   }
 
   // Runtime commands are saturated at the configured physical and joint limits. The pure codec
@@ -242,7 +254,13 @@ ActuatorFeedback BxiActuatorDriver::sendControl(
   command.kp = std::clamp(kp, 0.0, spec_.kp_max);
   command.kd = std::clamp(kd, 0.0, spec_.kd_max);
   command.torque = std::clamp(tau_ff * motor_dir_, spec_.t_min, spec_.t_max);
-  const auto encoded = protocol::encodeCommand(command, limits());
+  return protocol::encodeCommand(command, limits());
+}
+
+ActuatorFeedback BxiActuatorDriver::sendControl(
+  double p_ref, double v_ref, double kp, double kd, double tau_ff)
+{
+  const auto encoded = encodeControlBlock(p_ref, v_ref, kp, kd, tau_ff);
   if (!encoded.has_value()) {
     return {};
   }

@@ -2,6 +2,9 @@
 #ifndef BXI_HARDWARE__ACTUATOR__BXI_ACTUATOR_HPP_
 #define BXI_HARDWARE__ACTUATOR__BXI_ACTUATOR_HPP_
 
+#include <array>
+#include <cstdint>
+#include <optional>
 #include <string>
 
 #include "bxi_hardware/actuator/actuator_driver.hpp"
@@ -23,6 +26,11 @@ struct BxiSpec
   double t_min = -50.0;  // BXI7010-19 ピークトルク
   double t_max =  50.0;
 };
+
+// Stateless check of one received frame, safe to call from a receive thread: an 8-byte
+// standard frame from the motor's reply ID whose payload names the same motor.
+std::optional<protocol::MitFeedback> decodeMotorReply(
+  const CanFrame & frame, int can_id, const protocol::MitLimits & limits);
 
 enum class ActuatorState
 {
@@ -63,6 +71,19 @@ public:
   ActuatorFeedback sendControl(
     double p_ref, double v_ref, double kp, double kd, double tau_ff) override;
 
+  // Helpers for the streamed transport, where sending and receiving run on separate threads.
+  // None is thread-safe: only the thread that owns this driver (the send thread while streaming,
+  // otherwise the lifecycle thread) may call them. The receive thread uses decodeMotorReply().
+  // Clamps and encodes a command; nullopt unless enabled and every input is finite.
+  std::optional<std::array<uint8_t, 8>> encodeControlBlock(
+    double p_ref, double v_ref, double kp, double kd, double tau_ff) const;
+  // Converts a decoded reply to joint units and updates the temperature-sensor fault flags.
+  ActuatorFeedback applyFeedback(const protocol::MitFeedback & decoded);
+  // Latches safe-stop after a streamed communication fault and sends a best-effort disable.
+  void latchCommunicationFault() {latchSafeStop();}
+  int canId() const {return can_id_;}
+  protocol::MitLimits limits() const;
+
   ActuatorState state() const {return state_;}
   uint32_t consecutiveTimeouts() const {return consecutive_timeouts_;}
   bool mosTemperatureSensorFault() const {return mos_sensor_fault_;}
@@ -73,7 +94,6 @@ private:
   ActuatorFeedback transact(const CanFrame & request);
   void latchSafeStop();
   void trySendDisable();
-  protocol::MitLimits limits() const;
   void updateTemperature(const protocol::MitFeedback & decoded, ActuatorFeedback & result);
 
   CanBus * bus_;
