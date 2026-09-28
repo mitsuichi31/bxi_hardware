@@ -69,6 +69,20 @@ def main():
         samples = cycles[1:] if key in ("interval_ns", "start_lateness_ns") else cycles
         show_metric(label, samples, key)
     show_metric("CAN transaction", transactions, "duration_ns")
+    if transactions and "rx_kernel_realtime_ns" in transactions[0]:
+        timestamped = [row for row in transactions
+                       if int(row["rx_kernel_realtime_ns"]) > 0
+                       and int(row["rx_userspace_realtime_ns"]) > 0]
+        print(f"RX kernel timestamps={len(timestamped)}/{len(transactions)}")
+        delays = sorted(int(row["rx_userspace_realtime_ns"])
+                        - int(row["rx_kernel_realtime_ns"])
+                        for row in timestamped)
+        if delays:
+            print("kernel RX to userspace read: "
+                  f"median={nearest_rank(delays, 0.5):.4f} "
+                  f"p99={nearest_rank(delays, 0.99):.4f} "
+                  f"p99.9={nearest_rank(delays, 0.999):.4f} "
+                  f"max={nearest_rank(delays, 1.0):.4f} ms")
 
 
 if __name__ == "__main__":

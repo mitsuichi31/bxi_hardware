@@ -96,6 +96,7 @@ TEST(VcanLifecycle, FdBrsBusSendsAndReceivesFdFrames)
   }
 
   SocketCanBus driver_bus(CanFrameFormat::kFdBrs);
+  driver_bus.setRxTimestamping(true);
   SocketCanBus emulator_bus(CanFrameFormat::kFdBrs);
   ASSERT_TRUE(driver_bus.open(interface_name)) << "vcan needs 'mtu 72' for CAN FD";
   ASSERT_TRUE(emulator_bus.open(interface_name));
@@ -113,7 +114,10 @@ TEST(VcanLifecycle, FdBrsBusSendsAndReceivesFdFrames)
   BxiSpec spec;
   BxiActuatorDriver driver(&driver_bus, 1, 1, 0.0, -1.0, 1.0, 20.0, 1.0, spec, 30, 2);
   EXPECT_TRUE(driver.enable().valid);
-  EXPECT_TRUE(driver.sendControl(0.1, 0.0, 20.0, 1.0, 0.0).valid);
+  const auto control_feedback = driver.sendControl(0.1, 0.0, 20.0, 1.0, 0.0);
+  ASSERT_TRUE(control_feedback.valid);
+  ASSERT_GT(control_feedback.rx_kernel_realtime_ns, 0);
+  EXPECT_GE(control_feedback.rx_userspace_realtime_ns, control_feedback.rx_kernel_realtime_ns);
   EXPECT_TRUE(driver.disable().valid);
   EXPECT_EQ(fd_brs_requests.load(), 3);
 
@@ -146,6 +150,27 @@ TEST(VcanLifecycle, FdBusRefusesAnInterfaceWithoutFd)
   }
   SocketCanBus bus(CanFrameFormat::kFd);
   EXPECT_FALSE(bus.open(interface_name));
+}
+
+TEST(VcanLifecycle, OptInKernelReceiveTimestampPrecedesUserspaceRead)
+{
+  const char * interface_name = std::getenv("BXI_VCAN_IFACE");
+  if (interface_name == nullptr) {
+    GTEST_SKIP() << "BXI_VCAN_IFACE is not configured";
+  }
+
+  SocketCanBus receiver;
+  receiver.setRxTimestamping(true);
+  SocketCanBus sender;
+  ASSERT_TRUE(receiver.open(interface_name));
+  ASSERT_TRUE(sender.open(interface_name));
+  ASSERT_TRUE(sender.send(makeFeedback(1)));
+
+  CanFrame reply;
+  ASSERT_TRUE(receiver.recv(reply, 100));
+  ASSERT_GT(reply.rx_kernel_realtime_ns, 0);
+  EXPECT_GE(reply.rx_userspace_realtime_ns, reply.rx_kernel_realtime_ns);
+  EXPECT_LT(reply.rx_userspace_realtime_ns - reply.rx_kernel_realtime_ns, 1000000000LL);
 }
 
 }  // namespace

@@ -94,6 +94,8 @@ ActuatorFeedback BxiActuatorDriver::transact(const CanFrame & request)
     result.effort = decoded->torque * motor_dir_;
     updateTemperature(*decoded, result);
     result.valid = true;
+    result.rx_kernel_realtime_ns = response.rx_kernel_realtime_ns;
+    result.rx_userspace_realtime_ns = response.rx_userspace_realtime_ns;
     return result;
   }
 

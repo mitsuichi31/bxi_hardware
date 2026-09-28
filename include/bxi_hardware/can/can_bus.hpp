@@ -19,6 +19,12 @@ struct CanFrame
   // Set on received frames. Outgoing frames use the bus-wide format (see SocketCanBus).
   bool fd = false;
   bool brs = false;
+  // Populated only when SocketCAN receive timestamping is enabled for a measurement run.
+  // Both use CLOCK_REALTIME; zero means that the timestamp was unavailable.
+  int64_t rx_kernel_realtime_ns = 0;
+  int64_t rx_userspace_realtime_ns = 0;
+  // Raw hardware RX clock; compare intervals only on the same CAN device.
+  int64_t rx_hardware_raw_ns = 0;
 };
 
 // Frame format used for every transmitted frame on a bus. BXI motors reply in the format they

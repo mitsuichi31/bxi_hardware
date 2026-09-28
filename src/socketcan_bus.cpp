@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <ctime>
 #include <cstring>
 #include <unistd.h>
 #include <net/if.h>
@@ -12,6 +13,8 @@
 #include <sys/select.h>
 #include <linux/can.h>
 #include <linux/can/raw.h>
+#include <linux/errqueue.h>
+#include <linux/net_tstamp.h>
 
 #include <rclcpp/rclcpp.hpp>
 
@@ -70,6 +73,28 @@ bool SocketCanBus::open(const std::string & ifname)
     fd_ = -1;
     return false;
   }
+  if (rx_timestamp_mode_ == RxTimestampMode::kSoftware) {
+    const int enabled = 1;
+    if (::setsockopt(fd_, SOL_SOCKET, SO_TIMESTAMPNS, &enabled, sizeof(enabled)) < 0) {
+      RCLCPP_ERROR(logger(), "[%s] SO_TIMESTAMPNS failed: %s",
+        ifname.c_str(), std::strerror(errno));
+      ::close(fd_);
+      fd_ = -1;
+      return false;
+    }
+  } else if (rx_timestamp_mode_ == RxTimestampMode::kHardware) {
+    // Request both timestamp types in a single SCM_TIMESTAMPING_NEW record. Do not combine
+    // SO_TIMESTAMPNS with SO_TIMESTAMPING: the kernel documents a false software timestamp case.
+    const int flags = SOF_TIMESTAMPING_RX_HARDWARE | SOF_TIMESTAMPING_RAW_HARDWARE |
+      SOF_TIMESTAMPING_RX_SOFTWARE | SOF_TIMESTAMPING_SOFTWARE;
+    if (::setsockopt(fd_, SOL_SOCKET, SO_TIMESTAMPING_NEW, &flags, sizeof(flags)) < 0) {
+      RCLCPP_ERROR(logger(), "[%s] SO_TIMESTAMPING_NEW failed: %s",
+        ifname.c_str(), std::strerror(errno));
+      ::close(fd_);
+      fd_ = -1;
+      return false;
+    }
+  }
 
   struct sockaddr_can addr{};
   addr.can_family = AF_CAN;
@@ -94,6 +119,23 @@ void SocketCanBus::close()
     ::close(fd_);
     fd_ = -1;
   }
+}
+
+bool SocketCanBus::setReceiveEnabled(bool enabled)
+{
+  std::lock_guard<std::mutex> lk(io_mutex_);
+  if (fd_ < 0) {
+    return false;
+  }
+  const struct can_filter accept_all{0, 0};
+  const void * filters = enabled ? static_cast<const void *>(&accept_all) : nullptr;
+  const socklen_t length = enabled ? sizeof(accept_all) : 0;
+  if (::setsockopt(fd_, SOL_CAN_RAW, CAN_RAW_FILTER, filters, length) < 0) {
+    RCLCPP_ERROR(logger(), "[%s] CAN_RAW_FILTER failed: %s", ifname_.c_str(),
+      std::strerror(errno));
+    return false;
+  }
+  return true;
 }
 
 bool SocketCanBus::send(const CanFrame & frame)
@@ -123,6 +165,29 @@ bool SocketCanBus::send(const CanFrame & frame)
     static rclcpp::Clock clock(RCL_STEADY_TIME);
     RCLCPP_WARN_THROTTLE(logger(), clock, 1000,
                          "[%s] write() failed: %s", ifname_.c_str(), std::strerror(errno));
+    return false;
+  }
+  return true;
+}
+
+bool SocketCanBus::sendFdBroadcast24(const std::array<uint8_t, 24> & payload)
+{
+  std::lock_guard<std::mutex> lk(io_mutex_);
+  if (fd_ < 0 || format_ == CanFrameFormat::kClassic) {
+    return false;
+  }
+
+  struct canfd_frame cf{};
+  cf.can_id = 0x7FFU;
+  cf.len = static_cast<uint8_t>(payload.size());
+  cf.flags = format_ == CanFrameFormat::kFdBrs ? CANFD_BRS : 0;
+  std::memcpy(cf.data, payload.data(), payload.size());
+  const ssize_t n = ::write(fd_, &cf, CANFD_MTU);
+  if (n != CANFD_MTU) {
+    static rclcpp::Clock clock(RCL_STEADY_TIME);
+    RCLCPP_WARN_THROTTLE(logger(), clock, 1000,
+                         "[%s] 24-byte FD broadcast write() failed: %s", ifname_.c_str(),
+                         std::strerror(errno));
     return false;
   }
   return true;
@@ -161,7 +226,58 @@ bool SocketCanBus::recv(CanFrame & out, int timeout_ms)
     }
 
     struct canfd_frame cf{};
-    const ssize_t n = ::read(fd_, &cf, sizeof(cf));
+    int64_t kernel_realtime_ns = 0;
+    int64_t userspace_realtime_ns = 0;
+    int64_t hardware_raw_ns = 0;
+    ssize_t n;
+    if (rx_timestamp_mode_ != RxTimestampMode::kOff) {
+      struct iovec iov{&cf, sizeof(cf)};
+      alignas(struct cmsghdr) char control[CMSG_SPACE(sizeof(struct scm_timestamping64))]{};
+      struct msghdr msg{};
+      msg.msg_iov = &iov;
+      msg.msg_iovlen = 1;
+      msg.msg_control = control;
+      msg.msg_controllen = sizeof(control);
+      n = ::recvmsg(fd_, &msg, 0);
+      struct timespec received_at{};
+      if (::clock_gettime(CLOCK_REALTIME, &received_at) == 0) {
+        userspace_realtime_ns = static_cast<int64_t>(received_at.tv_sec) * 1000000000LL +
+          received_at.tv_nsec;
+      }
+      if ((msg.msg_flags & MSG_CTRUNC) == 0) {
+        for (struct cmsghdr * cmsg = CMSG_FIRSTHDR(&msg); cmsg != nullptr;
+          cmsg = CMSG_NXTHDR(&msg, cmsg))
+        {
+          if (rx_timestamp_mode_ == RxTimestampMode::kSoftware &&
+            cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_TIMESTAMPNS &&
+            cmsg->cmsg_len >= CMSG_LEN(sizeof(struct timespec)))
+          {
+            struct timespec stamped_at{};
+            std::memcpy(&stamped_at, CMSG_DATA(cmsg), sizeof(stamped_at));
+            kernel_realtime_ns = static_cast<int64_t>(stamped_at.tv_sec) * 1000000000LL +
+              stamped_at.tv_nsec;
+            break;
+          } else if (rx_timestamp_mode_ == RxTimestampMode::kHardware &&
+            cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SO_TIMESTAMPING_NEW &&
+            cmsg->cmsg_len >= CMSG_LEN(sizeof(struct scm_timestamping64)))
+          {
+            struct scm_timestamping64 stamps{};
+            std::memcpy(&stamps, CMSG_DATA(cmsg), sizeof(stamps));
+            if (stamps.ts[0].tv_sec != 0 || stamps.ts[0].tv_nsec != 0) {
+              kernel_realtime_ns = static_cast<int64_t>(stamps.ts[0].tv_sec) * 1000000000LL +
+                stamps.ts[0].tv_nsec;
+            }
+            if (stamps.ts[2].tv_sec != 0 || stamps.ts[2].tv_nsec != 0) {
+              hardware_raw_ns = static_cast<int64_t>(stamps.ts[2].tv_sec) * 1000000000LL +
+                stamps.ts[2].tv_nsec;
+            }
+            break;
+          }
+        }
+      }
+    } else {
+      n = ::read(fd_, &cf, sizeof(cf));
+    }
     if (n != static_cast<ssize_t>(CAN_MTU) && n != static_cast<ssize_t>(CANFD_MTU)) {
       return false;
     }
@@ -178,6 +294,9 @@ bool SocketCanBus::recv(CanFrame & out, int timeout_ms)
     out.brs = out.fd && (cf.flags & CANFD_BRS) != 0;
     std::memset(out.data.data(), 0, out.data.size());
     std::memcpy(out.data.data(), cf.data, cf.len);
+    out.rx_kernel_realtime_ns = kernel_realtime_ns;
+    out.rx_userspace_realtime_ns = userspace_realtime_ns;
+    out.rx_hardware_raw_ns = hardware_raw_ns;
     return true;
   }
 }

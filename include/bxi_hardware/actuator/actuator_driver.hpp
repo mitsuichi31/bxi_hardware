@@ -17,6 +17,9 @@ struct ActuatorFeedback
   double motor_temperature = 0.0;  // [degC]
   uint32_t consecutive_timeouts = 0;
   bool valid = false;
+  // Optional SocketCAN measurement timestamps, CLOCK_REALTIME nanoseconds.
+  int64_t rx_kernel_realtime_ns = 0;
+  int64_t rx_userspace_realtime_ns = 0;
 };
 
 class ActuatorDriver

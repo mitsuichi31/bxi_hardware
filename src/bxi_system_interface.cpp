@@ -339,6 +339,9 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_activate(
 
     for (auto & [bus_name, indices] : bus_joints) {
       auto bus = makeBus(bus_formats_[bus_name]);
+      if (auto * socketcan = dynamic_cast<SocketCanBus *>(bus.get())) {
+        socketcan->setRxTimestamping(!worker_timing_dir_.empty());
+      }
       if (!bus->open(bus_name)) {
         RCLCPP_ERROR(logger(), "CANオープン失敗: %s", bus_name.c_str());
         return fail_activation();
@@ -538,12 +541,14 @@ void BxiSystemInterface::writeWorkerTiming()
     if (!transaction_file) {
       RCLCPP_ERROR(logger(), "worker timing CSV を開けません: %s", transaction_path.c_str());
     } else {
-      transaction_file << "cycle,joint_index,duration_ns,valid\n";
+      transaction_file << "cycle,joint_index,duration_ns,valid,tx_call_realtime_ns,"
+        "rx_kernel_realtime_ns,rx_userspace_realtime_ns\n";
       const auto count = std::min(trace.transaction_count, trace.transactions.size());
       for (size_t i = 0; i < count; ++i) {
         const auto & row = trace.transactions[i];
         transaction_file << row.cycle << ',' << row.joint_index << ',' << row.duration_ns << ',' <<
-          (row.valid ? 1 : 0) << '\n';
+          (row.valid ? 1 : 0) << ',' << row.tx_call_realtime_ns << ',' <<
+          row.rx_kernel_realtime_ns << ',' << row.rx_userspace_realtime_ns << '\n';
       }
       transaction_file.flush();
       if (!transaction_file) {
@@ -628,6 +633,9 @@ void BxiSystemInterface::workerLoop(
         continue;
       }
       const auto transaction_start = timing != nullptr ? clock::now() : t0;
+      const auto tx_call_realtime_ns = timing != nullptr ?
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count() : 0;
       auto fb = joints_[i].actuator->sendControl(lp[k], lv[k], lkp[k], lkd[k], leff[k]);
       if (timing != nullptr) {
         WorkerTimingTransaction transaction;
@@ -635,6 +643,9 @@ void BxiSystemInterface::workerLoop(
         transaction.joint_index = i;
         transaction.duration_ns = elapsed_ns(transaction_start, clock::now());
         transaction.valid = fb.valid;
+        transaction.tx_call_realtime_ns = tx_call_realtime_ns;
+        transaction.rx_kernel_realtime_ns = fb.rx_kernel_realtime_ns;
+        transaction.rx_userspace_realtime_ns = fb.rx_userspace_realtime_ns;
         if (timing->transaction_count < timing->transactions.size()) {
           timing->transactions[timing->transaction_count] = transaction;
         } else {

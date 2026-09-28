@@ -23,8 +23,19 @@ public:
   bool isOpen() const override { return fd_ >= 0; }
 
   bool send(const CanFrame & frame) override;
+  // Diagnostic FD broadcast for motor IDs 1-3. The regular CanFrame remains 8 bytes.
+  bool sendFdBroadcast24(const std::array<uint8_t, 24> & payload);
   bool recv(CanFrame & out, int timeout_ms) override;
   void flushRx() override;
+  // Configure before open(). Normal runs keep the original read() path.
+  void setRxTimestamping(bool enabled) {
+    rx_timestamp_mode_ = enabled ? RxTimestampMode::kSoftware : RxTimestampMode::kOff;
+  }
+  void setRxHardwareTimestamping(bool enabled) {
+    rx_timestamp_mode_ = enabled ? RxTimestampMode::kHardware : RxTimestampMode::kOff;
+  }
+  // Disable the receive filter on a send-only diagnostic socket, then restore it afterward.
+  bool setReceiveEnabled(bool enabled);
 
   const std::string & name() const override { return ifname_; }
   CanFrameFormat format() const { return format_; }
@@ -34,6 +45,8 @@ private:
   int fd_ = -1;
   std::string ifname_;
   std::mutex io_mutex_;
+  enum class RxTimestampMode { kOff, kSoftware, kHardware };
+  RxTimestampMode rx_timestamp_mode_ = RxTimestampMode::kOff;
 };
 
 }  // namespace bxi_hardware

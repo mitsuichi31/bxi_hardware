@@ -88,6 +88,9 @@ private:
     size_t joint_index = 0;
     int64_t duration_ns = 0;
     bool valid = false;
+    int64_t tx_call_realtime_ns = 0;
+    int64_t rx_kernel_realtime_ns = 0;
+    int64_t rx_userspace_realtime_ns = 0;
   };
 
   struct WorkerTimingTrace

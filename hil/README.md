@@ -69,6 +69,8 @@ sed -n '/^VmLck:/p' "/proc/$cm_pid/status"        # メモリ固定量を確認
 
 CAN worker は現在 `SCHED_OTHER`。計測時だけ `BXI_WORKER_TIMING_DIR` に書き込み可能な既存ディレクトリを指定する。周期中は事前確保したバッファへ記録し、軸の disable と CAN バスの close が終わった後に、バスごとの `*_cycles.csv` と `*_transactions.csv` を保存する。通常の起動では計測を行わない。1バスあたり20,000周期分を確保し、超過したサンプル数は CSV 先頭の `dropped_*` に残す。強制終了時は CSV を保存できないため、通常の SIGINT で停止する。
 
+計測を有効にしたときだけSocketCANの `SO_TIMESTAMPNS` を有効にし、`*_transactions.csv` に制御呼び出し直前・カーネル受信・ユーザー空間取込の `CLOCK_REALTIME` 時刻（ns）を追加する。受信時刻が取得できない取引は0になる。既存の `duration_ns` は単調時計の値で、絶対時刻列と直接引き算しない。`tx_call_realtime_ns` は `sendControl()` 呼び出し直前であり、CANフレームの実際の送出時刻ではない。カーネル受信時刻もオンワイヤ時刻ではない。計測しない起動は従来の `read()` 経路を使う。
+
 ```bash
 mkdir -p /ws/log
 BXI_WORKER_TIMING_DIR=/ws/log ros2 launch bxi_hardware single_joint_hil.launch.py
@@ -89,6 +91,39 @@ ros2 run bxi_hardware bxi_probe --iface can0 --can-id 1 --format classic --count
 # can0 が fd on なら、CAN FD でも確認する
 ros2 run bxi_hardware bxi_probe --iface can0 --can-id 1 --format fd_brs --count 500 \
   | tee /ws/log/bxi_probe_fd_brs_$(date +%Y%m%d_%H%M%S).log
+```
+
+12軸・1 kHzの[事前検証計画](../../../docs/plans/20260927_bxi_1000hz_12axis_feasibility_plan.md)では、ベンダーCAN通信ガイド§3のFDブロードキャストを1軸で確認する。`bxi_probe` の `--broadcast` はCAN FDのID `0x7FF` にモーターID 1用の8バイト無トルク指令を載せる。最初は `--menu-only` を併用する。このモードはEscの後に個別IDへdisableを送り、モーターID 1のMIT応答がある場合だけ無トルク指令を送る。明示的に `02 MOTOR` が表示された場合は送らない。enableは送らない。文字の `STATE` 行がない場合はMENU表示の確認はできていないと記録する。2026-09-28の実機では、disableの応答はあったが `STATE` 行は出なかった。実機の固定・電源遮断手段・競合プロセス不在を確認し、まず短い低レート試験で応答の有無を記録する。モーターID 2以上や24バイトの3軸指令は、このオプションの対象外。
+
+`bxi_probe` は実送信開始間隔と有効応答取込間隔から、設定値とは別に実測Hzと間隔分布を表示する。`--menu-only` では無応答または送信失敗を検出した時点で追加の指令を止める。間隔の値はユーザー空間の単調時計によるもので、CAN上の送出・到着時刻ではない。
+
+逐次送受信の `--rate 1000` は実機で1,000送信/1,000応答だったが、実送信は平均856.7 Hzだった。各応答を待つ方式のままでは1 ms周期に届かない。送信周期と受信を切り分ける `--stream` は、`--menu-only --broadcast` と併用したときだけ使える診断モードである。独立した受信ソケットを使い、予定送信数、実送信数、応答数、スキップ数と両方の時刻間隔を報告する。無応答が指定timeoutを超えた場合や異常温度・送信失敗では追加送信を止め、disableを試みる。まず低レートの短時間試験で動作を確かめる。応答に要求番号がないため、送信数と応答数が一致しても個別の指令との対応は確認できない。
+
+実機の送受信分離診断は1 kHz・100周期で100送信/100応答・スキップ0だったが、応答取込間隔の最大は2.081 msだった。以後の出力にはカーネル受信時刻の間隔も表示し、受信がカーネルに届く段階の遅れとユーザー空間への取込遅れを分ける。カーネル受信時刻は`CLOCK_REALTIME`、送信開始とユーザー空間取込は単調時計なので、異なる時計の絶対値を直接比較しない。
+
+新表示を使った1 kHz・100周期の再測定でも100送信/100応答・スキップ0だったが、応答取込の最大間隔は2.009 ms、カーネル受信の最大間隔も2.011 msだった。平均送信1 kHzと全数応答だけで「毎1 msに新しいフィードバック」を達成したとは判断しない。ソフトウェア受信時刻はオンワイヤ到着時刻ではないため、モーター・アダプタ・ドライバの切り分けにはハードウェアタイムスタンプまたは外部計測が必要となる。[診断レポート](../../../docs/test-reports/2026-09-28-bxi-1000hz-feasibility.md)に現在の判定をまとめた。すべてdisable応答後、enableなしの試験である。
+
+`peak_pciefd` の上流Linux 6.8ソースには、受信DMA割り込みの既定条件に約1 msの時限がある。原因かどうかは、次の診断で同じフレームのrawハードウェア受信間隔とソフトウェア受信間隔を比較する。新しい出力の「周期開始時の最新受信経過」は、制御側がその時点で読める最後のフィードバックの経過時間で、モーター内部の測定時刻は分からない。ハードウェア受信時刻が欠測すれば失敗扱いになる。実機の固定は確認済み。電源遮断は試験者が担当するが、その手段と直前の確認時刻を記録してから実行する。`restart-ms 100` の設定意図は未確認であり、bus-off後の自動復帰があり得る。
+
+最初の切り分けは、既存と同じ無トルク・enableなしの20周期・200 Hzで行う。コンテナ内で最新の `bxi_hardware` をビルドしたうえで、実機担当者が実行する。
+
+```bash
+ros2 run bxi_hardware bxi_probe --iface can0 --can-id 1 --format fd_brs \
+  --broadcast --menu-only --stream --hardware-timestamps --count 20 --rate 200
+```
+
+2026-09-28の200 Hz実機結果は20送信/20応答、ハードウェア時刻20/20、ハードウェア受信間隔の中央値4.999 ms・最大5.119 msだった。周期開始時の最新受信経過は19件で中央値3.723 ms・最大3.859 ms（初回1件欠測）。この試験で時刻取得を確認した。電源遮断手段と確認時刻はまだ記録されていない。
+
+同条件の1 kHz・100周期では100送信/100応答、ハードウェア時刻100/100、送信スキップ0。ハードウェア受信間隔は0.911〜1.048 ms、カーネルソフトウェア受信間隔は0〜2.032 msだった。周期開始時の最新受信経過は最大1.712 ms、1 ms超過38/98。ハードウェア受信時刻付与後のホスト経路で受信のまとまりが発生している。受信DMA割り込み時限が有力な原因だが、変更前後の比較はまだ行っていない。詳しくは[診断レポート](../../../docs/test-reports/2026-09-28-bxi-1000hz-feasibility.md)。
+
+```bash
+ros2 run bxi_hardware bxi_probe --iface can0 --can-id 1 --format fd_brs \
+  --broadcast --menu-only --stream --count 20 --rate 200
+```
+
+```bash
+ros2 run bxi_hardware bxi_probe --iface can0 --can-id 1 --format fd_brs \
+  --broadcast --menu-only --count 20 --rate 50
 ```
 
 確認すること:
