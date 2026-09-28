@@ -3,8 +3,10 @@
 #ifndef BXI_HARDWARE__CAN__SOCKETCAN_BUS_HPP_
 #define BXI_HARDWARE__CAN__SOCKETCAN_BUS_HPP_
 
+#include <cstdint>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include "bxi_hardware/can/can_bus.hpp"
 
@@ -22,9 +24,8 @@ public:
   void close() override;
   bool isOpen() const override { return fd_ >= 0; }
 
+  // Classic buses send at most 8 bytes; FD buses send any valid CAN FD length up to 64 bytes.
   bool send(const CanFrame & frame) override;
-  // Diagnostic FD broadcast for motor IDs 1-3. The regular CanFrame remains 8 bytes.
-  bool sendFdBroadcast24(const std::array<uint8_t, 24> & payload);
   bool recv(CanFrame & out, int timeout_ms) override;
   void flushRx() override;
   // Configure before open(). Normal runs keep the original read() path.
@@ -36,6 +37,9 @@ public:
   }
   // Disable the receive filter on a send-only diagnostic socket, then restore it afterward.
   bool setReceiveEnabled(bool enabled);
+  // Accept only these standard (11-bit) data-frame IDs on an open socket. An empty list is
+  // rejected; use setReceiveEnabled(false) for a send-only socket.
+  bool setReceiveStandardIds(const std::vector<uint32_t> & ids);
 
   const std::string & name() const override { return ifname_; }
   CanFrameFormat format() const { return format_; }

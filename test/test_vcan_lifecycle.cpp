@@ -1,7 +1,13 @@
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <thread>
+
+#include <linux/can.h>
+#include <net/if.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include <gtest/gtest.h>
 
@@ -150,6 +156,130 @@ TEST(VcanLifecycle, FdBusRefusesAnInterfaceWithoutFd)
   }
   SocketCanBus bus(CanFrameFormat::kFd);
   EXPECT_FALSE(bus.open(interface_name));
+}
+
+// Receives until a frame with the given ID arrives. Other frames on the shared vcan are ignored.
+bool receiveId(SocketCanBus & bus, uint32_t id, CanFrame & out)
+{
+  for (int i = 0; i < 20; ++i) {
+    if (bus.recv(out, 50) && !out.extended && out.id == id) {
+      return true;
+    }
+  }
+  return false;
+}
+
+CanFrame makePatternFrame(uint32_t id, uint8_t length)
+{
+  CanFrame frame;
+  frame.id = id;
+  frame.extended = false;
+  // dlc may exceed the array to test rejection; only the bytes that exist are filled.
+  frame.dlc = length;
+  for (size_t i = 0; i < std::min<size_t>(length, frame.data.size()); ++i) {
+    frame.data[i] = static_cast<uint8_t>(0xA0 + i);
+  }
+  return frame;
+}
+
+TEST(VcanLifecycle, FdBusSendsAndReceivesPayloadsUpTo64Bytes)
+{
+  const char * interface_name = std::getenv("BXI_VCAN_IFACE");
+  if (interface_name == nullptr) {
+    GTEST_SKIP() << "BXI_VCAN_IFACE is not configured";
+  }
+  SocketCanBus sender(CanFrameFormat::kFd);
+  SocketCanBus receiver(CanFrameFormat::kFd);
+  ASSERT_TRUE(sender.open(interface_name)) << "vcan needs 'mtu 72' for CAN FD";
+  ASSERT_TRUE(receiver.open(interface_name));
+
+  for (const uint8_t length : {8, 24, 64}) {
+    const auto frame = makePatternFrame(0x7FF, length);
+    ASSERT_TRUE(sender.send(frame)) << static_cast<int>(length);
+    CanFrame received;
+    ASSERT_TRUE(receiveId(receiver, 0x7FF, received)) << static_cast<int>(length);
+    EXPECT_TRUE(received.fd);
+    EXPECT_FALSE(received.brs);
+    ASSERT_EQ(received.dlc, length);
+    for (size_t i = 0; i < length; ++i) {
+      EXPECT_EQ(received.data[i], frame.data[i]) << "byte " << i;
+    }
+  }
+
+  // Lengths that SocketCAN would silently pad are refused instead.
+  for (const uint8_t length : {9, 13, 25, 65}) {
+    EXPECT_FALSE(sender.send(makePatternFrame(0x7FF, length))) << static_cast<int>(length);
+  }
+}
+
+TEST(VcanLifecycle, ClassicBusRefusesPayloadsLongerThanEightBytes)
+{
+  const char * interface_name = std::getenv("BXI_VCAN_IFACE");
+  if (interface_name == nullptr) {
+    GTEST_SKIP() << "BXI_VCAN_IFACE is not configured";
+  }
+  SocketCanBus bus;
+  ASSERT_TRUE(bus.open(interface_name));
+  EXPECT_TRUE(bus.send(makePatternFrame(0x123, 8)));
+  EXPECT_FALSE(bus.send(makePatternFrame(0x123, 12)));
+  EXPECT_FALSE(bus.send(makePatternFrame(0x123, 24)));
+}
+
+// CanFrame has no RTR flag, so remote frames are written through a plain raw socket.
+bool sendRemoteFrame(const char * interface_name, uint32_t id)
+{
+  const int fd = ::socket(PF_CAN, SOCK_RAW, CAN_RAW);
+  if (fd < 0) {
+    return false;
+  }
+  struct sockaddr_can addr{};
+  addr.can_family = AF_CAN;
+  addr.can_ifindex = static_cast<int>(::if_nametoindex(interface_name));
+  struct can_frame frame{};
+  frame.can_id = id | CAN_RTR_FLAG;
+  frame.len = 8;
+  const bool ok = addr.can_ifindex != 0 &&
+    ::bind(fd, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) == 0 &&
+    ::write(fd, &frame, sizeof(frame)) == static_cast<ssize_t>(sizeof(frame));
+  ::close(fd);
+  return ok;
+}
+
+TEST(VcanLifecycle, StandardIdFilterPassesOnlyListedReplies)
+{
+  const char * interface_name = std::getenv("BXI_VCAN_IFACE");
+  if (interface_name == nullptr) {
+    GTEST_SKIP() << "BXI_VCAN_IFACE is not configured";
+  }
+  SocketCanBus sender(CanFrameFormat::kFd);
+  SocketCanBus receiver(CanFrameFormat::kFd);
+  ASSERT_TRUE(sender.open(interface_name));
+  ASSERT_TRUE(receiver.open(interface_name));
+  EXPECT_FALSE(receiver.setReceiveStandardIds({}));
+  EXPECT_FALSE(receiver.setReceiveStandardIds({0x800}));
+  ASSERT_TRUE(receiver.setReceiveStandardIds({protocol::defaultMasterId(1)}));
+
+  // The broadcast command, another motor's reply, and extended-ID or remote frames with the
+  // listed ID must not reach the filtered socket.
+  ASSERT_TRUE(sender.send(makePatternFrame(0x7FF, 24)));
+  ASSERT_TRUE(sender.send(makeFeedback(2)));
+  CanFrame extended = makeFeedback(1);
+  extended.extended = true;
+  ASSERT_TRUE(sender.send(extended));
+  ASSERT_TRUE(sendRemoteFrame(interface_name, protocol::defaultMasterId(1)));
+  ASSERT_TRUE(sender.send(makeFeedback(1)));
+
+  CanFrame received;
+  ASSERT_TRUE(receiver.recv(received, 100));
+  EXPECT_EQ(received.id, protocol::defaultMasterId(1));
+  EXPECT_FALSE(received.extended);
+  EXPECT_EQ(received.dlc, 8U);
+  EXPECT_FALSE(receiver.recv(received, 50));
+
+  // Restoring the accept-all filter lets other IDs through again.
+  ASSERT_TRUE(receiver.setReceiveEnabled(true));
+  ASSERT_TRUE(sender.send(makeFeedback(2)));
+  ASSERT_TRUE(receiveId(receiver, protocol::defaultMasterId(2), received));
 }
 
 TEST(VcanLifecycle, OptInKernelReceiveTimestampPrecedesUserspaceRead)

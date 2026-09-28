@@ -138,13 +138,44 @@ bool SocketCanBus::setReceiveEnabled(bool enabled)
   return true;
 }
 
+bool SocketCanBus::setReceiveStandardIds(const std::vector<uint32_t> & ids)
+{
+  std::lock_guard<std::mutex> lk(io_mutex_);
+  if (fd_ < 0 || ids.empty()) {
+    return false;
+  }
+  std::vector<struct can_filter> filters;
+  filters.reserve(ids.size());
+  for (const uint32_t id : ids) {
+    if (id > CAN_SFF_MASK) {
+      return false;
+    }
+    // Match the ID exactly and exclude extended-ID and remote frames.
+    filters.push_back({id, CAN_SFF_MASK | CAN_EFF_FLAG | CAN_RTR_FLAG});
+  }
+  if (::setsockopt(fd_, SOL_CAN_RAW, CAN_RAW_FILTER, filters.data(),
+    static_cast<socklen_t>(filters.size() * sizeof(filters[0]))) < 0)
+  {
+    RCLCPP_ERROR(logger(), "[%s] CAN_RAW_FILTER failed: %s", ifname_.c_str(),
+      std::strerror(errno));
+    return false;
+  }
+  return true;
+}
+
 bool SocketCanBus::send(const CanFrame & frame)
 {
   std::lock_guard<std::mutex> lk(io_mutex_);
   if (fd_ < 0) {
     return false;
   }
-  if (frame.dlc > frame.data.size()) {
+  const bool length_ok = format_ == CanFrameFormat::kClassic ?
+    frame.dlc <= kClassicCanMaxDataLength : isValidCanFdDataLength(frame.dlc);
+  if (!length_ok) {
+    static rclcpp::Clock clock(RCL_STEADY_TIME);
+    RCLCPP_WARN_THROTTLE(logger(), clock, 1000, "[%s] refusing %u-byte frame on a %s bus",
+      ifname_.c_str(), static_cast<unsigned>(frame.dlc),
+      format_ == CanFrameFormat::kClassic ? "classic" : "CAN FD");
     return false;
   }
   struct canfd_frame cf{};
@@ -170,29 +201,6 @@ bool SocketCanBus::send(const CanFrame & frame)
   return true;
 }
 
-bool SocketCanBus::sendFdBroadcast24(const std::array<uint8_t, 24> & payload)
-{
-  std::lock_guard<std::mutex> lk(io_mutex_);
-  if (fd_ < 0 || format_ == CanFrameFormat::kClassic) {
-    return false;
-  }
-
-  struct canfd_frame cf{};
-  cf.can_id = 0x7FFU;
-  cf.len = static_cast<uint8_t>(payload.size());
-  cf.flags = format_ == CanFrameFormat::kFdBrs ? CANFD_BRS : 0;
-  std::memcpy(cf.data, payload.data(), payload.size());
-  const ssize_t n = ::write(fd_, &cf, CANFD_MTU);
-  if (n != CANFD_MTU) {
-    static rclcpp::Clock clock(RCL_STEADY_TIME);
-    RCLCPP_WARN_THROTTLE(logger(), clock, 1000,
-                         "[%s] 24-byte FD broadcast write() failed: %s", ifname_.c_str(),
-                         std::strerror(errno));
-    return false;
-  }
-  return true;
-}
-
 bool SocketCanBus::recv(CanFrame & out, int timeout_ms)
 {
   std::lock_guard<std::mutex> lk(io_mutex_);
@@ -200,8 +208,8 @@ bool SocketCanBus::recv(CanFrame & out, int timeout_ms)
     return false;
   }
 
-  // Frames longer than 8 bytes (e.g. 64-byte FD broadcasts from another node) do not fit
-  // CanFrame and are skipped until the deadline, like any other unrelated frame.
+  // FD frames up to 64 bytes are returned as-is. Callers that expect an 8-byte MIT reply check
+  // both the ID and the length.
   using clock = std::chrono::steady_clock;
   const auto deadline = clock::now() + std::chrono::milliseconds(std::max(timeout_ms, 0));
   while (true) {
@@ -282,10 +290,7 @@ bool SocketCanBus::recv(CanFrame & out, int timeout_ms)
       return false;
     }
     if (cf.len > out.data.size()) {
-      if (timeout_ms == 0) {
-        return false;
-      }
-      continue;
+      return false;  // Not produced by SocketCAN; guards the copy below.
     }
     out.extended = (cf.can_id & CAN_EFF_FLAG) != 0;
     out.id = cf.can_id & (out.extended ? CAN_EFF_MASK : CAN_SFF_MASK);

@@ -3,19 +3,50 @@
 #ifndef BXI_HARDWARE__CAN__CAN_BUS_HPP_
 #define BXI_HARDWARE__CAN__CAN_BUS_HPP_
 
+#include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 
 namespace bxi_hardware
 {
 
+inline constexpr size_t kClassicCanMaxDataLength = 8;
+inline constexpr size_t kCanFdMaxDataLength = 64;
+
+// CAN FD carries 0-8 bytes, then only these fixed lengths. SocketCAN would otherwise pad the
+// payload to the next length without telling the sender.
+constexpr bool isValidCanFdDataLength(size_t length)
+{
+  return length <= 8 || length == 12 || length == 16 || length == 20 || length == 24 ||
+         length == 32 || length == 48 || length == 64;
+}
+
 struct CanFrame
 {
   uint32_t id = 0;
   bool extended = true;
+  // Payload length in bytes (SocketCAN len), not the 4-bit DLC code.
   uint8_t dlc = 0;
-  std::array<uint8_t, 8> data{};
+  std::array<uint8_t, kCanFdMaxDataLength> data{};
+
+  template<size_t N>
+  void setData(const std::array<uint8_t, N> & bytes)
+  {
+    static_assert(N <= kCanFdMaxDataLength, "CAN FD payload is at most 64 bytes");
+    data.fill(0);
+    std::copy(bytes.begin(), bytes.end(), data.begin());
+    dlc = static_cast<uint8_t>(N);
+  }
+  // MIT commands and replies are 8-byte payloads.
+  std::array<uint8_t, 8> data8() const
+  {
+    std::array<uint8_t, 8> bytes{};
+    std::copy_n(data.begin(), bytes.size(), bytes.begin());
+    return bytes;
+  }
+
   // Set on received frames. Outgoing frames use the bus-wide format (see SocketCanBus).
   bool fd = false;
   bool brs = false;

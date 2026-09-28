@@ -103,8 +103,7 @@ public:
     CanFrame frame;
     frame.id = broadcast ? 0x7FFU : static_cast<uint32_t>(options_.can_id);
     frame.extended = false;
-    frame.dlc = 8;
-    frame.data = data;
+    frame.setData(data);
     const auto t0 = clock_type::now();
     if (sent_at != nullptr) {
       *sent_at = t0;
@@ -301,7 +300,7 @@ public:
         }
         if (motor_index >= 0) {
           const auto at = clock_type::now();
-          const auto fb = protocol::decodeFeedback(in.data, protocol::MitLimits{});
+          const auto fb = protocol::decodeFeedback(in.data8(), protocol::MitLimits{});
           if (!fb || fb->motor_id != motor_index + 1 ||
             !std::isfinite(fb->mos_temperature) || !std::isfinite(fb->motor_temperature) ||
             fb->mos_temperature > 80.0 || fb->motor_temperature > 80.0)
@@ -346,14 +345,16 @@ public:
     CanFrame command;
     command.id = 0x7FFU;
     command.extended = false;
-    command.dlc = 8;
-    command.data = protocol::encodeCommand(protocol::MitCommand{}, protocol::MitLimits{}).value();
-    std::array<uint8_t, 24> broadcast_24{};
+    const auto block =
+      protocol::encodeCommand(protocol::MitCommand{}, protocol::MitLimits{}).value();
     if (options_.broadcast_blocks == 3) {
+      std::array<uint8_t, 24> broadcast_24{};
       for (size_t motor = 0; motor < 3; ++motor) {
-        std::copy(command.data.begin(), command.data.end(),
-          broadcast_24.begin() + motor * command.data.size());
+        std::copy(block.begin(), block.end(), broadcast_24.begin() + motor * block.size());
       }
+      command.setData(broadcast_24);
+    } else {
+      command.setData(block);
     }
     const auto period = std::chrono::microseconds(1000000 / options_.rate_hz);
     const auto start = clock_type::now() + std::chrono::milliseconds(10);
@@ -402,8 +403,7 @@ public:
       if (no_reply) {
         break;
       }
-      const bool sent_ok = options_.broadcast_blocks == 3 ?
-        bus_.sendFdBroadcast24(broadcast_24) : bus_.send(command);
+      const bool sent_ok = bus_.send(command);
       if (!sent_ok) {
         ++send_failures_;
         fault.store(true);
@@ -516,7 +516,7 @@ public:
     if (!last_reply_) {
       return;
     }
-    const auto fb = protocol::decodeFeedback(last_reply_->data, protocol::MitLimits{});
+    const auto fb = protocol::decodeFeedback(last_reply_->data8(), protocol::MitLimits{});
     if (fb) {
       std::printf("[%s] 最後の応答: id=0x%02X pos=%+.4f rad vel=%+.3f rad/s tor=%+.3f N·m "
         "NTC1=%.1f degC NTC2=%.1f degC%s\n", label, fb->motor_id, fb->position, fb->velocity,

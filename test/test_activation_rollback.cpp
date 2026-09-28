@@ -37,9 +37,9 @@ public:
   {
     std::lock_guard<std::mutex> lock(mutex_);
     sent.push_back(frame);
-    const bool control_frame = frame.data !=
+    const bool control_frame = frame.data8() !=
       protocol::encodeSpecialCommand(protocol::SpecialCommand::kEnable) &&
-      frame.data != protocol::encodeSpecialCommand(protocol::SpecialCommand::kDisable);
+      frame.data8() != protocol::encodeSpecialCommand(protocol::SpecialCommand::kDisable);
     if (open_ && reply_ids.count(frame.id) != 0 && (!control_frame || reply_to_control)) {
       CanFrame feedback;
       feedback.id = protocol::defaultMasterId(frame.id);
@@ -77,7 +77,7 @@ public:
     std::lock_guard<std::mutex> lock(mutex_);
     for (const auto & frame : sent) {
       if (frame.id == id &&
-        frame.data == protocol::encodeSpecialCommand(protocol::SpecialCommand::kDisable))
+        frame.data8() == protocol::encodeSpecialCommand(protocol::SpecialCommand::kDisable))
       {
         return true;
       }

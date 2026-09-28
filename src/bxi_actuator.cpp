@@ -84,7 +84,7 @@ ActuatorFeedback BxiActuatorDriver::transact(const CanFrame & request)
       continue;
     }
     const auto decoded = protocol::decodeFeedback(
-      response.data, limits(), static_cast<uint8_t>(can_id_));
+      response.data8(), limits(), static_cast<uint8_t>(can_id_));
     if (!decoded.has_value()) {
       continue;
     }
@@ -126,8 +126,7 @@ void BxiActuatorDriver::trySendDisable()
   CanFrame disable_frame;
   disable_frame.id = static_cast<uint32_t>(can_id_);
   disable_frame.extended = false;
-  disable_frame.dlc = 8;
-  disable_frame.data = protocol::encodeSpecialCommand(protocol::SpecialCommand::kDisable);
+  disable_frame.setData(protocol::encodeSpecialCommand(protocol::SpecialCommand::kDisable));
   if (!bus_->send(disable_frame)) {
     RCLCPP_ERROR(logger(), "motor id=%d disable frame could not be sent", can_id_);
   }
@@ -171,8 +170,7 @@ ActuatorFeedback BxiActuatorDriver::sendSpecial(
   CanFrame frame;
   frame.id = static_cast<uint32_t>(can_id_);
   frame.extended = false;
-  frame.dlc = 8;
-  frame.data = protocol::encodeSpecialCommand(command);
+  frame.setData(protocol::encodeSpecialCommand(command));
   auto feedback = transact(frame);
   if (feedback.valid) {
     state_ = enables_motor ? ActuatorState::kEnabled : ActuatorState::kDisabled;
@@ -252,8 +250,7 @@ ActuatorFeedback BxiActuatorDriver::sendControl(
   CanFrame frame;
   frame.id = static_cast<uint32_t>(can_id_);
   frame.extended = false;
-  frame.dlc = 8;
-  frame.data = encoded.value();
+  frame.setData(encoded.value());
   return transact(frame);
 }
 

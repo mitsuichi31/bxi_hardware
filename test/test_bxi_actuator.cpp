@@ -178,7 +178,7 @@ TEST(BxiActuator, LatchesSafeStopAndStopsNewCommandsAfterTimeouts)
   EXPECT_FALSE(driver.sendControl(0.0, 0.0, 0.0, 0.0, 0.0).valid);
   EXPECT_EQ(driver.state(), ActuatorState::kSafeStopped);
   ASSERT_EQ(bus.sent_.size(), 4U);
-  EXPECT_EQ(bus.sent_.back().data, protocol::encodeSpecialCommand(protocol::SpecialCommand::kDisable));
+  EXPECT_EQ(bus.sent_.back().data8(), protocol::encodeSpecialCommand(protocol::SpecialCommand::kDisable));
   const size_t sends_at_stop = bus.sent_.size();
   EXPECT_FALSE(driver.sendControl(0.0, 0.0, 0.0, 0.0, 0.0).valid);
   EXPECT_EQ(bus.sent_.size(), sends_at_stop);
@@ -194,7 +194,7 @@ TEST(BxiActuator, TriesDisableWhenControlSendFails)
   EXPECT_FALSE(driver.sendControl(0.0, 0.0, 0.0, 0.0, 0.0).valid);
   EXPECT_EQ(driver.state(), ActuatorState::kSafeStopped);
   ASSERT_EQ(bus.sent_.size(), 3U);
-  EXPECT_EQ(bus.sent_.back().data, protocol::encodeSpecialCommand(protocol::SpecialCommand::kDisable));
+  EXPECT_EQ(bus.sent_.back().data8(), protocol::encodeSpecialCommand(protocol::SpecialCommand::kDisable));
   EXPECT_FALSE(driver.sendControl(0.0, 0.0, 0.0, 0.0, 0.0).valid);
   EXPECT_EQ(bus.sent_.size(), 3U);
 }
@@ -211,7 +211,7 @@ TEST(BxiActuator, RetryingDisableKeepsSafeStopLatched)
   const size_t sends_before_retry = bus.sent_.size();
   EXPECT_FALSE(driver.disable().valid);
   EXPECT_EQ(bus.sent_.size(), sends_before_retry + 1);
-  EXPECT_EQ(bus.sent_.back().data, protocol::encodeSpecialCommand(protocol::SpecialCommand::kDisable));
+  EXPECT_EQ(bus.sent_.back().data8(), protocol::encodeSpecialCommand(protocol::SpecialCommand::kDisable));
   EXPECT_EQ(driver.state(), ActuatorState::kSafeStopped);
 }
 
@@ -227,7 +227,7 @@ TEST(BxiActuator, UnrelatedFramesCannotExtendTransactionDeadline)
   EXPECT_FALSE(driver.sendControl(0.0, 0.0, 0.0, 0.0, 0.0).valid);
   EXPECT_LT(bus.unrelated_delivered_, 10);
   EXPECT_EQ(driver.state(), ActuatorState::kSafeStopped);
-  EXPECT_EQ(bus.sent_.back().data,
+  EXPECT_EQ(bus.sent_.back().data8(),
     protocol::encodeSpecialCommand(protocol::SpecialCommand::kDisable));
 }
 
