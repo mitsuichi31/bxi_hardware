@@ -118,6 +118,9 @@ private:
     bool broadcast = false;  // tx_frame: broadcast
     double stream_feedback_max_age_ms = 0.0;
     size_t isolated_id1_broadcast_blocks = 0;  // hil_isolated_id1_broadcast_blocks
+    int send_thread_priority = 0;     // SCHED_FIFO 1-98; 0 = SCHED_OTHER
+    int receive_thread_priority = 0;  // SCHED_FIFO 1-98; 0 = SCHED_OTHER
+    std::vector<int> thread_cpus;     // CPU affinity of both threads; empty keeps the default
   };
 
   bool parseConfig();

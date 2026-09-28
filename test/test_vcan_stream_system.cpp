@@ -14,6 +14,8 @@
 #include <thread>
 #include <vector>
 
+#include <sys/resource.h>
+
 #include <gtest/gtest.h>
 
 #include "bxi_hardware/bxi_system_interface.hpp"
@@ -588,6 +590,81 @@ TEST(StreamedSystemAt1kHz, SafeStopDisablesBeforeReportingTheStream)
   EXPECT_EQ(system.on_deactivate(rclcpp_lifecycle::State()),
     hardware_interface::CallbackReturn::SUCCESS);
   EXPECT_FALSE(std::filesystem::is_empty(dir));  // the CSVs were still written
+}
+
+// Thread settings from can_transport reach both stream threads (checked through the CSV header).
+TEST(StreamedSystemAt1kHz, AppliesConfiguredThreadScheduling)
+{
+  const char * iface = std::getenv("BXI_VCAN_IFACE");
+  if (iface == nullptr) {
+    GTEST_SKIP() << "BXI_VCAN_IFACE is not configured";
+  }
+  const auto dir = std::filesystem::path(::testing::TempDir()) / "bxi_stream_rt_timing";
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+  ASSERT_EQ(setenv("BXI_WORKER_TIMING_DIR", dir.c_str(), 1), 0);
+  struct UnsetTimingDir
+  {
+    ~UnsetTimingDir() {unsetenv("BXI_WORKER_TIMING_DIR");}
+  } unset_timing_dir;
+
+  MotorEmulator motors(iface, {1});
+  ASSERT_TRUE(motors.opened());
+  auto config = streamConfig(iface, 1000, 3.0, true, 1);
+  config.replace(config.find("stream_feedback_max_age_ms"), 0,
+    "send_thread_priority: 30, receive_thread_priority: 31, thread_cpus: [0, 1], ");
+  BxiSystemInterface system;
+  ASSERT_EQ(system.on_init(hardwareInfo(config, jointNames(1))),
+    hardware_interface::CallbackReturn::SUCCESS);
+  const auto activated = system.on_activate(rclcpp_lifecycle::State());
+  if (activated != hardware_interface::CallbackReturn::SUCCESS) {
+    GTEST_SKIP() << "activation failed; SCHED_FIFO may not be allowed here";
+  }
+  std::this_thread::sleep_for(20ms);
+  ASSERT_EQ(system.on_deactivate(rclcpp_lifecycle::State()),
+    hardware_interface::CallbackReturn::SUCCESS);
+  std::string metadata;
+  for (const auto & entry : std::filesystem::directory_iterator(dir)) {
+    const auto name = entry.path().filename().string();
+    if (name.size() > 11 && name.substr(name.size() - 11) == "_cycles.csv") {
+      std::ifstream(entry.path()) >> metadata;
+    }
+  }
+  EXPECT_NE(metadata.find("tx_thread=SCHED_FIFO_priority=30_cpus=0-1"), std::string::npos)
+    << metadata;
+  EXPECT_NE(metadata.find("rx_thread=SCHED_FIFO_priority=31_cpus=0-1"), std::string::npos)
+    << metadata;
+}
+
+// A priority the OS refuses fails activation and rolls back: every motor is disabled.
+TEST(StreamedSystemAt1kHz, RefusedThreadPriorityFailsActivationAndDisables)
+{
+  const char * iface = std::getenv("BXI_VCAN_IFACE");
+  if (iface == nullptr) {
+    GTEST_SKIP() << "BXI_VCAN_IFACE is not configured";
+  }
+  MotorEmulator motors(iface, {1, 2, 3});
+  ASSERT_TRUE(motors.opened());
+  auto config = streamConfig(iface, 1000, 3.0, true, 3);
+  config.replace(config.find("stream_feedback_max_age_ms"), 0, "send_thread_priority: 30, ");
+  BxiSystemInterface system;
+  ASSERT_EQ(system.on_init(hardwareInfo(config, jointNames(3))),
+    hardware_interface::CallbackReturn::SUCCESS);
+  rlimit saved{};
+  ASSERT_EQ(::getrlimit(RLIMIT_RTPRIO, &saved), 0);
+  rlimit none = saved;
+  none.rlim_cur = 0;
+  ASSERT_EQ(::setrlimit(RLIMIT_RTPRIO, &none), 0);
+  const auto activated = system.on_activate(rclcpp_lifecycle::State());
+  ::setrlimit(RLIMIT_RTPRIO, &saved);
+  if (activated == hardware_interface::CallbackReturn::SUCCESS) {
+    system.on_deactivate(rclcpp_lifecycle::State());
+    GTEST_SKIP() << "this process may use SCHED_FIFO regardless of RLIMIT_RTPRIO";
+  }
+  for (int id = 1; id <= 3; ++id) {
+    EXPECT_GE(motors.disables(id), 1) << id;
+  }
+  EXPECT_EQ(motors.broadcast_frames.load(), 0);
 }
 
 // A fault on one streamed bus stops and disables the other streamed bus as well.

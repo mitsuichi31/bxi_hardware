@@ -137,6 +137,19 @@ def test_streamed_bus_requires_max_age_of_at_least_two_periods(tmp_path):
 def test_stream_options_require_separate_rx(tmp_path):
     errors = transport_errors(tmp_path, "{tx_frame: broadcast}")
     assert any("require rx_mode: separate" in error for error in errors)
+    errors = transport_errors(tmp_path, "{send_thread_priority: 60}")
+    assert any("require rx_mode: separate" in error for error in errors)
+
+
+def test_thread_settings_are_range_checked(tmp_path):
+    base = "{rx_mode: separate, stream_feedback_max_age_ms: 3, "
+    assert transport_errors(
+        tmp_path, base + "send_thread_priority: 60, receive_thread_priority: 61, "
+        "thread_cpus: [2, 3]}") == []
+    errors = transport_errors(tmp_path, base + "send_thread_priority: 99}")
+    assert any("greater than the maximum of 98" in error for error in errors)
+    errors = transport_errors(tmp_path, base + "thread_cpus: []}")
+    assert any("[] is too short" in error for error in errors)
 
 
 def test_broadcast_needs_fd_and_ids_one_to_n(tmp_path):

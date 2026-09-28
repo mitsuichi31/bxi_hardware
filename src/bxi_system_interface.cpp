@@ -13,6 +13,7 @@
 #include <set>
 
 #include <pthread.h>
+#include <sched.h>
 #include <unistd.h>
 
 #include <yaml-cpp/yaml.h>
@@ -236,6 +237,7 @@ bool BxiSystemInterface::parseConfig()
       }
       BusTransport transport;
       bool has_max_age = false;
+      bool has_thread_setting = false;
       for (const auto & item : entry.second) {
         const auto key = item.first.as<std::string>();
         if (key == "rx_mode") {
@@ -257,6 +259,27 @@ bool BxiSystemInterface::parseConfig()
         } else if (key == "stream_feedback_max_age_ms") {
           transport.stream_feedback_max_age_ms = item.second.as<double>();
           has_max_age = true;
+        } else if (key == "send_thread_priority" || key == "receive_thread_priority") {
+          const int priority = item.second.as<int>();
+          if (priority < 1 || priority > 98) {
+            RCLCPP_ERROR(logger(), "can_transport.%s.%s は1〜98（SCHED_FIFO）", bus.c_str(),
+              key.c_str());
+            return false;
+          }
+          (key == "send_thread_priority" ? transport.send_thread_priority :
+          transport.receive_thread_priority) = priority;
+          has_thread_setting = true;
+        } else if (key == "thread_cpus") {
+          transport.thread_cpus = item.second.as<std::vector<int>>();
+          if (transport.thread_cpus.empty() ||
+            std::any_of(transport.thread_cpus.begin(), transport.thread_cpus.end(),
+            [](int cpu) {return cpu < 0 || cpu >= CPU_SETSIZE;}))
+          {
+            RCLCPP_ERROR(logger(), "can_transport.%s.thread_cpus は0以上のCPU番号の空でないリスト",
+              bus.c_str());
+            return false;
+          }
+          has_thread_setting = true;
         } else if (key == "hil_isolated_id1_broadcast_blocks") {
           const int blocks = item.second.as<int>();
           if (blocks != 3) {
@@ -272,10 +295,12 @@ bool BxiSystemInterface::parseConfig()
       }
 
       if (!transport.separate) {
-        if (transport.broadcast || has_max_age || transport.isolated_id1_broadcast_blocks != 0) {
+        if (transport.broadcast || has_max_age || transport.isolated_id1_broadcast_blocks != 0 ||
+          has_thread_setting)
+        {
           RCLCPP_ERROR(logger(), "can_transport.%s: tx_frame: broadcast、"
-            "stream_feedback_max_age_ms、hil_isolated_id1_broadcast_blocks は "
-            "rx_mode: separate が必要", bus.c_str());
+            "stream_feedback_max_age_ms、hil_isolated_id1_broadcast_blocks、"
+            "send/receive_thread_priority、thread_cpus は rx_mode: separate が必要", bus.c_str());
           return false;
         }
       } else if (!has_max_age || !std::isfinite(transport.stream_feedback_max_age_ms) ||
@@ -756,6 +781,9 @@ bool BxiSystemInterface::startStream(
   config.max_feedback_age = std::chrono::duration_cast<std::chrono::nanoseconds>(
     std::chrono::duration<double, std::milli>(transport.stream_feedback_max_age_ms));
   config.broadcast = transport.broadcast;
+  config.send_priority = transport.send_thread_priority;
+  config.receive_priority = transport.receive_thread_priority;
+  config.cpus = transport.thread_cpus;
   if (!worker_timing_dir_.empty()) {
     constexpr size_t kStreamTraceCycles = 20000;
     config.trace_cycles = kStreamTraceCycles;

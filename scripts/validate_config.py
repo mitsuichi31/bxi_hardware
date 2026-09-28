@@ -64,10 +64,13 @@ def validate_transport(config: dict, active_buses: set[str], used_ids: set[tuple
         broadcast = transport.get("tx_frame", "unicast") == "broadcast"
         isolated = "hil_isolated_id1_broadcast_blocks" in transport
         max_age = transport.get("stream_feedback_max_age_ms")
+        thread_setting = any(key in transport for key in (
+            "send_thread_priority", "receive_thread_priority", "thread_cpus"))
         if not separate:
-            if broadcast or max_age is not None or isolated:
-                errors.append(f"can_transport.{bus}: broadcast, stream_feedback_max_age_ms and "
-                              "hil_isolated_id1_broadcast_blocks require rx_mode: separate")
+            if broadcast or max_age is not None or isolated or thread_setting:
+                errors.append(f"can_transport.{bus}: broadcast, stream_feedback_max_age_ms, "
+                              "hil_isolated_id1_broadcast_blocks and thread settings require "
+                              "rx_mode: separate")
             continue
         if max_age is None or not math.isfinite(max_age) or max_age < 2 * period_ms:
             errors.append(f"can_transport.{bus}.stream_feedback_max_age_ms is required and must be "

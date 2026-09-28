@@ -65,10 +65,18 @@ struct StreamConfig
   std::vector<int> forbidden_reply_ids;
   // The receive thread checks its stop flag at least this often.
   int rx_poll_ms = 2;
+  // Each thread must report that it started (scheduling applied) within this time.
   std::chrono::milliseconds rx_ready_timeout{100};
   // Cycles to record in the preallocated trace (0 = no trace). Replies get twice as many rows
   // per axis.
   size_t trace_cycles = 0;
+  // SCHED_FIFO priority (1-98) of each thread; 0 selects SCHED_OTHER even if the thread calling
+  // start() runs under SCHED_FIFO. Each thread applies its own setting as it starts, and start()
+  // fails if that is refused.
+  int send_priority = 0;
+  int receive_priority = 0;
+  // CPU affinity of both threads; empty keeps the inherited affinity.
+  std::vector<int> cpus;
 };
 
 enum class StreamCycleOutcome : uint8_t
@@ -214,8 +222,16 @@ private:
   uint64_t forbidden_replies_ = 0;
   int forbidden_reply_id_ = 0;
 
+  // Start-up handshake of each thread: scheduling applied, or refused. The reason is left in
+  // *_setup_error_ and read only after the thread has been joined.
+  enum ThreadState : int {kStarting, kReady, kFailed};
+  bool waitForThread(const std::atomic<int> & state);
+
   std::atomic<bool> rx_running_{false};
-  std::atomic<bool> rx_ready_{false};
+  std::atomic<int> rx_state_{kStarting};
+  std::atomic<int> tx_state_{kStarting};
+  std::string rx_setup_error_;
+  std::string tx_setup_error_;
   std::atomic<bool> tx_running_{false};
   std::atomic<bool> tx_done_{false};
   // steady_clock ticks of the first streamed send; 0 until then.

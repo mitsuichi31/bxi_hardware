@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <set>
 #include <utility>
 
@@ -27,6 +28,36 @@ double toMilliseconds(clock_type::duration duration)
 int64_t toNanoseconds(clock_type::duration duration)
 {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count();
+}
+
+// Applies CPU affinity, then the scheduling policy, to the calling thread: SCHED_FIFO for a
+// priority above 0, otherwise SCHED_OTHER explicitly, since a new thread inherits the policy of
+// the thread that created it. Returns an empty string on success and the refused setting
+// otherwise.
+std::string applyThreadScheduling(int fifo_priority, const std::vector<int> & cpus)
+{
+  if (!cpus.empty()) {
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    std::string list;
+    for (const int cpu : cpus) {
+      CPU_SET(cpu, &set);
+      list += (list.empty() ? "" : ",") + std::to_string(cpu);
+    }
+    const int result = pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+    if (result != 0) {
+      return "CPU affinity " + list + ": " + std::strerror(result);
+    }
+  }
+  sched_param param{};
+  param.sched_priority = fifo_priority;
+  const int policy = fifo_priority > 0 ? SCHED_FIFO : SCHED_OTHER;
+  const int result = pthread_setschedparam(pthread_self(), policy, &param);
+  if (result != 0) {
+    return std::string(fifo_priority > 0 ? "SCHED_FIFO" : "SCHED_OTHER") + " priority " +
+           std::to_string(fifo_priority) + ": " + std::strerror(result);
+  }
+  return "";
 }
 
 // Names the calling thread (at most 15 characters) and describes its scheduling, for example
@@ -138,6 +169,14 @@ bool BxiBusStreamer::validate()
     return false;
   }
   // Two missing or late replies in a row must not stop a healthy bus.
+  const auto valid_priority = [](int priority) {return priority >= 0 && priority <= 98;};
+  if (!valid_priority(config_.send_priority) || !valid_priority(config_.receive_priority) ||
+    std::any_of(config_.cpus.begin(), config_.cpus.end(),
+    [](int cpu) {return cpu < 0 || cpu >= CPU_SETSIZE;}))
+  {
+    error_ = "thread priority must be 0-98 and CPU indices must be valid";
+    return false;
+  }
   if (config_.max_feedback_age < 2 * config_.period) {
     error_ = "max feedback age must be at least two periods";
     return false;
@@ -221,24 +260,41 @@ bool BxiBusStreamer::start()
     trace_.rx.resize(2 * config_.trace_cycles * n);
   }
 
-  rx_ready_ = false;
+  rx_state_ = kStarting;
+  tx_state_ = kStarting;
+  rx_setup_error_.clear();
+  tx_setup_error_.clear();
   rx_running_ = true;
   rx_thread_ = std::thread(&BxiBusStreamer::receiveLoop, this);
-  const auto deadline = clock_type::now() + config_.rx_ready_timeout;
-  while (!rx_ready_ && clock_type::now() < deadline) {
-    std::this_thread::sleep_for(std::chrono::microseconds(200));
-  }
-  if (!rx_ready_) {
-    error_ = "receive thread did not start in time";
-    RCLCPP_ERROR(logger(), "[%s] %s", tx_bus_->name().c_str(), error_.c_str());
+  if (!waitForThread(rx_state_)) {
+    // The setup error is read only after join, which orders it after the thread's write.
     stop();
+    error_ = "receive thread: " + (rx_setup_error_.empty() ? "did not start in time" :
+      rx_setup_error_);
+    RCLCPP_ERROR(logger(), "[%s] %s", tx_bus_->name().c_str(), error_.c_str());
     return false;
   }
   tx_done_ = false;
   first_send_ns_ = 0;
   tx_running_ = true;
   tx_thread_ = std::thread(&BxiBusStreamer::sendLoop, this);
+  if (!waitForThread(tx_state_)) {
+    stop();
+    error_ = "send thread: " + (tx_setup_error_.empty() ? "did not start in time" :
+      tx_setup_error_);
+    RCLCPP_ERROR(logger(), "[%s] %s", tx_bus_->name().c_str(), error_.c_str());
+    return false;
+  }
   return true;
+}
+
+bool BxiBusStreamer::waitForThread(const std::atomic<int> & state)
+{
+  const auto deadline = clock_type::now() + config_.rx_ready_timeout;
+  while (state == kStarting && clock_type::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::microseconds(200));
+  }
+  return state == kReady;
 }
 
 bool BxiBusStreamer::waitForFirstFeedback(std::chrono::nanoseconds timeout)
@@ -285,10 +341,16 @@ StreamStats BxiBusStreamer::stats() const
 
 void BxiBusStreamer::receiveLoop()
 {
+  const auto setup_error = applyThreadScheduling(config_.receive_priority, config_.cpus);
+  if (!setup_error.empty()) {
+    rx_setup_error_ = setup_error;  // read by start() only after join
+    rx_state_ = kFailed;
+    return;
+  }
   trace_.rx_thread = nameAndDescribeThread("bxrx_" + rx_bus_->name());
   RCLCPP_INFO(logger(), "[%s] receive thread: %s", rx_bus_->name().c_str(),
     trace_.rx_thread.c_str());
-  rx_ready_ = true;
+  rx_state_ = kReady;
   CanFrame frame;
   // recv() returns within rx_poll_ms when idle and after each frame on a busy bus, so the stop
   // flag is seen without closing the socket from another thread.
@@ -360,9 +422,17 @@ void BxiBusStreamer::fault(StreamFault kind, int axis)
 
 void BxiBusStreamer::sendLoop()
 {
+  const auto setup_error = applyThreadScheduling(config_.send_priority, config_.cpus);
+  if (!setup_error.empty()) {
+    tx_setup_error_ = setup_error;  // read by start() only after join
+    tx_state_ = kFailed;
+    tx_done_ = true;
+    return;
+  }
   trace_.tx_thread = nameAndDescribeThread("bxtx_" + tx_bus_->name());
   RCLCPP_INFO(logger(), "[%s] send thread: %s", tx_bus_->name().c_str(),
     trace_.tx_thread.c_str());
+  tx_state_ = kReady;
   const size_t n = drivers_.size();
   const auto period = config_.period;
   std::vector<StreamFeedback> feedback(n);

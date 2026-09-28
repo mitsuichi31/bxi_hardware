@@ -1,8 +1,9 @@
 #include <algorithm>
-#include <cstddef>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
+#include <cstring>
 #include <functional>
 #include <map>
 #include <memory>
@@ -10,7 +11,11 @@
 #include <optional>
 #include <set>
 #include <thread>
+#include <tuple>
 #include <vector>
+
+#include <pthread.h>
+#include <sys/resource.h>
 
 #include <gtest/gtest.h>
 
@@ -737,6 +742,124 @@ TEST(BusStreamer, FullTraceCountsDroppedRowsAndDisabledTraceStoresNone)
     EXPECT_TRUE(trace.age_ns.empty());
     EXPECT_TRUE(trace.rx.empty());
     EXPECT_GT(trace.cycle_count, 0U);
+  }
+}
+
+// Lowers the soft RLIMIT_RTPRIO for its scope, so SCHED_FIFO requests are refused unless the
+// process holds CAP_SYS_NICE. The hard limit stays, so the soft limit can be restored.
+class NoRealtimePriority
+{
+public:
+  NoRealtimePriority()
+  {
+    lowered_ = ::getrlimit(RLIMIT_RTPRIO, &saved_) == 0;
+    if (lowered_) {
+      rlimit none = saved_;
+      none.rlim_cur = 0;
+      lowered_ = ::setrlimit(RLIMIT_RTPRIO, &none) == 0;
+    }
+  }
+  ~NoRealtimePriority()
+  {
+    if (lowered_) {
+      ::setrlimit(RLIMIT_RTPRIO, &saved_);
+    }
+  }
+  bool lowered() const {return lowered_;}
+
+private:
+  rlimit saved_{};
+  bool lowered_ = false;
+};
+
+TEST(BusStreamer, AppliesFifoPriorityAndAffinityToBothThreads)
+{
+  Rig rig({1});
+  auto c = config(1ms, false);
+  c.send_priority = 20;
+  c.receive_priority = 21;
+  c.cpus = {0};
+  auto streamer = rig.makeStreamer(c);
+  if (!streamer->start()) {
+    if (streamer->error().find("Operation not permitted") != std::string::npos) {
+      GTEST_SKIP() << "SCHED_FIFO is not allowed here: " << streamer->error();
+    }
+    FAIL() << streamer->error();
+  }
+  ASSERT_TRUE(streamer->waitForFirstFeedback(10ms));
+  streamer->stop();
+  EXPECT_EQ(streamer->trace().tx_thread, "SCHED_FIFO priority=20 cpus=0");
+  EXPECT_EQ(streamer->trace().rx_thread, "SCHED_FIFO priority=21 cpus=0");
+  EXPECT_EQ(streamer->stats().fault, StreamFault::kNone);
+}
+
+// Unset priorities mean SCHED_OTHER even when start() runs on a SCHED_FIFO thread, which the
+// stream threads would otherwise inherit.
+TEST(BusStreamer, UnsetPriorityGivesSchedOtherEvenFromAFifoCaller)
+{
+  Rig rig({1});
+  auto streamer = rig.makeStreamer(config(1ms, false));
+  bool started = false;
+  std::string caller_setup;
+  std::thread caller([&]() {
+      sched_param param{};
+      param.sched_priority = 10;
+      const int result = pthread_setschedparam(pthread_self(), SCHED_FIFO, &param);
+      if (result != 0) {
+        caller_setup = std::strerror(result);
+        return;
+      }
+      started = streamer->start();
+    });
+  caller.join();
+  if (!caller_setup.empty()) {
+    GTEST_SKIP() << "SCHED_FIFO is not allowed here: " << caller_setup;
+  }
+  ASSERT_TRUE(started) << streamer->error();
+  ASSERT_TRUE(streamer->waitForFirstFeedback(10ms));
+  streamer->stop();
+  EXPECT_EQ(streamer->trace().tx_thread.rfind("SCHED_OTHER priority=0", 0), 0U)
+    << streamer->trace().tx_thread;
+  EXPECT_EQ(streamer->trace().rx_thread.rfind("SCHED_OTHER priority=0", 0), 0U)
+    << streamer->trace().rx_thread;
+}
+
+TEST(BusStreamer, RefusedFifoPriorityFailsStartAndSendsNothing)
+{
+  Rig rig({1});
+  const size_t enable_frames = rig.link.sent().size();
+  auto c = config(1ms, false);
+  c.send_priority = 20;
+  NoRealtimePriority no_rt;
+  if (!no_rt.lowered()) {
+    GTEST_SKIP() << "RLIMIT_RTPRIO could not be lowered";
+  }
+  auto streamer = rig.makeStreamer(c);
+  if (streamer->start()) {
+    streamer->stop();
+    GTEST_SKIP() << "this process may use SCHED_FIFO regardless of RLIMIT_RTPRIO";
+  }
+  EXPECT_NE(streamer->error().find("send thread: SCHED_FIFO priority 20"), std::string::npos)
+    << streamer->error();
+  EXPECT_TRUE(streamer->sendFinished());
+  EXPECT_EQ(rig.link.sent().size(), enable_frames);
+  streamer->stop();  // nothing left to join
+  EXPECT_EQ(rig.drivers[0]->state(), ActuatorState::kEnabled);
+}
+
+TEST(BusStreamer, RejectsOutOfRangeThreadSettings)
+{
+  for (const auto & [send, receive, cpu] : {std::tuple{99, 0, 0}, std::tuple{0, -1, 0},
+      std::tuple{0, 0, -1}})
+  {
+    Rig rig({1});
+    auto c = config(1ms, false);
+    c.send_priority = send;
+    c.receive_priority = receive;
+    c.cpus = {cpu};
+    auto streamer = rig.makeStreamer(c);
+    EXPECT_FALSE(streamer->start()) << send << " " << receive << " " << cpu;
+    EXPECT_NE(streamer->error().find("thread priority"), std::string::npos);
   }
 }
 

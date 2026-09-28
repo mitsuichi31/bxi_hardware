@@ -188,6 +188,10 @@ TEST(Configuration, AcceptsStreamedTransports)
     hardware_interface::CallbackReturn::SUCCESS);
   EXPECT_EQ(initWith("stream_sequential.yaml", transportConfig("{rx_mode: sequential}")),
     hardware_interface::CallbackReturn::SUCCESS);
+  EXPECT_EQ(initWith("stream_rt.yaml", transportConfig(
+      "{rx_mode: separate, stream_feedback_max_age_ms: 3, send_thread_priority: 60, "
+      "receive_thread_priority: 61, thread_cpus: [2, 3]}")),
+    hardware_interface::CallbackReturn::SUCCESS);
 }
 
 TEST(Configuration, RejectsInvalidStreamedTransports)
@@ -202,6 +206,15 @@ TEST(Configuration, RejectsInvalidStreamedTransports)
     {"unknown_key", transportConfig(
         "{rx_mode: separate, stream_feedback_max_age_ms: 3, rx_poll_ms: 1}")},
     {"bad_rx_mode", transportConfig("{rx_mode: threaded, stream_feedback_max_age_ms: 3}")},
+    {"priority_99", transportConfig(
+        "{rx_mode: separate, stream_feedback_max_age_ms: 3, send_thread_priority: 99}")},
+    {"priority_0", transportConfig(
+        "{rx_mode: separate, stream_feedback_max_age_ms: 3, receive_thread_priority: 0}")},
+    {"empty_cpus", transportConfig(
+        "{rx_mode: separate, stream_feedback_max_age_ms: 3, thread_cpus: []}")},
+    {"negative_cpu", transportConfig(
+        "{rx_mode: separate, stream_feedback_max_age_ms: 3, thread_cpus: [-1]}")},
+    {"priority_without_separate", transportConfig("{send_thread_priority: 60}")},
     {"broadcast_classic", transportConfig(
         "{rx_mode: separate, tx_frame: broadcast, stream_feedback_max_age_ms: 3}", "classic")},
     {"broadcast_ids_1_3", transportConfig(
