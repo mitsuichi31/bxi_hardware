@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cstddef>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -550,6 +551,7 @@ TEST(BusStreamer, SlowHookDoesNotSendAnExpiredCommand)
   Rig rig({1});
   auto c = config(1ms, false);
   c.max_feedback_age = 50ms;
+  c.trace_cycles = 200;
   std::atomic<int> calls{0};
   // Each send records which hook call prepared it. The send thread runs both, so the value read
   // here is the call of the current cycle.
@@ -579,6 +581,17 @@ TEST(BusStreamer, SlowHookDoesNotSendAnExpiredCommand)
   EXPECT_EQ(std::count(sent_by_call.begin(), sent_by_call.end(), 5), 0);
   EXPECT_TRUE(std::any_of(sent_by_call.begin(), sent_by_call.end(),
     [](int call) {return call > 5;}));
+  // The trace shows the expired cycle and how long its hook took.
+  const auto & trace = streamer->trace();
+  const auto rows = trace.cycles.begin() +
+    static_cast<std::ptrdiff_t>(std::min(trace.cycle_count, trace.cycles.size()));
+  const auto expired = std::find_if(trace.cycles.begin(), rows, [](const StreamCycleRecord & row) {
+      return row.outcome == StreamCycleOutcome::kExpiredAfterHook;
+    });
+  ASSERT_NE(expired, rows);
+  EXPECT_GE(expired->hook_ns, 4'500'000);
+  EXPECT_EQ(expired->frames, 0U);
+  EXPECT_EQ(expired->send_lateness_ns, -1);
 }
 
 TEST(BusStreamer, StopRequestedDuringTheHookSendsNothing)
@@ -649,6 +662,82 @@ TEST(BusStreamer, FirstFeedbackIgnoresRepliesReceivedBeforeTheFirstSend)
   EXPECT_TRUE(streamer->waitForFirstFeedback(30ms));
   streamer->stop();
   EXPECT_GE(streamer->stats().replies[0], 2U);
+}
+
+TEST(BusStreamer, TraceRecordsCyclesAgesRepliesAndThreads)
+{
+  Rig rig({1, 2});
+  auto c = config(1ms, true);
+  c.trace_cycles = 1000;
+  auto streamer = rig.makeStreamer(c);
+  ASSERT_TRUE(streamer->start());
+  std::this_thread::sleep_for(50ms);
+  streamer->stop();
+  const auto stats = streamer->stats();
+  const auto & trace = streamer->trace();
+  ASSERT_EQ(stats.fault, StreamFault::kNone);
+  ASSERT_LE(trace.cycle_count, trace.cycles.size());
+  EXPECT_EQ(trace.axes, 2U);
+
+  uint64_t sent_rows = 0;
+  bool seen_send = false;
+  for (size_t r = 0; r < trace.cycle_count; ++r) {
+    const auto & row = trace.cycles[r];
+    EXPECT_EQ(row.cycle, r);  // no row is skipped while the trace has room
+    EXPECT_GE(row.wake_lateness_ns, 0);
+    for (size_t a = 0; a < trace.axes; ++a) {
+      // Ages are -1 only until the first send, and fresh is a flag.
+      EXPECT_EQ(trace.age_ns[r * trace.axes + a] >= 0, seen_send) << r;
+      EXPECT_LE(trace.fresh[r * trace.axes + a], 1U);
+    }
+    if (row.outcome == StreamCycleOutcome::kSent) {
+      ++sent_rows;
+      seen_send = true;
+      EXPECT_EQ(row.frames, 1U);
+      EXPECT_GE(row.send_lateness_ns, 0);
+      EXPECT_LT(row.send_lateness_ns, 1'000'000);
+    }
+  }
+  EXPECT_EQ(sent_rows, stats.cycles);
+  EXPECT_EQ(trace.rx_count, stats.replies[0] + stats.replies[1]);
+  for (size_t r = 0; r < trace.rx_count; ++r) {
+    EXPECT_LT(trace.rx[r].axis, 2U);
+    EXPECT_GE(trace.rx[r].received_ns, 0);
+  }
+  EXPECT_NE(trace.tx_thread.find("SCHED_"), std::string::npos) << trace.tx_thread;
+  EXPECT_NE(trace.tx_thread.find("cpus="), std::string::npos) << trace.tx_thread;
+  EXPECT_NE(trace.rx_thread.find("SCHED_"), std::string::npos) << trace.rx_thread;
+}
+
+TEST(BusStreamer, FullTraceCountsDroppedRowsAndDisabledTraceStoresNone)
+{
+  {
+    Rig rig({1});
+    auto c = config(1ms, false);
+    c.trace_cycles = 5;
+    auto streamer = rig.makeStreamer(c);
+    ASSERT_TRUE(streamer->start());
+    std::this_thread::sleep_for(30ms);
+    streamer->stop();
+    const auto & trace = streamer->trace();
+    EXPECT_EQ(trace.cycles.size(), 5U);
+    EXPECT_GT(trace.cycle_count, 5U);
+    EXPECT_EQ(trace.rx.size(), 10U);
+    EXPECT_GT(trace.rx_count, 10U);
+    EXPECT_EQ(streamer->stats().fault, StreamFault::kNone);
+  }
+  {
+    Rig rig({1});
+    auto streamer = rig.makeStreamer(config(1ms, false));
+    ASSERT_TRUE(streamer->start());
+    std::this_thread::sleep_for(10ms);
+    streamer->stop();
+    const auto & trace = streamer->trace();
+    EXPECT_TRUE(trace.cycles.empty());
+    EXPECT_TRUE(trace.age_ns.empty());
+    EXPECT_TRUE(trace.rx.empty());
+    EXPECT_GT(trace.cycle_count, 0U);
+  }
 }
 
 // Stop paths from the plan: an idle bus, a flooded bus, after a fault, and after a failed

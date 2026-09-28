@@ -73,6 +73,7 @@ if(BUILD_TESTING)
     BXI_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
   set_target_properties(test_vcan_stream_system PROPERTIES BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}")
   ament_add_pytest_test(test_validate_config test/test_validate_config.py)
+  ament_add_pytest_test(test_analyze_stream_timing test/test_analyze_stream_timing.py)
   ament_add_pytest_test(test_sine_trajectory test/test_sine_trajectory.py)
 endif()
 

@@ -5,6 +5,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <map>
 #include <mutex>
@@ -75,6 +76,11 @@ public:
     delays_ = std::move(delays);
   }
   int disables(int id) const {return disables_[static_cast<size_t>(id)].load();}
+  // steady_clock ticks when the first disable frame for this motor arrived, 0 if none yet.
+  int64_t firstDisableSteadyNs(int id) const
+  {
+    return first_disable_steady_ns_[static_cast<size_t>(id)].load();
+  }
 
   std::atomic<bool> answer_broadcast{true};
   std::atomic<bool> overheat{false};  // every reply reports 150 degC
@@ -103,6 +109,9 @@ private:
       const int id = static_cast<int>(frame.id);
       if (id >= 1 && id <= 3 && frame.dlc == 8 && ids_.count(id) != 0) {
         if (frame.data8() == disable) {
+          int64_t none = 0;
+          first_disable_steady_ns_[static_cast<size_t>(id)].compare_exchange_strong(none,
+            clock_type::now().time_since_epoch().count());
           ++disables_[static_cast<size_t>(id)];
         }
         schedule(now, id);
@@ -164,6 +173,7 @@ private:
   std::vector<clock_type::duration> delays_{300us};
   size_t delay_index_ = 0;
   std::array<std::atomic<int>, 4> disables_{};
+  std::array<std::atomic<int64_t>, 4> first_disable_steady_ns_{};
   std::thread receiver_;
   std::thread sender_;
 };
@@ -443,6 +453,141 @@ TEST(StreamedSystemAt1kHz, UnicastStreamRunsAndDeactivates)
     hardware_interface::CallbackReturn::SUCCESS);
   EXPECT_GE(motors.disables(1), 1);
   EXPECT_GE(motors.disables(2), 1);
+}
+
+// With BXI_WORKER_TIMING_DIR set, stopping a streamed bus writes its cycle and reply CSVs once.
+TEST(StreamedSystemAt1kHz, TimingDirectoryReceivesStreamCsvs)
+{
+  const char * iface = std::getenv("BXI_VCAN_IFACE");
+  if (iface == nullptr) {
+    GTEST_SKIP() << "BXI_VCAN_IFACE is not configured";
+  }
+  const auto dir = std::filesystem::path(::testing::TempDir()) / "bxi_stream_timing";
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+  ASSERT_EQ(setenv("BXI_WORKER_TIMING_DIR", dir.c_str(), 1), 0);
+  struct UnsetTimingDir
+  {
+    ~UnsetTimingDir() {unsetenv("BXI_WORKER_TIMING_DIR");}
+  } unset_timing_dir;
+
+  MotorEmulator motors(iface, {1, 2, 3});
+  ASSERT_TRUE(motors.opened());
+  BxiSystemInterface system;
+  ASSERT_EQ(system.on_init(hardwareInfo(streamConfig(iface, 1000, 3.0, true, 3), jointNames(3))),
+    hardware_interface::CallbackReturn::SUCCESS);
+  ASSERT_EQ(system.on_activate(rclcpp_lifecycle::State()),
+    hardware_interface::CallbackReturn::SUCCESS);
+  std::this_thread::sleep_for(200ms);
+  ASSERT_EQ(system.on_deactivate(rclcpp_lifecycle::State()),
+    hardware_interface::CallbackReturn::SUCCESS);
+
+  std::vector<std::filesystem::path> cycle_files;
+  std::vector<std::filesystem::path> rx_files;
+  for (const auto & entry : std::filesystem::directory_iterator(dir)) {
+    const auto name = entry.path().filename().string();
+    if (name.rfind("bxi_stream_", 0) == 0) {
+      const bool is_cycles = name.size() > 11 && name.substr(name.size() - 11) == "_cycles.csv";
+      (is_cycles ? cycle_files : rx_files).push_back(entry.path());
+    }
+  }
+  ASSERT_EQ(cycle_files.size(), 1U);
+  ASSERT_EQ(rx_files.size(), 1U);
+
+  std::ifstream cycles(cycle_files[0]);
+  std::string metadata;
+  std::string header;
+  std::getline(cycles, metadata);
+  std::getline(cycles, header);
+  EXPECT_EQ(metadata.rfind("#period_ns=1000000,max_feedback_age_ns=3000000,broadcast=1,"
+    "can_ids=1;2;3,", 0), 0U) << metadata;
+  EXPECT_NE(metadata.find("tx_thread=SCHED_"), std::string::npos) << metadata;
+  EXPECT_EQ(header, "cycle,outcome,wake_lateness_ns,hook_ns,send_lateness_ns,frames,"
+    "age_ns_1,fresh_1,age_ns_2,fresh_2,age_ns_3,fresh_3");
+  int cycle_rows = 0;
+  int sent_rows = 0;
+  for (std::string line; std::getline(cycles, line); ) {
+    ++cycle_rows;
+    sent_rows += line.find(",sent,") != std::string::npos ? 1 : 0;
+  }
+  EXPECT_GE(cycle_rows, 150);
+  EXPECT_GE(sent_rows, 150);
+
+  std::ifstream rx(rx_files[0]);
+  std::getline(rx, metadata);
+  std::getline(rx, header);
+  EXPECT_EQ(header, "can_id,received_ns,rx_kernel_realtime_ns,rx_userspace_realtime_ns,"
+    "rx_hardware_raw_ns");
+  int rx_rows = 0;
+  int kernel_stamped = 0;
+  for (std::string line; std::getline(rx, line); ) {
+    ++rx_rows;
+    // Third field: the kernel software timestamp, present on vcan.
+    const auto first = line.find(',');
+    const auto second = line.find(',', first + 1);
+    kernel_stamped += std::stoll(line.substr(second + 1)) > 0 ? 1 : 0;
+  }
+  EXPECT_GE(rx_rows, 3 * 150);
+  EXPECT_EQ(kernel_stamped, rx_rows);
+}
+
+// On a safe-stop the monitor must send the disables before it logs and writes the CSVs, so that
+// slow disk I/O cannot delay stopping the motors. File modification times are too coarse to
+// order the two, so the report start is taken from a test seam on the same steady clock.
+class RecordsReportStart : public BxiSystemInterface
+{
+public:
+  std::atomic<int64_t> report_steady_ns{0};
+
+protected:
+  void onStreamReport(const std::string &) override
+  {
+    int64_t none = 0;
+    report_steady_ns.compare_exchange_strong(none,
+      clock_type::now().time_since_epoch().count());
+  }
+};
+
+TEST(StreamedSystemAt1kHz, SafeStopDisablesBeforeReportingTheStream)
+{
+  const char * iface = std::getenv("BXI_VCAN_IFACE");
+  if (iface == nullptr) {
+    GTEST_SKIP() << "BXI_VCAN_IFACE is not configured";
+  }
+  const auto dir = std::filesystem::path(::testing::TempDir()) / "bxi_stream_safe_stop_timing";
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+  ASSERT_EQ(setenv("BXI_WORKER_TIMING_DIR", dir.c_str(), 1), 0);
+  struct UnsetTimingDir
+  {
+    ~UnsetTimingDir() {unsetenv("BXI_WORKER_TIMING_DIR");}
+  } unset_timing_dir;
+
+  MotorEmulator motors(iface, {1, 2, 3});
+  ASSERT_TRUE(motors.opened());
+  RecordsReportStart system;
+  ASSERT_EQ(system.on_init(hardwareInfo(streamConfig(iface, 1000, 3.0, true, 3), jointNames(3))),
+    hardware_interface::CallbackReturn::SUCCESS);
+  ASSERT_EQ(system.on_activate(rclcpp_lifecycle::State()),
+    hardware_interface::CallbackReturn::SUCCESS);
+  std::this_thread::sleep_for(50ms);
+  motors.silent_mask = 0b100;
+
+  // The monitor reports without on_deactivate; wait for it.
+  const auto deadline = clock_type::now() + 1s;
+  while (clock_type::now() < deadline && system.report_steady_ns.load() == 0) {
+    std::this_thread::sleep_for(1ms);
+  }
+  const int64_t reported_ns = system.report_steady_ns.load();
+  ASSERT_GT(reported_ns, 0);
+  for (int id = 1; id <= 3; ++id) {
+    const int64_t disabled_ns = motors.firstDisableSteadyNs(id);
+    ASSERT_GT(disabled_ns, 0) << id;
+    EXPECT_LT(disabled_ns, reported_ns) << "motor " << id << " was disabled after the report began";
+  }
+  EXPECT_EQ(system.on_deactivate(rclcpp_lifecycle::State()),
+    hardware_interface::CallbackReturn::SUCCESS);
+  EXPECT_FALSE(std::filesystem::is_empty(dir));  // the CSVs were still written
 }
 
 // A fault on one streamed bus stops and disables the other streamed bus as well.

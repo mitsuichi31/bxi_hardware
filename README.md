@@ -26,8 +26,12 @@ ip link set up vcan0
 ip link add dev vcan1 type vcan # classic only (FD open must be refused)
 ip link set vcan1 mtu 16
 ip link set up vcan1
+ip link add dev vcan2 type vcan # second FD bus for the two-bus stream test
+ip link set vcan2 mtu 72
+ip link set up vcan2
 export BXI_VCAN_IFACE=vcan0
 export BXI_VCAN_CLASSIC_IFACE=vcan1
+export BXI_VCAN_IFACE_B=vcan2
 python3 scripts/validate_config.py test/config/valid.yaml
 colcon build
 colcon test

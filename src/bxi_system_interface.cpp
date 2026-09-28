@@ -628,7 +628,12 @@ void BxiSystemInterface::releaseResources()
       joints_[i].actuator->disable();
     }
   }
+  // Every motor has been disabled; logging and CSV output may take their time now.
+  for (const auto & [bus_name, streamer] : streamers_) {
+    reportStream(bus_name);
+  }
   streamers_.clear();
+  reported_streams_.clear();
   for (auto & [name, bus] : rx_buses_) {
     bus->close();
   }
@@ -735,7 +740,9 @@ bool BxiSystemInterface::startStream(
   const auto & transport = bus_transport_[bus_name];
   auto rx_bus = makeBus(bus_formats_[bus_name]);
   if (auto * socketcan = dynamic_cast<SocketCanBus *>(rx_bus.get())) {
-    socketcan->setRxTimestamping(!worker_timing_dir_.empty());
+    // Timing runs also request raw hardware RX timestamps; the kernel software timestamp comes
+    // in the same record, and interfaces without hardware stamps (vcan) leave that field zero.
+    socketcan->setRxHardwareTimestamping(!worker_timing_dir_.empty());
   }
   if (!rx_bus->open(bus_name)) {
     RCLCPP_ERROR(logger(), "[%s] 受信用CANオープン失敗", bus_name.c_str());
@@ -749,6 +756,10 @@ bool BxiSystemInterface::startStream(
   config.max_feedback_age = std::chrono::duration_cast<std::chrono::nanoseconds>(
     std::chrono::duration<double, std::milli>(transport.stream_feedback_max_age_ms));
   config.broadcast = transport.broadcast;
+  if (!worker_timing_dir_.empty()) {
+    constexpr size_t kStreamTraceCycles = 20000;
+    config.trace_cycles = kStreamTraceCycles;
+  }
   std::vector<uint32_t> reply_ids;
   std::vector<BxiActuatorDriver *> drivers;
   for (size_t i : indices) {
@@ -861,31 +872,17 @@ void BxiSystemInterface::streamMonitorLoop(std::string bus_name, std::vector<siz
   // for controller_manager to deactivate the component.
   stopStream(bus_name);
   disableAxes(bus_name, indices, "safe-stop");
+  reportStream(bus_name);  // log and CSV only after the motors have been told to disable
 }
 
 void BxiSystemInterface::stopStream(const std::string & bus_name)
 {
+  // Only the thread joins and the socket changes that disabling needs happen here. Logging and
+  // CSV output wait for reportStream(), after the disable frames have been sent.
   std::lock_guard<std::mutex> lock(stream_stop_mutex_);
   const auto streamer = streamers_.find(bus_name);
   if (streamer != streamers_.end()) {
     streamer->second->stop();
-    const auto stats = streamer->second->stats();
-    std::string per_axis;
-    for (size_t k = 0; k < stats.replies.size(); ++k) {
-      char text[96];
-      std::snprintf(text, sizeof(text), " [%zu] replies=%llu no_new=%llu max_age=%.3fms", k,
-        static_cast<unsigned long long>(stats.replies[k]),
-        static_cast<unsigned long long>(stats.cycles_without_new_reply[k]),
-        stats.max_age_ms[k]);
-      per_axis += text;
-    }
-    RCLCPP_INFO(logger(), "[%s] 送受信分離を停止: cycles=%llu skipped=%llu partial=%llu "
-      "frames=%llu fault=%s axis=%d external=%s%s", bus_name.c_str(),
-      static_cast<unsigned long long>(stats.cycles),
-      static_cast<unsigned long long>(stats.skipped_cycles),
-      static_cast<unsigned long long>(stats.partial_cycles),
-      static_cast<unsigned long long>(stats.frames_sent), streamFaultName(stats.fault),
-      stats.fault_axis, stats.stopped_externally ? "yes" : "no", per_axis.c_str());
   }
   const auto rx_bus = rx_buses_.find(bus_name);
   if (rx_bus == rx_buses_.end()) {
@@ -903,6 +900,127 @@ void BxiSystemInterface::stopStream(const std::string & bus_name)
   }
   rx_bus->second->close();
   rx_buses_.erase(rx_bus);
+}
+
+void BxiSystemInterface::reportStream(const std::string & bus_name)
+{
+  const BxiBusStreamer * streamer = nullptr;
+  {
+    // The monitor and releaseResources() can both report a bus; claim it once, then log and
+    // write outside the lock so that another bus can stop meanwhile. The streamer stays alive
+    // until releaseResources() clears the map after joining the monitors.
+    std::lock_guard<std::mutex> lock(stream_stop_mutex_);
+    const auto found = streamers_.find(bus_name);
+    if (found == streamers_.end() || !reported_streams_.insert(bus_name).second) {
+      return;
+    }
+    streamer = found->second.get();
+  }
+  onStreamReport(bus_name);
+  const auto stats = streamer->stats();
+  std::string per_axis;
+  for (size_t k = 0; k < stats.replies.size(); ++k) {
+    char text[96];
+    std::snprintf(text, sizeof(text), " [%zu] replies=%llu no_new=%llu max_age=%.3fms", k,
+      static_cast<unsigned long long>(stats.replies[k]),
+      static_cast<unsigned long long>(stats.cycles_without_new_reply[k]),
+      stats.max_age_ms[k]);
+    per_axis += text;
+  }
+  RCLCPP_INFO(logger(), "[%s] 送受信分離を停止: cycles=%llu skipped=%llu partial=%llu "
+    "frames=%llu fault=%s axis=%d external=%s%s", bus_name.c_str(),
+    static_cast<unsigned long long>(stats.cycles),
+    static_cast<unsigned long long>(stats.skipped_cycles),
+    static_cast<unsigned long long>(stats.partial_cycles),
+    static_cast<unsigned long long>(stats.frames_sent), streamFaultName(stats.fault),
+    stats.fault_axis, stats.stopped_externally ? "yes" : "no", per_axis.c_str());
+  if (!worker_timing_dir_.empty()) {
+    writeStreamTiming(bus_name, *streamer);
+  }
+}
+
+void BxiSystemInterface::writeStreamTiming(
+  const std::string & bus_name, const BxiBusStreamer & streamer)
+{
+  // Called after the stream threads have joined, outside any control cycle.
+  const auto & trace = streamer.trace();
+  const auto & config = streamer.config();
+  const auto & ids = streamer.canIds();
+  const auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+    std::chrono::system_clock::now().time_since_epoch()).count();
+  std::string safe_bus_name = bus_name;
+  for (char & ch : safe_bus_name) {
+    if (!((ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'Z') ||
+      (ch >= 'a' && ch <= 'z') || ch == '_' || ch == '-'))
+    {
+      ch = '_';
+    }
+  }
+  const auto stem = (std::filesystem::path(worker_timing_dir_) /
+    ("bxi_stream_" + safe_bus_name + "_" + std::to_string(timestamp))).string();
+  std::string id_list;
+  for (const int id : ids) {
+    id_list += (id_list.empty() ? "" : ";") + std::to_string(id);
+  }
+  const size_t cycle_rows = std::min(trace.cycle_count, trace.cycles.size());
+  const size_t rx_rows = std::min(trace.rx_count, trace.rx.size());
+  // Commas separate the metadata fields, so the thread descriptions use '|' for their cpu list.
+  auto describe = [](std::string text) {
+      std::replace(text.begin(), text.end(), ',', '|');
+      std::replace(text.begin(), text.end(), ' ', '_');
+      return text;
+    };
+  const std::string metadata = "#period_ns=" + std::to_string(config.period.count()) +
+    ",max_feedback_age_ns=" + std::to_string(config.max_feedback_age.count()) +
+    ",broadcast=" + (config.broadcast ? "1" : "0") + ",can_ids=" + id_list +
+    ",dropped_cycles=" + std::to_string(trace.cycle_count - cycle_rows) +
+    ",dropped_rx=" + std::to_string(trace.rx_count - rx_rows) +
+    ",tx_thread=" + describe(trace.tx_thread) + ",rx_thread=" + describe(trace.rx_thread);
+
+  const auto cycle_path = stem + "_cycles.csv";
+  std::ofstream cycle_file(cycle_path);
+  if (!cycle_file) {
+    RCLCPP_ERROR(logger(), "stream timing CSV を開けません: %s", cycle_path.c_str());
+    return;
+  }
+  cycle_file << metadata << '\n' << "cycle,outcome,wake_lateness_ns,hook_ns,send_lateness_ns,frames";
+  for (const int id : ids) {
+    cycle_file << ",age_ns_" << id << ",fresh_" << id;
+  }
+  cycle_file << '\n';
+  for (size_t r = 0; r < cycle_rows; ++r) {
+    const auto & row = trace.cycles[r];
+    cycle_file << row.cycle << ',' << streamCycleOutcomeName(row.outcome) << ',' <<
+      row.wake_lateness_ns << ',' << row.hook_ns << ',' << row.send_lateness_ns << ',' <<
+      static_cast<int>(row.frames);
+    for (size_t a = 0; a < trace.axes; ++a) {
+      cycle_file << ',' << trace.age_ns[r * trace.axes + a] << ',' <<
+        static_cast<int>(trace.fresh[r * trace.axes + a]);
+    }
+    cycle_file << '\n';
+  }
+
+  const auto rx_path = stem + "_rx.csv";
+  std::ofstream rx_file(rx_path);
+  if (!rx_file) {
+    RCLCPP_ERROR(logger(), "stream timing CSV を開けません: %s", rx_path.c_str());
+    return;
+  }
+  rx_file << metadata << '\n' <<
+    "can_id,received_ns,rx_kernel_realtime_ns,rx_userspace_realtime_ns,rx_hardware_raw_ns\n";
+  for (size_t r = 0; r < rx_rows; ++r) {
+    const auto & row = trace.rx[r];
+    rx_file << ids[row.axis] << ',' << row.received_ns << ',' << row.rx_kernel_realtime_ns <<
+      ',' << row.rx_userspace_realtime_ns << ',' << row.rx_hardware_raw_ns << '\n';
+  }
+  cycle_file.flush();
+  rx_file.flush();
+  if (!cycle_file || !rx_file) {
+    RCLCPP_ERROR(logger(), "stream timing CSV 書込失敗: %s", stem.c_str());
+  }
+  RCLCPP_INFO(logger(), "[%s] stream timing: %zu cycles, %zu replies, dropped %zu/%zu; %s",
+    bus_name.c_str(), cycle_rows, rx_rows, trace.cycle_count - cycle_rows,
+    trace.rx_count - rx_rows, stem.c_str());
 }
 
 void BxiSystemInterface::disableAxes(

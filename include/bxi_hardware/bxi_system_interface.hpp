@@ -9,6 +9,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -68,6 +69,8 @@ protected:
   // Test seam: called during on_activate() after every streamed bus has answered and the workers
   // run, just before the final safe-stop check.
   virtual void onStreamFeedbackConfirmed() {}
+  // Test seam: called when a stopped stream starts its log and CSV output (reportStream()).
+  virtual void onStreamReport(const std::string & /*bus_name*/) {}
 
 private:
   struct WorkerTimingCycle
@@ -127,6 +130,8 @@ private:
   // the bus without waiting for controller_manager.
   void streamMonitorLoop(std::string bus_name, std::vector<size_t> indices);
   void stopStream(const std::string & bus_name);
+  void reportStream(const std::string & bus_name);
+  void writeStreamTiming(const std::string & bus_name, const BxiBusStreamer & streamer);
   void disableAxes(const std::string & bus_name, const std::vector<size_t> & indices,
     const char * reason);
   bool loadSpec(const std::string & motor_type);
@@ -148,6 +153,7 @@ private:
   std::map<std::string, std::shared_ptr<CanBus>> rx_buses_;
   std::map<std::string, std::unique_ptr<BxiBusStreamer>> streamers_;
   std::mutex stream_stop_mutex_;
+  std::set<std::string> reported_streams_;  // streams already logged and written
   std::map<std::string, BxiSpec> specs_;
 
   std::string config_file_;

@@ -1,8 +1,12 @@
 #include "bxi_hardware/bus_streamer.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <set>
 #include <utility>
+
+#include <pthread.h>
+#include <sched.h>
 
 #include <rclcpp/rclcpp.hpp>
 
@@ -20,7 +24,59 @@ double toMilliseconds(clock_type::duration duration)
   return std::chrono::duration<double, std::milli>(duration).count();
 }
 
+int64_t toNanoseconds(clock_type::duration duration)
+{
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count();
+}
+
+// Names the calling thread (at most 15 characters) and describes its scheduling, for example
+// "SCHED_FIFO priority=60 cpus=2-3". Called once at thread start, never inside the cycle.
+std::string nameAndDescribeThread(const std::string & name)
+{
+  pthread_setname_np(pthread_self(), name.substr(0, 15).c_str());
+  int policy = 0;
+  sched_param param{};
+  std::string text = "unknown";
+  if (pthread_getschedparam(pthread_self(), &policy, &param) == 0) {
+    text = policy == SCHED_FIFO ? "SCHED_FIFO" : policy == SCHED_RR ? "SCHED_RR" :
+      policy == SCHED_OTHER ? "SCHED_OTHER" : "policy=" + std::to_string(policy);
+    text += " priority=" + std::to_string(param.sched_priority);
+  }
+  cpu_set_t cpus;
+  CPU_ZERO(&cpus);
+  if (pthread_getaffinity_np(pthread_self(), sizeof(cpus), &cpus) == 0) {
+    std::string list;
+    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+      if (!CPU_ISSET(cpu, &cpus)) {
+        continue;
+      }
+      int last = cpu;
+      while (last + 1 < CPU_SETSIZE && CPU_ISSET(last + 1, &cpus)) {
+        ++last;
+      }
+      list += (list.empty() ? "" : ",") + std::to_string(cpu) +
+        (last > cpu ? "-" + std::to_string(last) : "");
+      cpu = last;
+    }
+    text += " cpus=" + list;
+  }
+  return text;
+}
+
 }  // namespace
+
+const char * streamCycleOutcomeName(StreamCycleOutcome outcome)
+{
+  switch (outcome) {
+    case StreamCycleOutcome::kSent: return "sent";
+    case StreamCycleOutcome::kSkippedLate: return "skipped_late";
+    case StreamCycleOutcome::kSkippedBurst: return "skipped_burst";
+    case StreamCycleOutcome::kExpiredAfterHook: return "expired_after_hook";
+    case StreamCycleOutcome::kPartial: return "partial";
+    case StreamCycleOutcome::kStopped: return "stopped";
+  }
+  return "unknown";
+}
 
 const char * streamFaultName(StreamFault fault)
 {
@@ -155,6 +211,15 @@ bool BxiBusStreamer::start()
   tx_stats_.replies.assign(n, 0);
   tx_stats_.cycles_without_new_reply.assign(n, 0);
   tx_stats_.max_age_ms.assign(n, 0.0);
+  trace_ = StreamTrace{};
+  trace_.axes = n;
+  trace_.origin = clock_type::now();
+  if (config_.trace_cycles > 0) {
+    trace_.cycles.resize(config_.trace_cycles);
+    trace_.age_ns.resize(config_.trace_cycles * n);
+    trace_.fresh.resize(config_.trace_cycles * n);
+    trace_.rx.resize(2 * config_.trace_cycles * n);
+  }
 
   rx_ready_ = false;
   rx_running_ = true;
@@ -220,6 +285,9 @@ StreamStats BxiBusStreamer::stats() const
 
 void BxiBusStreamer::receiveLoop()
 {
+  trace_.rx_thread = nameAndDescribeThread("bxrx_" + rx_bus_->name());
+  RCLCPP_INFO(logger(), "[%s] receive thread: %s", rx_bus_->name().c_str(),
+    trace_.rx_thread.c_str());
   rx_ready_ = true;
   CanFrame frame;
   // recv() returns within rx_poll_ms when idle and after each frame on a busy bus, so the stop
@@ -245,6 +313,17 @@ void BxiBusStreamer::receiveLoop()
         slot.rx_userspace_realtime_ns = frame.rx_userspace_realtime_ns;
         ++slot.sequence;
         used = true;
+      }
+      if (decoded.has_value()) {
+        if (trace_.rx_count < trace_.rx.size()) {
+          auto & row = trace_.rx[trace_.rx_count];
+          row.axis = static_cast<uint16_t>(i);
+          row.received_ns = toNanoseconds(received_at - trace_.origin);
+          row.rx_kernel_realtime_ns = frame.rx_kernel_realtime_ns;
+          row.rx_userspace_realtime_ns = frame.rx_userspace_realtime_ns;
+          row.rx_hardware_raw_ns = frame.rx_hardware_raw_ns;
+        }
+        ++trace_.rx_count;
       }
       break;
     }
@@ -281,6 +360,9 @@ void BxiBusStreamer::fault(StreamFault kind, int axis)
 
 void BxiBusStreamer::sendLoop()
 {
+  trace_.tx_thread = nameAndDescribeThread("bxtx_" + tx_bus_->name());
+  RCLCPP_INFO(logger(), "[%s] send thread: %s", tx_bus_->name().c_str(),
+    trace_.tx_thread.c_str());
   const size_t n = drivers_.size();
   const auto period = config_.period;
   std::vector<StreamFeedback> feedback(n);
@@ -310,6 +392,15 @@ void BxiBusStreamer::sendLoop()
       break;
     }
     const auto now = clock_type::now();
+    // Trace row for this cycle, or nullptr when tracing is off or the trace is full.
+    const size_t row_index = trace_.cycle_count++;
+    StreamCycleRecord * row =
+      row_index < trace_.cycles.size() ? &trace_.cycles[row_index] : nullptr;
+    if (row != nullptr) {
+      *row = StreamCycleRecord{};
+      row->cycle = k;
+      row->wake_lateness_ns = toNanoseconds(now - target);
+    }
 
     {
       std::lock_guard<std::mutex> lock(slot_mutex_);
@@ -338,10 +429,17 @@ void BxiBusStreamer::sendLoop()
       } else if (sent_previous_cycle) {
         ++tx_stats_.cycles_without_new_reply[i];
       }
+      if (row != nullptr) {
+        trace_.fresh[row_index * n + i] = fresh[i] ? 1 : 0;
+        trace_.age_ns[row_index * n + i] = -1;
+      }
       if (!sent_any) {
         continue;
       }
       const auto age = now - (has_reply[i] ? last_reply[i] : first_send);
+      if (row != nullptr) {
+        trace_.age_ns[row_index * n + i] = toNanoseconds(age);
+      }
       feedback[i].age_ms = toMilliseconds(age);
       tx_stats_.max_age_ms[i] = std::max(tx_stats_.max_age_ms[i], feedback[i].age_ms);
       if (!faulted && age > config_.max_feedback_age) {
@@ -356,19 +454,33 @@ void BxiBusStreamer::sendLoop()
       fault(StreamFault::kForbiddenReply, -1);
       faulted = true;
     }
+    const auto set_outcome = [row](StreamCycleOutcome outcome) {
+        if (row != nullptr) {
+          row->outcome = outcome;
+        }
+      };
     if (faulted) {
+      set_outcome(StreamCycleOutcome::kStopped);
       break;
     }
 
     // Send nothing for a slot that is already a full period late, and never two frames within
     // half a period, so a stalled thread does not catch up in a burst.
-    if (now >= target + period || (sent_any && now - last_send < period / 2)) {
+    const bool late = now >= target + period;
+    if (late || (sent_any && now - last_send < period / 2)) {
+      set_outcome(late ? StreamCycleOutcome::kSkippedLate : StreamCycleOutcome::kSkippedBurst);
       ++tx_stats_.skipped_cycles;
       sent_previous_cycle = false;
       continue;
     }
 
-    if (!hook_(feedback, commands)) {
+    const auto hook_start = clock_type::now();
+    const bool hook_ok = hook_(feedback, commands);
+    if (row != nullptr) {
+      row->hook_ns = toNanoseconds(clock_type::now() - hook_start);
+    }
+    if (!hook_ok) {
+      set_outcome(StreamCycleOutcome::kStopped);
       fault(StreamFault::kOwnerRequested, -1);
       break;
     }
@@ -384,6 +496,7 @@ void BxiBusStreamer::sendLoop()
       blocks[i] = {can_ids_[i], *block};
     }
     if (faulted) {
+      set_outcome(StreamCycleOutcome::kStopped);
       break;
     }
 
@@ -405,6 +518,7 @@ void BxiBusStreamer::sendLoop()
           for (auto * driver : drivers_) {
             driver->latchCommunicationFault();
           }
+          set_outcome(StreamCycleOutcome::kStopped);
           fault(StreamFault::kSendFailed, -1);
           break;
         }
@@ -433,6 +547,12 @@ void BxiBusStreamer::sendLoop()
       }
     }
     tx_stats_.frames_sent += frames_this_cycle;
+    if (row != nullptr) {
+      row->frames = static_cast<uint8_t>(frames_this_cycle);
+      if (frames_this_cycle > 0) {
+        row->send_lateness_ns = toNanoseconds(send_time - target);
+      }
+    }
     if (frames_this_cycle > 0) {
       if (!sent_any) {
         first_send = send_time;
@@ -442,16 +562,20 @@ void BxiBusStreamer::sendLoop()
       last_send = send_time;
     }
     if (faulted) {
+      set_outcome(StreamCycleOutcome::kStopped);
       break;
     }
     if (window_closed) {
       if (stop_all_->load()) {
+        set_outcome(StreamCycleOutcome::kStopped);
         tx_stats_.stopped_externally = true;
         break;
       }
       if (frames_this_cycle == 0) {
+        set_outcome(StreamCycleOutcome::kExpiredAfterHook);
         ++tx_stats_.skipped_cycles;
       } else {
+        set_outcome(StreamCycleOutcome::kPartial);
         ++tx_stats_.partial_cycles;
       }
       sent_previous_cycle = frames_this_cycle > 0;

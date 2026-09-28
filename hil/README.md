@@ -79,6 +79,19 @@ python3 /ws/src/bxi_hardware/hil/single_joint/analyze_worker_timing.py \
   /ws/log/bxi_worker_can0_1790496612659  # 番号は今回の起動ログに合わせる
 ```
 
+`can_transport` で `rx_mode: separate` にしたバスは、上記の worker CSV ではなく、停止時にバスごとの `bxi_stream_<bus>_<時刻>_cycles.csv` と `_rx.csv` を保存する。同じく1バスあたり20,000周期分を事前確保し、周期中はファイルに書かない。
+
+- `_cycles.csv`：周期ごとの結果（`sent`、`skipped_late`、`skipped_burst`、`expired_after_hook`、`partial`、`stopped`）、予定時刻からの起床の遅れ、hook（`data_mutex_` の待ちを含む）の所要時間、予定時刻からの最初のフレームの送信の遅れ、フレーム数、軸ごとの周期開始時点のフィードバック経過時間（最初の送信前は -1）と新しい応答の有無。
+- `_rx.csv`：有効な応答ごとの受信時刻（単調時計、開始からの ns）、カーネル受信・ユーザー空間取込の `CLOCK_REALTIME` 時刻、rawハードウェア受信時刻（取得できないインターフェースでは0）。カーネル受信から取込までの差には、受信スレッドの起床に加えて `recvmsg()` と先行フレームの処理待ちが含まれる。受信スレッドの起床遅れの上限値として扱い、起床遅れそのものとは呼ばない。
+- 先頭行の `tx_thread` / `rx_thread` は、各スレッドが開始した時点のスケジューリング方式・優先度・CPUアフィニティ。スレッド名は `bxtx_<bus>` / `bxrx_<bus>` で、`ps -L` や `chrt -p` で確認できる。
+
+```bash
+python3 /ws/src/bxi_hardware/hil/single_joint/analyze_stream_timing.py \
+  /ws/log/bxi_stream_can0_1790632101395 --tolerance-ms 0.1  # 番号は今回の起動ログに合わせる
+```
+
+`--tolerance-ms` を超えた送信の遅れ・間隔だけを数える。1 ms をわずかに超えた正のジッタを合否判定に使わないためである。
+
 2026-09-27 の指令なし1軸 HIL ベースラインでは、6,756周期の平均開始間隔が5.1108 ms（約195.7 Hz）、worker 作業時間の中央値1.3127 ms・最大1.5377 ms、CAN 取引時間の中央値1.3082 ms・最大1.5330 msだった。5 msを超えた作業周期、無効応答、計測バッファ欠測は0。計測オン・オフの短い CAN 時刻比較では明確な悪化は観測されなかった。条件、p99などの分布、生データはワークスペース側の `docs/test-reports/2026-09-27-bxi-worker-baseline.md` に記録した。これは worker の優先度を変更する前の値で、指令送信時やタイムアウト時の遅れは含まない。
 
 同じ条件で `can_frame_format.can0` だけを変えた CAN FD / CAN FD+BRS の実測は、ワークスペース側の `docs/test-reports/2026-09-27-bxi-worker-can-fd.md` に記録した。CAN取引時間の中央値は、Classic 1.3082 ms、FD（BRSなし）1.3272 ms、FD+BRS 1.2572 ms。3モードとも worker の作業時間は5 ms以内だが、周期開始間隔は約5.1 msのままだった。既定の `bxi_hardware.yaml` は Classic CAN のままにしている。

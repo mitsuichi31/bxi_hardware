@@ -66,6 +66,57 @@ struct StreamConfig
   // The receive thread checks its stop flag at least this often.
   int rx_poll_ms = 2;
   std::chrono::milliseconds rx_ready_timeout{100};
+  // Cycles to record in the preallocated trace (0 = no trace). Replies get twice as many rows
+  // per axis.
+  size_t trace_cycles = 0;
+};
+
+enum class StreamCycleOutcome : uint8_t
+{
+  kSent,              // every command of the cycle was sent
+  kSkippedLate,       // woke a full period late; nothing sent
+  kSkippedBurst,      // within half a period of the previous send; nothing sent
+  kExpiredAfterHook,  // the slot expired while the hook ran; nothing sent
+  kPartial,           // the slot expired between per-motor frames
+  kStopped,           // a fault or stop request ended the stream in this cycle
+};
+
+const char * streamCycleOutcomeName(StreamCycleOutcome outcome);
+
+struct StreamCycleRecord
+{
+  uint64_t cycle = 0;
+  int64_t wake_lateness_ns = 0;  // wake-up after the scheduled slot start
+  int64_t hook_ns = 0;           // time in the owner hook, including its lock waits
+  int64_t send_lateness_ns = -1;  // first frame after the slot start; -1 if nothing was sent
+  uint8_t frames = 0;
+  StreamCycleOutcome outcome = StreamCycleOutcome::kSent;
+};
+
+struct StreamRxRecord
+{
+  uint16_t axis = 0;
+  int64_t received_ns = 0;  // steady clock, relative to StreamTrace::origin
+  int64_t rx_kernel_realtime_ns = 0;
+  int64_t rx_userspace_realtime_ns = 0;
+  int64_t rx_hardware_raw_ns = 0;
+};
+
+// Filled only while running and read only after stop(). All storage is allocated in start().
+struct StreamTrace
+{
+  std::chrono::steady_clock::time_point origin{};
+  size_t axes = 0;
+  std::vector<StreamCycleRecord> cycles;
+  size_t cycle_count = 0;  // may exceed cycles.size(); the excess is dropped
+  // cycles.size() x axes, row-major. Age at the start of the cycle; -1 before the first send.
+  std::vector<int64_t> age_ns;
+  std::vector<uint8_t> fresh;  // a new reply was applied at the start of the cycle
+  std::vector<StreamRxRecord> rx;
+  size_t rx_count = 0;  // may exceed rx.size(); the excess is dropped
+  // Scheduling of each thread as it started, e.g. "SCHED_OTHER priority=0 cpus=0-15".
+  std::string tx_thread;
+  std::string rx_thread;
 };
 
 struct StreamStats
@@ -118,6 +169,9 @@ public:
   const std::string & error() const {return error_;}
   // Complete only after stop().
   StreamStats stats() const;
+  const StreamTrace & trace() const {return trace_;}
+  const StreamConfig & config() const {return config_;}
+  const std::vector<int> & canIds() const {return can_ids_;}
 
   // The 0x7FF frame for blocks indexed by motor ID - 1. nullopt if the length is not a valid
   // CAN FD length or a block position is out of range.
@@ -174,6 +228,8 @@ private:
   uint64_t rx_ignored_ = 0;
   // Written by the send thread, read after join.
   StreamStats tx_stats_;
+  // Cycle rows and tx_thread by the send thread, rx rows and rx_thread by the receive thread.
+  StreamTrace trace_;
 };
 
 }  // namespace bxi_hardware
