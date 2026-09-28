@@ -45,12 +45,27 @@ def test_summarizes_outcomes_lateness_and_per_motor_age(tmp_path):
     assert "send lateness from slot start:" in text and "over 0.1 ms=1/3" in text
     # Send times 0.06, 1.05, 2.32 ms: the second interval (1.27 ms) exceeds period + 0.1 ms.
     assert "over period+0.1 ms=1/2" in next(line for line in lines if line.startswith("send interval"))
-    motor2 = next(line for line in lines if line.startswith("motor 2 feedback age"))
+    motor2 = next(line for line in lines if line.startswith("motor 2 latest reply age at slot start"))
     assert "max=2.7000" in motor2 and "over one period=2/3" in motor2
-    assert "motor 2: over max age=0, cycles without a new reply=1/3" in text
+    # Sent slots only, measured at the send: 0.70 + (0.05 - 0.04) and 1.70 + (0.32 - 0.30) ms.
+    to_send = next(line for line in lines if line.startswith("motor 2 reply to next send"))
+    assert "max=1.7200" in to_send and "over one period=1/2" in to_send
+    assert "motor 2: over stop threshold=0, slots without a new reply=1/3" in text
+    assert "slots=4 (dropped 0), sends=3" in text
     assert "motor 1: kernel timestamps=3/3, hardware timestamps=0/3" in text
     kernel_to_user = next(line for line in lines if line.startswith("motor 1 kernel RX"))
     assert "max=0.0200" in kernel_to_user
+
+
+def test_marks_reply_statistics_when_the_reply_trace_filled(tmp_path):
+    stem = write_capture(tmp_path)
+    for suffix in ("_cycles.csv", "_rx.csv"):
+        path = Path(f"{stem}{suffix}")
+        path.write_text(path.read_text().replace("dropped_rx=0", "dropped_rx=7"))
+    text = "\n".join(summarize(stem))
+    assert "(dropped 7)" in text
+    assert "kernel RX to userspace read (upper bound of receive wake-up) " \
+        "(first 4 replies only; 7 not recorded)" in text
 
 
 def test_tolerance_changes_the_late_counts(tmp_path):

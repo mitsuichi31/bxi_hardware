@@ -81,7 +81,11 @@ python3 /ws/src/bxi_hardware/hil/single_joint/analyze_worker_timing.py \
 
 `can_transport` で `rx_mode: separate` にしたバスは、上記の worker CSV ではなく、停止時にバスごとの `bxi_stream_<bus>_<時刻>_cycles.csv` と `_rx.csv` を保存する。同じく1バスあたり20,000周期分を事前確保し、周期中はファイルに書かない。
 
-- `_cycles.csv`：周期ごとの結果（`sent`、`skipped_late`、`skipped_burst`、`expired_after_hook`、`partial`、`stopped`）、予定時刻からの起床の遅れ、hook（`data_mutex_` の待ちを含む）の所要時間、予定時刻からの最初のフレームの送信の遅れ、フレーム数、軸ごとの周期開始時点のフィードバック経過時間（最初の送信前は -1）と新しい応答の有無。
+- `_cycles.csv`：周期ごとの結果（`sent`、`skipped_late`、`skipped_burst`、`expired_after_hook`、`partial`、`stopped`）、予定時刻からの起床の遅れ、hook（`data_mutex_` の待ちを含む）の所要時間、予定時刻からの最初のフレームの送信の遅れ、フレーム数、軸ごとの「周期開始時の最新応答経過時間」（列名 `age_ns_<id>`、最初の送信前は -1）と新しい応答の有無（`fresh_<id>`）。
+
+  - **周期開始時の最新応答経過時間**：送信スレッドが周期ごとに起きた時点で、最新の応答を受信してから何 ns 経ったか。送信するかどうかを決める前に測るので、スキップした周期や停止した周期にも記録される。`stream_feedback_max_age_ms` を超えると安全停止する。
+  - **受信から次の送信までの時間**：送信した周期だけについて、最新の応答から実際の送信までの時間。`age_ns + (send_lateness_ns − wake_lateness_ns)` で求める（解析スクリプトが計算する）。
+  - **新しい応答が届いたか**は `fresh_<id>` で判定する。経過時間が1周期未満でも、周期の起床間隔が揺れると新着の有無とは一致しない。送信スレッド自身が遅れた場合は、新しい応答が届いていても経過時間が大きくなる。
 - `_rx.csv`：有効な応答ごとの受信時刻（単調時計、開始からの ns）、カーネル受信・ユーザー空間取込の `CLOCK_REALTIME` 時刻、rawハードウェア受信時刻（取得できないインターフェースでは0）。カーネル受信から取込までの差には、受信スレッドの起床に加えて `recvmsg()` と先行フレームの処理待ちが含まれる。受信スレッドの起床遅れの上限値として扱い、起床遅れそのものとは呼ばない。
 - 先頭行の `tx_thread` / `rx_thread` は、各スレッドが開始した時点のスケジューリング方式・優先度・CPUアフィニティ。スレッド名は `bxtx_<bus>` / `bxrx_<bus>` で、`ps -L` や `chrt -p` で確認できる。
 
@@ -91,6 +95,30 @@ python3 /ws/src/bxi_hardware/hil/single_joint/analyze_stream_timing.py \
 ```
 
 `--tolerance-ms` を超えた送信の遅れ・間隔だけを数える。1 ms をわずかに超えた正のジッタを合否判定に使わないためである。
+
+### 送受信分離のスケジューリングを vcan で比較する
+
+実機を使わずに、controller_manager（1 kHz・`SCHED_FIFO` 50、`controllers_1khz.yaml`）と送受信分離（`bxi_hardware_stream_1khz.yaml` を vcan 用に書き換えたもの）を同時に動かし、送受信スレッドのスケジューリング条件を比べられる。
+
+- `bxi_vcan_motor_emulator`：vcan 専用の模擬モーター。個別ID宛ての指令にはすぐに応答し、`0x7FF` のブロードキャストには `--delay-us` 後に応答する。`--replies-per-command` で応答を増やすと、受信側の負荷を上げられる。`ros2 run` 経由では SIGINT がツールに届かないため、`$(ros2 pkg prefix bxi_hardware)/lib/bxi_hardware/bxi_vcan_motor_emulator` を直接起動する。
+- `compare_stream_scheduling.py`：次の条件ごとに設定を作り、模擬モーターと `single_joint_hil.launch.py` を起動し、CSV・ログ・`summary.tsv` を出力先にまとめる。
+  - 送受信スレッドの条件：SCHED_OTHER、controller_manager より下／上の FIFO、CPU 固定、受信スレッドだけ高い FIFO
+  - CPU 負荷：なし／全 CPU にビジーループ
+  - 1指令あたりの応答数
+  - controller_manager については、ログの `Overrun detected` 警告の件数（`cm_overrun_warnings`）を数える。
+  - `summary.tsv` は周期の結果を種類ごと（`sent`・`skipped_late`・`skipped_burst`・`expired_after_hook`・`partial`・`stopped`）に分けて数える。`stopped` は、故障で送信を止めた最後の周期である。
+  - 受信記録は1軸あたり周期数の2倍（2万周期なら4万件）で満杯になる。`dropped_rx` が0でなければ、受信間隔と「カーネル受信→取込」の統計は、記録できた前半の応答だけの値である。
+  - `--resummarize <出力先>` で、既存の CSV から `summary.tsv` を作り直せる。
+  - 模擬モーターは既定で `SCHED_FIFO` 80 で動かす（`--emulator-priority`）。本物のモーターはホストの外にあり、ホストの CPU 負荷で応答が遅れないためである。SCHED_OTHER のままだと、CPU 負荷で模擬モーター自体が遅れ、送受信分離が鮮度切れで安全停止する。
+
+```bash
+sudo ip link add vcan0 type vcan && sudo ip link set vcan0 mtu 72 up
+python3 /ws/src/bxi_hardware/hil/single_joint/compare_stream_scheduling.py --seconds 10 \
+  --out /ws/log/stream_sched_$(date +%Y%m%d_%H%M%S)
+sudo ip link del vcan0
+```
+
+vcan 上の値は、ホストのスケジューリングの比較であり、実機の CAN の送受信時間を含まない。
 
 2026-09-27 の指令なし1軸 HIL ベースラインでは、6,756周期の平均開始間隔が5.1108 ms（約195.7 Hz）、worker 作業時間の中央値1.3127 ms・最大1.5377 ms、CAN 取引時間の中央値1.3082 ms・最大1.5330 msだった。5 msを超えた作業周期、無効応答、計測バッファ欠測は0。計測オン・オフの短い CAN 時刻比較では明確な悪化は観測されなかった。条件、p99などの分布、生データはワークスペース側の `docs/test-reports/2026-09-27-bxi-worker-baseline.md` に記録した。これは worker の優先度を変更する前の値で、指令送信時やタイムアウト時の遅れは含まない。
 

@@ -42,6 +42,10 @@ pluginlib_export_plugin_description_file(hardware_interface bxi_hardware.xml)
 add_executable(bxi_probe tools/bxi_probe.cpp)
 target_link_libraries(bxi_probe ${PROJECT_NAME})
 
+# vcan 専用の模擬モーター（スケジューリング条件の比較用）
+add_executable(bxi_vcan_motor_emulator tools/bxi_vcan_motor_emulator.cpp)
+target_link_libraries(bxi_vcan_motor_emulator ${PROJECT_NAME})
+
 add_executable(sine_command_cpp hil/single_joint/sine_command.cpp)
 ament_target_dependencies(sine_command_cpp rclcpp sensor_msgs std_msgs)
 
@@ -74,6 +78,7 @@ if(BUILD_TESTING)
   set_target_properties(test_vcan_stream_system PROPERTIES BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}")
   ament_add_pytest_test(test_validate_config test/test_validate_config.py)
   ament_add_pytest_test(test_analyze_stream_timing test/test_analyze_stream_timing.py)
+  ament_add_pytest_test(test_compare_stream_scheduling test/test_compare_stream_scheduling.py)
   ament_add_pytest_test(test_sine_trajectory test/test_sine_trajectory.py)
 endif()
 
@@ -90,7 +95,8 @@ install(FILES hil/single_joint/single_joint_hil.launch.py
   DESTINATION share/${PROJECT_NAME}/hil/single_joint)
 install(PROGRAMS hil/single_joint/ramp_command.py hil/single_joint/sine_command.py
   DESTINATION lib/${PROJECT_NAME})
-install(TARGETS bxi_probe sine_command_cpp DESTINATION lib/${PROJECT_NAME})
+install(TARGETS bxi_probe bxi_vcan_motor_emulator sine_command_cpp
+  DESTINATION lib/${PROJECT_NAME})
 install(
   TARGETS ${PROJECT_NAME}
   EXPORT export_${PROJECT_NAME}

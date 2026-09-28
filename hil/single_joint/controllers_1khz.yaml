@@ -1,0 +1,18 @@
+# controllers.yaml と同じ構成で、更新周期だけを 1 kHz にしたもの（送受信分離の比較・HIL 用）。
+controller_manager:
+  ros__parameters:
+    update_rate: 1000
+    thread_priority: 50
+    lock_memory: true
+
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+
+    joint1_command:
+      type: forward_command_controller/MultiInterfaceForwardCommandController
+
+joint1_command:
+  ros__parameters:
+    joint: joint1
+    # /joint1_command/commands（std_msgs/Float64MultiArray）の data = [position, velocity, kp, kd, effort]
+    interface_names: [position, velocity, kp, kd, effort]

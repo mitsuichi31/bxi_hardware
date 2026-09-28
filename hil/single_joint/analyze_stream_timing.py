@@ -49,6 +49,31 @@ def intervals(values):
     return [later - earlier for earlier, later in zip(values, values[1:])]
 
 
+def latest_reply_ages(cycles, can_id):
+    """Latest reply age at the start of each slot, in ns (the stop decision uses this value).
+
+    Recorded before the slot's send decision, so skipped and stopped slots have it too.
+    Slots before the first send (-1) are left out.
+    """
+    return [int(row[f"age_ns_{can_id}"]) for row in cycles if int(row[f"age_ns_{can_id}"]) >= 0]
+
+
+def reply_to_send_times(cycles, can_id):
+    """Time from the latest reply to the send of each slot that sent, in ns.
+
+    The age is taken when the thread wakes; the send follows (send - wake) later.
+    """
+    return [int(row[f"age_ns_{can_id}"]) + int(row["send_lateness_ns"]) - int(row["wake_lateness_ns"])
+            for row in cycles
+            if int(row["send_lateness_ns"]) >= 0 and int(row[f"age_ns_{can_id}"]) >= 0]
+
+
+def slots_without_new_reply(cycles, can_id):
+    """Slots after the first send whose start found no new reply (fresh flag 0)."""
+    return sum(1 for row in cycles
+               if int(row[f"age_ns_{can_id}"]) >= 0 and row[f"fresh_{can_id}"] == "0")
+
+
 def summarize(stem, tolerance_ms=0.1):
     """Return the report lines for one stream timing capture."""
     metadata, cycles = read_csv(Path(f"{stem}_cycles.csv"))
@@ -59,10 +84,12 @@ def summarize(stem, tolerance_ms=0.1):
     can_ids = [int(value) for value in metadata["can_ids"].split(";") if value]
 
     lines = [
-        f"period={period_ns / 1e6:.3f} ms, max feedback age={max_age_ns / 1e6:.3f} ms, "
+        f"period={period_ns / 1e6:.3f} ms, "
+        f"stop threshold for the latest reply age={max_age_ns / 1e6:.3f} ms, "
         f"broadcast={metadata['broadcast']}, motors={can_ids}",
         f"send thread: {metadata['tx_thread']}; receive thread: {metadata['rx_thread']}",
-        f"cycles={len(cycles)} (dropped {metadata['dropped_cycles']}), "
+        f"slots={len(cycles)} (dropped {metadata['dropped_cycles']}), "
+        f"sends={sum(row['outcome'] == 'sent' for row in cycles)}, "
         f"replies={len(replies)} (dropped {metadata['dropped_rx']})",
     ]
     outcomes = Counter(row["outcome"] for row in cycles)
@@ -83,20 +110,21 @@ def summarize(stem, tolerance_ms=0.1):
         "send interval", intervals(send_times), period_ns + tolerance_ns,
         f"over period+{tolerance_ms:g} ms"))
 
+    dropped_rx = int(metadata["dropped_rx"])
+    rx_note = f" (first {len(replies)} replies only; {dropped_rx} not recorded)" if dropped_rx else ""
     for can_id in can_ids:
-        ages = [int(row[f"age_ns_{can_id}"]) for row in cycles if int(row[f"age_ns_{can_id}"]) >= 0]
+        ages = latest_reply_ages(cycles, can_id)
         lines.append(format_distribution(
-            f"motor {can_id} feedback age at cycle start", ages, period_ns, "over one period"))
-        over_limit = sum(age > max_age_ns for age in ages)
-        # A cycle counts as without a new reply only after the first send (age is then >= 0).
-        without_new = sum(1 for row in cycles
-                          if int(row[f"age_ns_{can_id}"]) >= 0 and row[f"fresh_{can_id}"] == "0")
-        lines.append(f"motor {can_id}: over max age={over_limit}, "
-                     f"cycles without a new reply={without_new}/{len(ages)}")
+            f"motor {can_id} latest reply age at slot start", ages, period_ns, "over one period"))
+        lines.append(format_distribution(
+            f"motor {can_id} reply to next send (sent slots)", reply_to_send_times(cycles, can_id),
+            period_ns, "over one period"))
+        lines.append(f"motor {can_id}: over stop threshold={sum(age > max_age_ns for age in ages)}, "
+                     f"slots without a new reply={slots_without_new_reply(cycles, can_id)}/{len(ages)}")
 
         rows = [row for row in replies if int(row["can_id"]) == can_id]
         lines.append(format_distribution(
-            f"motor {can_id} reply interval (userspace)",
+            f"motor {can_id} reply interval (userspace){rx_note}",
             intervals([int(row["received_ns"]) for row in rows]), period_ns + tolerance_ns,
             f"over period+{tolerance_ms:g} ms"))
         stamped = [row for row in rows
@@ -104,7 +132,7 @@ def summarize(stem, tolerance_ms=0.1):
         # Includes the receive thread's wake-up, the recvmsg() call, and any wait behind earlier
         # frames, so it bounds the wake-up delay from above rather than isolating it.
         lines.append(format_distribution(
-            f"motor {can_id} kernel RX to userspace read (upper bound of receive wake-up)",
+            f"motor {can_id} kernel RX to userspace read (upper bound of receive wake-up){rx_note}",
             [int(row["rx_userspace_realtime_ns"]) - int(row["rx_kernel_realtime_ns"]) for row in stamped]))
         hardware = [int(row["rx_hardware_raw_ns"]) for row in rows if int(row["rx_hardware_raw_ns"]) > 0]
         lines.append(f"motor {can_id}: kernel timestamps={len(stamped)}/{len(rows)}, "

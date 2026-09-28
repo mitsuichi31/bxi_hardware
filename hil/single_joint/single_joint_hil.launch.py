@@ -5,6 +5,8 @@
 
   ros2 launch bxi_hardware single_joint_hil.launch.py
   ros2 launch bxi_hardware single_joint_hil.launch.py config_file:=/path/to/bxi_hardware.yaml
+  ros2 launch bxi_hardware single_joint_hil.launch.py \
+    config_file:=.../bxi_hardware_stream_1khz.yaml controllers_file:=.../controllers_1khz.yaml
 """
 
 from launch import LaunchDescription
@@ -20,6 +22,7 @@ def generate_launch_description():
     hil_dir = PathJoinSubstitution([share, "hil", "single_joint"])
     config_file = LaunchConfiguration("config_file")
     spec_dir = LaunchConfiguration("spec_dir")
+    controllers_file = LaunchConfiguration("controllers_file")
 
     robot_description = ParameterValue(
         Command([
@@ -39,6 +42,10 @@ def generate_launch_description():
             "spec_dir",
             default_value=PathJoinSubstitution([share, "config", "specs"]),
             description="モーター機種 spec（MOTOR_70.yaml など）のディレクトリ"),
+        DeclareLaunchArgument(
+            "controllers_file",
+            default_value=PathJoinSubstitution([hil_dir, "controllers.yaml"]),
+            description="controller_manager の設定（更新周期・RT優先度・controller）"),
         Node(
             package="robot_state_publisher",
             executable="robot_state_publisher",
@@ -47,7 +54,7 @@ def generate_launch_description():
         Node(
             package="controller_manager",
             executable="ros2_control_node",
-            parameters=[PathJoinSubstitution([hil_dir, "controllers.yaml"])],
+            parameters=[controllers_file],
             output="screen",
         ),
         Node(
