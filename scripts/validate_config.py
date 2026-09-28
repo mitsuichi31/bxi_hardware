@@ -43,6 +43,47 @@ def validate(config_path: Path, schema_path: Path, spec_dir: Path) -> list[str]:
         motor_type = joint["motor_type"]
         if motor_type == "TBD" or not (spec_dir / f"{motor_type}.yaml").is_file():
             errors.append(f"{name}: missing motor spec {motor_type!r}")
+    errors.extend(validate_transport(config, active_buses, used_ids))
+    return errors
+
+
+# Valid CAN FD payload lengths for a broadcast of N 8-byte blocks.
+BROADCAST_MOTOR_COUNTS = {1, 2, 3, 4, 6, 8}
+
+
+def validate_transport(config: dict, active_buses: set[str], used_ids: set[tuple[str, int]]) -> list[str]:
+    """Mirror BxiSystemInterface::parseConfig() for can_transport."""
+    errors: list[str] = []
+    period_ms = 1000.0 / config["defaults"]["can_hz"]
+    formats = config.get("can_frame_format", {})
+    for bus, transport in config.get("can_transport", {}).items():
+        if bus not in active_buses:
+            errors.append(f"can_transport: unknown or inactive bus {bus!r}")
+            continue
+        separate = transport.get("rx_mode", "sequential") == "separate"
+        broadcast = transport.get("tx_frame", "unicast") == "broadcast"
+        isolated = "hil_isolated_id1_broadcast_blocks" in transport
+        max_age = transport.get("stream_feedback_max_age_ms")
+        if not separate:
+            if broadcast or max_age is not None or isolated:
+                errors.append(f"can_transport.{bus}: broadcast, stream_feedback_max_age_ms and "
+                              "hil_isolated_id1_broadcast_blocks require rx_mode: separate")
+            continue
+        if max_age is None or not math.isfinite(max_age) or max_age < 2 * period_ms:
+            errors.append(f"can_transport.{bus}.stream_feedback_max_age_ms is required and must be "
+                          f"at least two periods ({2 * period_ms:.3f} ms)")
+        ids = sorted(can_id for joint_bus, can_id in used_ids if joint_bus == bus)
+        bus_format = formats.get(bus, "classic")
+        if isolated:
+            if not broadcast or bus != "can0" or ids != [1] or bus_format != "fd":
+                errors.append(f"can_transport.{bus}.hil_isolated_id1_broadcast_blocks needs can0, "
+                              "only motor ID 1, can_frame_format: fd and tx_frame: broadcast")
+        elif broadcast:
+            if bus_format == "classic":
+                errors.append(f"can_transport.{bus}: broadcast needs CAN FD")
+            if ids != list(range(1, len(ids) + 1)) or len(ids) not in BROADCAST_MOTOR_COUNTS:
+                errors.append(f"can_transport.{bus}: broadcast needs enabled motor IDs 1..N "
+                              f"with N in {sorted(BROADCAST_MOTOR_COUNTS)}")
     return errors
 
 

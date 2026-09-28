@@ -13,6 +13,10 @@
       "type": "object",
       "additionalProperties": {"type": "string", "enum": ["classic", "fd", "fd_brs"]}
     },
+    "can_transport": {
+      "type": "object",
+      "additionalProperties": {"$ref": "#/$defs/transport"}
+    },
     "defaults": {
       "type": "object",
       "required": ["control_timeout_ms", "maximum_consecutive_timeouts", "can_hz"],
@@ -31,6 +35,16 @@
     }
   },
   "$defs": {
+    "transport": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "rx_mode": {"type": "string", "enum": ["sequential", "separate"]},
+        "tx_frame": {"type": "string", "enum": ["unicast", "broadcast"]},
+        "stream_feedback_max_age_ms": {"type": "number", "exclusiveMinimum": 0, "maximum": 50},
+        "hil_isolated_id1_broadcast_blocks": {"type": "integer", "const": 3}
+      }
+    },
     "joint": {
       "type": "object",
       "required": ["enabled"],

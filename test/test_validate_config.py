@@ -98,3 +98,60 @@ joints:
   a: {enabled: true, can_bus: can0, can_id: 1, motor_dir: 0, motor_type: MOTOR_70, lower: -1, upper: 1}
 """)
     assert any("not one of [-1, 1]" in error for error in errors)
+
+
+TRANSPORT_BASE = """
+active_can_buses: [can0]
+can_frame_format: {{can0: {fmt}}}
+defaults: {{control_timeout_ms: 3, maximum_consecutive_timeouts: 3, can_hz: {hz}}}
+can_transport:
+  can0: {transport}
+joints:
+{joints}
+"""
+JOINT = "  j{id}: {{enabled: true, can_bus: can0, can_id: {id}, motor_dir: 1, motor_type: MOTOR_70, lower: -1, upper: 1}}\n"
+
+
+def transport_errors(tmp_path, transport, ids=(1, 2, 3), fmt="fd", hz=1000):
+    joints = "".join(JOINT.format(id=can_id) for can_id in ids)
+    return run(tmp_path / "transport.yaml", tmp_path,
+               TRANSPORT_BASE.format(fmt=fmt, hz=hz, transport=transport, joints=joints))
+
+
+def test_accepts_streamed_broadcast_and_unicast(tmp_path):
+    assert transport_errors(
+        tmp_path, "{rx_mode: separate, tx_frame: broadcast, stream_feedback_max_age_ms: 3}") == []
+    assert transport_errors(
+        tmp_path, "{rx_mode: separate, stream_feedback_max_age_ms: 15}", ids=(1, 5), hz=200) == []
+
+
+def test_streamed_bus_requires_max_age_of_at_least_two_periods(tmp_path):
+    for transport in ("{rx_mode: separate}",
+                      "{rx_mode: separate, stream_feedback_max_age_ms: 1.5}"):
+        errors = transport_errors(tmp_path, transport)
+        assert any("at least two periods" in error for error in errors), transport
+    errors = transport_errors(tmp_path, "{rx_mode: separate, stream_feedback_max_age_ms: 60}")
+    assert any("greater than the maximum of 50" in error for error in errors)
+
+
+def test_stream_options_require_separate_rx(tmp_path):
+    errors = transport_errors(tmp_path, "{tx_frame: broadcast}")
+    assert any("require rx_mode: separate" in error for error in errors)
+
+
+def test_broadcast_needs_fd_and_ids_one_to_n(tmp_path):
+    base = "{rx_mode: separate, tx_frame: broadcast, stream_feedback_max_age_ms: 3}"
+    assert any("needs CAN FD" in error for error in transport_errors(tmp_path, base, fmt="classic"))
+    assert any("IDs 1..N" in error for error in transport_errors(tmp_path, base, ids=(1, 3)))
+    assert any("IDs 1..N" in error for error in transport_errors(tmp_path, base, ids=(1, 2, 3, 4, 5)))
+
+
+def test_isolated_single_motor_broadcast_is_limited_to_can0_id1_fd(tmp_path):
+    isolated = ("{rx_mode: separate, tx_frame: broadcast, stream_feedback_max_age_ms: 3, "
+                "hil_isolated_id1_broadcast_blocks: 3}")
+    assert transport_errors(tmp_path, isolated, ids=(1,)) == []
+    assert any("hil_isolated" in error for error in transport_errors(tmp_path, isolated, ids=(1, 2)))
+    assert any("hil_isolated" in error
+               for error in transport_errors(tmp_path, isolated, ids=(1,), fmt="fd_brs"))
+    errors = transport_errors(tmp_path, isolated.replace("blocks: 3", "blocks: 4"), ids=(1,))
+    assert any("3 was expected" in error for error in errors)

@@ -18,6 +18,7 @@
 #include "rclcpp_lifecycle/state.hpp"
 
 #include "bxi_hardware/actuator/bxi_actuator.hpp"
+#include "bxi_hardware/bus_streamer.hpp"
 #include "bxi_hardware/can/socketcan_bus.hpp"
 
 namespace bxi_hardware
@@ -64,6 +65,9 @@ public:
 
 protected:
   virtual std::shared_ptr<CanBus> makeBus(CanFrameFormat format);
+  // Test seam: called during on_activate() after every streamed bus has answered and the workers
+  // run, just before the final safe-stop check.
+  virtual void onStreamFeedbackConfirmed() {}
 
 private:
   struct WorkerTimingCycle
@@ -104,7 +108,27 @@ private:
     int64_t period_ns = 0;
   };
 
+  // Per-bus transport from can_transport. The defaults keep the sequential worker.
+  struct BusTransport
+  {
+    bool separate = false;   // rx_mode: separate
+    bool broadcast = false;  // tx_frame: broadcast
+    double stream_feedback_max_age_ms = 0.0;
+    size_t isolated_id1_broadcast_blocks = 0;  // hil_isolated_id1_broadcast_blocks
+  };
+
   bool parseConfig();
+  bool startStream(const std::string & bus_name, const std::vector<size_t> & indices);
+  // Runs on the send thread of a streamed bus once per cycle.
+  bool streamCycle(
+    const std::string & bus_name, const std::vector<size_t> & indices, const std::vector<StreamFeedback> & feedback,
+    std::vector<StreamCommand> & commands);
+  // Option 1 of the stop design: waits for the stream to end and, after a safe-stop, disables
+  // the bus without waiting for controller_manager.
+  void streamMonitorLoop(std::string bus_name, std::vector<size_t> indices);
+  void stopStream(const std::string & bus_name);
+  void disableAxes(const std::string & bus_name, const std::vector<size_t> & indices,
+    const char * reason);
   bool loadSpec(const std::string & motor_type);
   void workerLoop(std::string bus_name, std::vector<size_t> indices, WorkerTimingTrace * timing);
   void stopWorkers();
@@ -120,6 +144,10 @@ private:
   std::map<std::string, std::shared_ptr<CanBus>> buses_;
   std::vector<std::string> active_buses_;
   std::map<std::string, CanFrameFormat> bus_formats_;
+  std::map<std::string, BusTransport> bus_transport_;
+  std::map<std::string, std::shared_ptr<CanBus>> rx_buses_;
+  std::map<std::string, std::unique_ptr<BxiBusStreamer>> streamers_;
+  std::mutex stream_stop_mutex_;
   std::map<std::string, BxiSpec> specs_;
 
   std::string config_file_;

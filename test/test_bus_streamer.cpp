@@ -551,6 +551,14 @@ TEST(BusStreamer, SlowHookDoesNotSendAnExpiredCommand)
   auto c = config(1ms, false);
   c.max_feedback_age = 50ms;
   std::atomic<int> calls{0};
+  // Each send records which hook call prepared it. The send thread runs both, so the value read
+  // here is the call of the current cycle.
+  std::mutex sent_mutex;
+  std::vector<int> sent_by_call;
+  rig.link.after_send = [&]() {
+      std::lock_guard<std::mutex> lock(sent_mutex);
+      sent_by_call.push_back(calls.load());
+    };
   auto streamer = rig.makeStreamer(c,
       [&calls](const std::vector<StreamFeedback> &, std::vector<StreamCommand> &) {
         if (++calls == 5) {
@@ -565,8 +573,12 @@ TEST(BusStreamer, SlowHookDoesNotSendAnExpiredCommand)
   EXPECT_EQ(stats.fault, StreamFault::kNone);
   EXPECT_GE(stats.skipped_cycles, 1U);
   EXPECT_EQ(stats.frames_sent, stats.cycles);
-  // Every hook call sent its command except the slow one.
-  EXPECT_EQ(static_cast<uint64_t>(calls.load()), stats.cycles + 1);
+  // The slow fifth call's command was never sent, and later cycles kept sending. Other calls
+  // may also expire on a slow machine (for example under ThreadSanitizer); they are not counted.
+  std::lock_guard<std::mutex> lock(sent_mutex);
+  EXPECT_EQ(std::count(sent_by_call.begin(), sent_by_call.end(), 5), 0);
+  EXPECT_TRUE(std::any_of(sent_by_call.begin(), sent_by_call.end(),
+    [](int call) {return call > 5;}));
 }
 
 TEST(BusStreamer, StopRequestedDuringTheHookSendsNothing)

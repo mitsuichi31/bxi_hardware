@@ -1,12 +1,14 @@
 #include <atomic>
 #include <chrono>
 #include <deque>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <set>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -135,6 +137,123 @@ hardware_interface::HardwareInfo hardwareInfo(const std::string & config)
     info.joints.push_back(joint);
   }
   return info;
+}
+
+std::string writeConfig(const std::string & file_name, const std::string & text)
+{
+  const std::string path = ::testing::TempDir() + file_name;
+  std::ofstream(path) << text;
+  return path;
+}
+
+hardware_interface::HardwareInfo hardwareInfoAt(const std::string & config_path)
+{
+  auto info = hardwareInfo("valid.yaml");
+  info.hardware_parameters["config_file"] = config_path;
+  return info;
+}
+
+// joint1 and joint2 on can0 with IDs 1 and 2 unless replaced.
+std::string transportConfig(
+  const std::string & transport, const std::string & format = "fd", int can_hz = 1000,
+  const std::string & joint2 = "{enabled: true, can_bus: can0, can_id: 2, motor_dir: 1, "
+  "motor_type: MOTOR_70, lower: -1.0, upper: 1.0}")
+{
+  return "active_can_buses: [can0]\n"
+         "can_frame_format: {can0: " + format + "}\n"
+         "defaults: {control_timeout_ms: 3, maximum_consecutive_timeouts: 3, can_hz: " +
+         std::to_string(can_hz) + "}\n"
+         "can_transport:\n  can0: " + transport + "\n"
+         "joints:\n"
+         "  joint1: {enabled: true, can_bus: can0, can_id: 1, motor_dir: 1, motor_type: MOTOR_70, "
+         "lower: -1.0, upper: 1.0}\n"
+         "  joint2: " + joint2 + "\n";
+}
+
+hardware_interface::CallbackReturn initWith(const std::string & name, const std::string & text)
+{
+  TestSystemInterface system;
+  const auto result = system.on_init(hardwareInfoAt(writeConfig(name, text)));
+  EXPECT_TRUE(system.created_buses.empty());
+  return result;
+}
+
+TEST(Configuration, AcceptsStreamedTransports)
+{
+  EXPECT_EQ(initWith("stream_broadcast.yaml", transportConfig(
+      "{rx_mode: separate, tx_frame: broadcast, stream_feedback_max_age_ms: 3}")),
+    hardware_interface::CallbackReturn::SUCCESS);
+  EXPECT_EQ(initWith("stream_unicast.yaml", transportConfig(
+      "{rx_mode: separate, stream_feedback_max_age_ms: 15}", "classic", 200)),
+    hardware_interface::CallbackReturn::SUCCESS);
+  EXPECT_EQ(initWith("stream_sequential.yaml", transportConfig("{rx_mode: sequential}")),
+    hardware_interface::CallbackReturn::SUCCESS);
+}
+
+TEST(Configuration, RejectsInvalidStreamedTransports)
+{
+  const std::vector<std::pair<std::string, std::string>> cases = {
+    {"no_max_age", transportConfig("{rx_mode: separate}")},
+    {"max_age_below_two_periods",
+      transportConfig("{rx_mode: separate, stream_feedback_max_age_ms: 1.5}")},
+    {"max_age_above_50ms", transportConfig("{rx_mode: separate, stream_feedback_max_age_ms: 60}")},
+    {"broadcast_without_separate", transportConfig("{tx_frame: broadcast}")},
+    {"max_age_without_separate", transportConfig("{stream_feedback_max_age_ms: 3}")},
+    {"unknown_key", transportConfig(
+        "{rx_mode: separate, stream_feedback_max_age_ms: 3, rx_poll_ms: 1}")},
+    {"bad_rx_mode", transportConfig("{rx_mode: threaded, stream_feedback_max_age_ms: 3}")},
+    {"broadcast_classic", transportConfig(
+        "{rx_mode: separate, tx_frame: broadcast, stream_feedback_max_age_ms: 3}", "classic")},
+    {"broadcast_ids_1_3", transportConfig(
+        "{rx_mode: separate, tx_frame: broadcast, stream_feedback_max_age_ms: 3}", "fd", 1000,
+        "{enabled: true, can_bus: can0, can_id: 3, motor_dir: 1, motor_type: MOTOR_70, "
+        "lower: -1.0, upper: 1.0}")},
+    {"isolated_two_motors", transportConfig(
+        "{rx_mode: separate, tx_frame: broadcast, stream_feedback_max_age_ms: 3, "
+        "hil_isolated_id1_broadcast_blocks: 3}")},
+    {"isolated_fd_brs", transportConfig(
+        "{rx_mode: separate, tx_frame: broadcast, stream_feedback_max_age_ms: 3, "
+        "hil_isolated_id1_broadcast_blocks: 3}", "fd_brs", 1000, "{enabled: false}")},
+    {"isolated_blocks_4", transportConfig(
+        "{rx_mode: separate, tx_frame: broadcast, stream_feedback_max_age_ms: 3, "
+        "hil_isolated_id1_broadcast_blocks: 4}", "fd", 1000, "{enabled: false}")},
+  };
+  for (const auto & [name, text] : cases) {
+    EXPECT_EQ(initWith(name + ".yaml", text), hardware_interface::CallbackReturn::ERROR) << name;
+  }
+  // The isolated single-motor form itself is accepted on can0.
+  EXPECT_EQ(initWith("isolated_ok.yaml", transportConfig(
+      "{rx_mode: separate, tx_frame: broadcast, stream_feedback_max_age_ms: 3, "
+      "hil_isolated_id1_broadcast_blocks: 3}", "fd", 1000, "{enabled: false}")),
+    hardware_interface::CallbackReturn::SUCCESS);
+  // A transport entry for a bus that is not active is rejected.
+  auto unknown_bus = transportConfig("{rx_mode: sequential}");
+  unknown_bus.replace(unknown_bus.find("can_transport:\n  can0:"),
+    std::string("can_transport:\n  can0:").size(), "can_transport:\n  can9:");
+  EXPECT_EQ(initWith("unknown_bus.yaml", unknown_bus), hardware_interface::CallbackReturn::ERROR);
+}
+
+// The emulated send bus answers unicast frames only, so the receive bus never sees a streamed
+// reply: activation must fail and disable both motors with acknowledgements.
+TEST(ActivationRollback, StreamedBusWithoutStreamedRepliesRollsBack)
+{
+  TestSystemInterface system;
+  system.reply_ids = {1, 2};
+  ASSERT_EQ(system.on_init(hardwareInfoAt(writeConfig("stream_rollback.yaml", transportConfig(
+      "{rx_mode: separate, tx_frame: broadcast, stream_feedback_max_age_ms: 3}")))),
+    hardware_interface::CallbackReturn::SUCCESS);
+  EXPECT_EQ(system.on_activate(rclcpp_lifecycle::State()), hardware_interface::CallbackReturn::ERROR);
+  ASSERT_EQ(system.created_buses.size(), 2U);  // send and receive buses
+  const auto & tx = *system.created_buses[0];
+  EXPECT_TRUE(tx.hasDisable(1));
+  EXPECT_TRUE(tx.hasDisable(2));
+  EXPECT_FALSE(tx.isOpen());
+  EXPECT_FALSE(system.created_buses[1]->isOpen());
+  bool broadcast_seen = false;
+  for (const auto & frame : tx.sent) {
+    broadcast_seen = broadcast_seen || (frame.id == 0x7FFU && frame.dlc == 16);
+  }
+  EXPECT_TRUE(broadcast_seen);
 }
 
 TEST(ActivationRollback, FailedRequiredJointDisablesEarlierJointAndClosesBus)

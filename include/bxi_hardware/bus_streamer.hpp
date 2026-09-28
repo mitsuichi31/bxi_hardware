@@ -113,6 +113,8 @@ public:
   // Joins the send thread, then the receive thread. Safe to call more than once.
   void stop();
 
+  // True once the send thread has ended: after a fault, an external stop, or stop().
+  bool sendFinished() const {return tx_done_;}
   const std::string & error() const {return error_;}
   // Complete only after stop().
   StreamStats stats() const;

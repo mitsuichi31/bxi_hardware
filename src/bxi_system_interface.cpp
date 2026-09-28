@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
@@ -207,6 +208,117 @@ bool BxiSystemInterface::parseConfig()
       RCLCPP_ERROR(logger(), "joint '%s': motor_type specが未確定", name.c_str());
       return false;
     }
+  }
+
+  // Optional per-bus transport. Buses not listed keep the sequential worker.
+  bus_transport_.clear();
+  if (!root["can_transport"]) {
+    return true;
+  }
+  std::map<std::string, std::vector<int>> bus_motor_ids;
+  for (const auto & jr : joints_) {
+    if (jr.enabled) {
+      bus_motor_ids[jr.can_bus].push_back(jr.can_id);
+    }
+  }
+  try {
+    const YAML::Node transports = root["can_transport"];
+    if (!transports.IsMap()) {
+      RCLCPP_ERROR(logger(), "can_transport はbusごとのmapが必要です");
+      return false;
+    }
+    const double period_ms = 1000.0 / can_hz_;
+    for (const auto & entry : transports) {
+      const auto bus = entry.first.as<std::string>();
+      if (active_bus_set.count(bus) == 0 || !entry.second.IsMap()) {
+        RCLCPP_ERROR(logger(), "can_transport: 未知またはinactiveなCAN bus '%s'", bus.c_str());
+        return false;
+      }
+      BusTransport transport;
+      bool has_max_age = false;
+      for (const auto & item : entry.second) {
+        const auto key = item.first.as<std::string>();
+        if (key == "rx_mode") {
+          const auto value = item.second.as<std::string>();
+          if (value != "sequential" && value != "separate") {
+            RCLCPP_ERROR(logger(), "can_transport.%s.rx_mode: sequential / separate が必要 ('%s')",
+              bus.c_str(), value.c_str());
+            return false;
+          }
+          transport.separate = value == "separate";
+        } else if (key == "tx_frame") {
+          const auto value = item.second.as<std::string>();
+          if (value != "unicast" && value != "broadcast") {
+            RCLCPP_ERROR(logger(), "can_transport.%s.tx_frame: unicast / broadcast が必要 ('%s')",
+              bus.c_str(), value.c_str());
+            return false;
+          }
+          transport.broadcast = value == "broadcast";
+        } else if (key == "stream_feedback_max_age_ms") {
+          transport.stream_feedback_max_age_ms = item.second.as<double>();
+          has_max_age = true;
+        } else if (key == "hil_isolated_id1_broadcast_blocks") {
+          const int blocks = item.second.as<int>();
+          if (blocks != 3) {
+            RCLCPP_ERROR(logger(), "can_transport.%s.hil_isolated_id1_broadcast_blocks は3のみ",
+              bus.c_str());
+            return false;
+          }
+          transport.isolated_id1_broadcast_blocks = 3;
+        } else {
+          RCLCPP_ERROR(logger(), "can_transport.%s: 未知のキー '%s'", bus.c_str(), key.c_str());
+          return false;
+        }
+      }
+
+      if (!transport.separate) {
+        if (transport.broadcast || has_max_age || transport.isolated_id1_broadcast_blocks != 0) {
+          RCLCPP_ERROR(logger(), "can_transport.%s: tx_frame: broadcast、"
+            "stream_feedback_max_age_ms、hil_isolated_id1_broadcast_blocks は "
+            "rx_mode: separate が必要", bus.c_str());
+          return false;
+        }
+      } else if (!has_max_age || !std::isfinite(transport.stream_feedback_max_age_ms) ||
+        transport.stream_feedback_max_age_ms < 2.0 * period_ms ||
+        transport.stream_feedback_max_age_ms > 50.0)
+      {
+        // Required with no default: the sequential timeout settings mean something else.
+        RCLCPP_ERROR(logger(), "can_transport.%s.stream_feedback_max_age_ms は必須で、"
+          "周期の2倍（%.3f ms）以上 50 ms 以下", bus.c_str(), 2.0 * period_ms);
+        return false;
+      }
+
+      auto ids = bus_motor_ids[bus];
+      std::sort(ids.begin(), ids.end());
+      if (transport.isolated_id1_broadcast_blocks != 0) {
+        if (!transport.broadcast || bus != "can0" || ids != std::vector<int>{1} ||
+          bus_formats_[bus] != CanFrameFormat::kFd)
+        {
+          RCLCPP_ERROR(logger(), "can_transport.%s.hil_isolated_id1_broadcast_blocks は "
+            "can0・ID 1の1軸のみ・can_frame_format: fd・tx_frame: broadcast が必要", bus.c_str());
+          return false;
+        }
+      } else if (transport.broadcast) {
+        bool contiguous = !ids.empty();
+        for (size_t k = 0; k < ids.size(); ++k) {
+          contiguous = contiguous && ids[k] == static_cast<int>(k + 1);
+        }
+        const size_t length = ids.size() * 8;
+        if (bus_formats_[bus] == CanFrameFormat::kClassic || !contiguous ||
+          length > kCanFdMaxDataLength || !isValidCanFdDataLength(length))
+        {
+          // Blocks for unconfigured IDs are not defined until the vendor answers.
+          RCLCPP_ERROR(logger(), "can_transport.%s: broadcast はCAN FDで、有効な関節の"
+            "CAN IDが1..Nの連続、かつN×8 BがCAN FDの有効長（N=1,2,3,4,6,8）である必要",
+            bus.c_str());
+          return false;
+        }
+      }
+      bus_transport_[bus] = transport;
+    }
+  } catch (const YAML::Exception & e) {
+    RCLCPP_ERROR(logger(), "can_transport の値が不正です: %s", e.what());
+    return false;
   }
   return true;
 }
@@ -432,6 +544,12 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_activate(
 
     running_ = true;
     for (auto & [bus_name, live] : live_joints_) {
+      if (bus_transport_[bus_name].separate) {
+        if (!startStream(bus_name, live)) {
+          return fail_activation();
+        }
+        continue;
+      }
       WorkerTimingTrace * timing = nullptr;
       if (!worker_timing_dir_.empty()) {
         constexpr size_t kTimingCycleCapacity = 20000;
@@ -443,6 +561,34 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_activate(
         worker_timing_.emplace(bus_name, std::move(trace));
       }
       workers_.emplace_back(&BxiSystemInterface::workerLoop, this, bus_name, live, timing);
+    }
+    // A streamed bus is active only after every motor has answered a streamed command.
+    for (auto & [bus_name, streamer] : streamers_) {
+      const auto & transport = bus_transport_[bus_name];
+      const auto wait = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::duration<double, std::milli>(
+          transport.stream_feedback_max_age_ms + 1000.0 / can_hz_));
+      if (!streamer->waitForFirstFeedback(wait)) {
+        RCLCPP_ERROR(logger(), "[%s] 送受信分離の最初の応答が %.1f ms 以内に揃いません。起動を中止します。",
+          bus_name.c_str(), std::chrono::duration<double, std::milli>(wait).count());
+        return fail_activation();
+      }
+      if (safe_stopped_) {
+        RCLCPP_ERROR(logger(), "[%s] 最初の応答の確認後に安全停止しました。起動を中止します。",
+          bus_name.c_str());
+        return fail_activation();
+      }
+    }
+    for (auto & [bus_name, streamer] : streamers_) {
+      workers_.emplace_back(
+        &BxiSystemInterface::streamMonitorLoop, this, bus_name, live_joints_[bus_name]);
+    }
+    onStreamFeedbackConfirmed();
+    // Any worker or stream may have stopped since its own check; never report a stopped system
+    // as active.
+    if (safe_stopped_) {
+      RCLCPP_ERROR(logger(), "起動中に安全停止しました。起動を中止します。");
+      return fail_activation();
     }
   } catch (const std::exception & e) {
     RCLCPP_ERROR(logger(), "起動中に例外: %s", e.what());
@@ -466,11 +612,27 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_deactivate(
 void BxiSystemInterface::releaseResources()
 {
   stopWorkers();
-  for (auto & jr : joints_) {
-    if (jr.actuator) {
-      jr.actuator->disable();
+  // Streams stop before any disable so that the send sockets receive acknowledgements again.
+  std::set<size_t> streamed_joints;
+  for (const auto & [bus_name, live] : live_joints_) {
+    const auto transport = bus_transport_.find(bus_name);
+    if (transport == bus_transport_.end() || !transport->second.separate) {
+      continue;
+    }
+    stopStream(bus_name);
+    disableAxes(bus_name, live, "deactivate");
+    streamed_joints.insert(live.begin(), live.end());
+  }
+  for (size_t i = 0; i < n_joints_; ++i) {
+    if (joints_[i].actuator && streamed_joints.count(i) == 0) {
+      joints_[i].actuator->disable();
     }
   }
+  streamers_.clear();
+  for (auto & [name, bus] : rx_buses_) {
+    bus->close();
+  }
+  rx_buses_.clear();
   for (auto & [name, bus] : buses_) {
     bus->close();
   }
@@ -562,6 +724,211 @@ void BxiSystemInterface::writeWorkerTiming()
   }
   worker_timing_.clear();
   worker_timing_dir_.clear();
+}
+
+// ---------------------------------------------------------------------------
+// Streamed buses (rx_mode: separate)
+// ---------------------------------------------------------------------------
+bool BxiSystemInterface::startStream(
+  const std::string & bus_name, const std::vector<size_t> & indices)
+{
+  const auto & transport = bus_transport_[bus_name];
+  auto rx_bus = makeBus(bus_formats_[bus_name]);
+  if (auto * socketcan = dynamic_cast<SocketCanBus *>(rx_bus.get())) {
+    socketcan->setRxTimestamping(!worker_timing_dir_.empty());
+  }
+  if (!rx_bus->open(bus_name)) {
+    RCLCPP_ERROR(logger(), "[%s] 受信用CANオープン失敗", bus_name.c_str());
+    return false;
+  }
+  // Registered before the send socket changes so that releaseResources() restores it.
+  rx_buses_[bus_name] = rx_bus;
+
+  StreamConfig config;
+  config.period = std::chrono::nanoseconds(static_cast<int64_t>(1e9 / can_hz_));
+  config.max_feedback_age = std::chrono::duration_cast<std::chrono::nanoseconds>(
+    std::chrono::duration<double, std::milli>(transport.stream_feedback_max_age_ms));
+  config.broadcast = transport.broadcast;
+  std::vector<uint32_t> reply_ids;
+  std::vector<BxiActuatorDriver *> drivers;
+  for (size_t i : indices) {
+    auto * driver = dynamic_cast<BxiActuatorDriver *>(joints_[i].actuator.get());
+    if (driver == nullptr) {
+      RCLCPP_ERROR(logger(), "[%s] %s: 送受信分離はBXIドライバのみ対応", bus_name.c_str(),
+        joints_[i].name.c_str());
+      return false;
+    }
+    drivers.push_back(driver);
+    reply_ids.push_back(protocol::defaultMasterId(static_cast<uint32_t>(joints_[i].can_id)));
+  }
+  if (transport.isolated_id1_broadcast_blocks != 0) {
+    config.padded_broadcast_blocks = transport.isolated_id1_broadcast_blocks;
+    for (int id = 2; id <= static_cast<int>(transport.isolated_id1_broadcast_blocks); ++id) {
+      config.forbidden_reply_ids.push_back(id);
+      reply_ids.push_back(protocol::defaultMasterId(static_cast<uint32_t>(id)));
+    }
+    RCLCPP_WARN(logger(), "[%s] 1台HIL専用: ID 1のみ接続の前提で、%zuブロックのブロードキャストを送り、"
+      "ID 2以降の応答を検知したら停止します", bus_name.c_str(),
+      transport.isolated_id1_broadcast_blocks);
+  }
+
+  auto * rx_socket = dynamic_cast<SocketCanBus *>(rx_bus.get());
+  if (rx_socket != nullptr && !rx_socket->setReceiveStandardIds(reply_ids)) {
+    RCLCPP_ERROR(logger(), "[%s] 受信IDフィルタを設定できません", bus_name.c_str());
+    return false;
+  }
+  rx_bus->flushRx();
+  auto & tx_bus = buses_[bus_name];
+  auto * tx_socket = dynamic_cast<SocketCanBus *>(tx_bus.get());
+  if (tx_socket != nullptr && !tx_socket->setReceiveEnabled(false)) {
+    RCLCPP_ERROR(logger(), "[%s] 送信ソケットの受信を停止できません", bus_name.c_str());
+    return false;
+  }
+  tx_bus->flushRx();
+
+  auto streamer = std::make_unique<BxiBusStreamer>(
+    tx_bus.get(), rx_bus.get(), drivers, config,
+    [this, bus_name, indices](
+      const std::vector<StreamFeedback> & feedback, std::vector<StreamCommand> & commands) {
+      return streamCycle(bus_name, indices, feedback, commands);
+    },
+    &safe_stopped_);
+  if (!streamer->start()) {
+    RCLCPP_ERROR(logger(), "[%s] 送受信分離を開始できません: %s", bus_name.c_str(),
+      streamer->error().c_str());
+    return false;
+  }
+  streamers_[bus_name] = std::move(streamer);
+  RCLCPP_INFO(logger(), "[%s] 送受信分離を開始 (%zu motors, %s, %dHz, 鮮度しきい値 %.1f ms)",
+    bus_name.c_str(), indices.size(), transport.broadcast ? "broadcast" : "unicast", can_hz_,
+    transport.stream_feedback_max_age_ms);
+  return true;
+}
+
+bool BxiSystemInterface::streamCycle(
+  const std::string & bus_name, const std::vector<size_t> & indices,
+  const std::vector<StreamFeedback> & feedback, std::vector<StreamCommand> & commands)
+{
+  // Same checks as the sequential worker. Messages are logged after the lock is released.
+  int sensor_fault = -1;
+  int overheated = -1;
+  double overheated_temperature = 0.0;
+  {
+    std::lock_guard<std::mutex> lk(data_mutex_);
+    for (size_t k = 0; k < indices.size(); ++k) {
+      const size_t i = indices[k];
+      if (feedback[k].updated) {
+        const auto & fb = feedback[k].feedback;
+        fb_pos_[i] = fb.position;
+        fb_vel_[i] = fb.velocity;
+        fb_eff_[i] = fb.effort;
+        fb_temp_[i] = fb.temperature;
+        if (!std::isfinite(fb.temperature)) {
+          joints_[i].temperature_sensor_fault = true;
+          sensor_fault = static_cast<int>(i);
+        } else if (fb.temperature > 80.0) {
+          joints_[i].overheated = true;
+          overheated = static_cast<int>(i);
+          overheated_temperature = fb.temperature;
+        }
+      }
+      commands[k] = {tgt_pos_[i], tgt_vel_[i], tgt_kp_[i], tgt_kd_[i], tgt_eff_[i]};
+    }
+  }
+  if (sensor_fault >= 0) {
+    RCLCPP_ERROR(logger(), "[%s] %s 両温度センサー故障。全軸を停止します。",
+      bus_name.c_str(), joints_[static_cast<size_t>(sensor_fault)].name.c_str());
+  }
+  if (overheated >= 0) {
+    RCLCPP_ERROR(logger(), "[%s] %s 過熱(%.1f)。全軸を停止します。", bus_name.c_str(),
+      joints_[static_cast<size_t>(overheated)].name.c_str(), overheated_temperature);
+  }
+  return sensor_fault < 0 && overheated < 0;
+}
+
+void BxiSystemInterface::streamMonitorLoop(std::string bus_name, std::vector<size_t> indices)
+{
+  const auto thread_name = ("bxim_" + bus_name).substr(0, 15);
+  pthread_setname_np(pthread_self(), thread_name.c_str());
+  BxiBusStreamer * streamer = streamers_.at(bus_name).get();
+  while (running_ && !streamer->sendFinished()) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  if (!running_ || !safe_stopped_) {
+    return;  // Normal deactivation: releaseResources() stops and disables this bus.
+  }
+  // The send thread stopped for a fault here or on another bus. Disable now instead of waiting
+  // for controller_manager to deactivate the component.
+  stopStream(bus_name);
+  disableAxes(bus_name, indices, "safe-stop");
+}
+
+void BxiSystemInterface::stopStream(const std::string & bus_name)
+{
+  std::lock_guard<std::mutex> lock(stream_stop_mutex_);
+  const auto streamer = streamers_.find(bus_name);
+  if (streamer != streamers_.end()) {
+    streamer->second->stop();
+    const auto stats = streamer->second->stats();
+    std::string per_axis;
+    for (size_t k = 0; k < stats.replies.size(); ++k) {
+      char text[96];
+      std::snprintf(text, sizeof(text), " [%zu] replies=%llu no_new=%llu max_age=%.3fms", k,
+        static_cast<unsigned long long>(stats.replies[k]),
+        static_cast<unsigned long long>(stats.cycles_without_new_reply[k]),
+        stats.max_age_ms[k]);
+      per_axis += text;
+    }
+    RCLCPP_INFO(logger(), "[%s] 送受信分離を停止: cycles=%llu skipped=%llu partial=%llu "
+      "frames=%llu fault=%s axis=%d external=%s%s", bus_name.c_str(),
+      static_cast<unsigned long long>(stats.cycles),
+      static_cast<unsigned long long>(stats.skipped_cycles),
+      static_cast<unsigned long long>(stats.partial_cycles),
+      static_cast<unsigned long long>(stats.frames_sent), streamFaultName(stats.fault),
+      stats.fault_axis, stats.stopped_externally ? "yes" : "no", per_axis.c_str());
+  }
+  const auto rx_bus = rx_buses_.find(bus_name);
+  if (rx_bus == rx_buses_.end()) {
+    return;
+  }
+  // Sequential disable needs the send socket to receive acknowledgements again.
+  const auto tx_bus = buses_.find(bus_name);
+  if (tx_bus != buses_.end()) {
+    if (auto * socketcan = dynamic_cast<SocketCanBus *>(tx_bus->second.get());
+      socketcan != nullptr && !socketcan->setReceiveEnabled(true))
+    {
+      RCLCPP_ERROR(logger(), "[%s] 送信ソケットの受信を再開できません", bus_name.c_str());
+    }
+    tx_bus->second->flushRx();
+  }
+  rx_bus->second->close();
+  rx_buses_.erase(rx_bus);
+}
+
+void BxiSystemInterface::disableAxes(
+  const std::string & bus_name, const std::vector<size_t> & indices, const char * reason)
+{
+  for (size_t i : indices) {
+    auto & actuator = joints_[i].actuator;
+    if (!actuator) {
+      continue;
+    }
+    auto * driver = dynamic_cast<BxiActuatorDriver *>(actuator.get());
+    if (driver != nullptr && driver->state() == ActuatorState::kSafeStopped) {
+      // The driver never waits for an acknowledgement once it has latched safe-stop.
+      actuator->disable();
+      RCLCPP_WARN(logger(), "[%s] %s disable (%s): best effort after safe-stop, "
+        "acknowledgement not checked", bus_name.c_str(), joints_[i].name.c_str(), reason);
+    } else if (driver != nullptr && driver->state() == ActuatorState::kDisabled) {
+      continue;  // Already acknowledged.
+    } else if (actuator->disable().valid) {
+      RCLCPP_INFO(logger(), "[%s] %s disable (%s): acknowledged", bus_name.c_str(),
+        joints_[i].name.c_str(), reason);
+    } else {
+      RCLCPP_ERROR(logger(), "[%s] %s disable (%s): acknowledgement missing", bus_name.c_str(),
+        joints_[i].name.c_str(), reason);
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
