@@ -2,6 +2,8 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <memory>
+#include <vector>
 #include <thread>
 
 #include <linux/can.h>
@@ -12,6 +14,7 @@
 #include <gtest/gtest.h>
 
 #include "bxi_hardware/actuator/bxi_actuator.hpp"
+#include "bxi_hardware/bus_streamer.hpp"
 #include "bxi_hardware/can/socketcan_bus.hpp"
 
 namespace bxi_hardware
@@ -276,10 +279,101 @@ TEST(VcanLifecycle, StandardIdFilterPassesOnlyListedReplies)
   EXPECT_EQ(received.dlc, 8U);
   EXPECT_FALSE(receiver.recv(received, 50));
 
-  // Restoring the accept-all filter lets other IDs through again.
+  // Restoring the accept-all filter lets other IDs through again. recv() skips a remote frame
+  // instead of returning it as an all-zero data frame.
   ASSERT_TRUE(receiver.setReceiveEnabled(true));
+  ASSERT_TRUE(sendRemoteFrame(interface_name, protocol::defaultMasterId(2)));
   ASSERT_TRUE(sender.send(makeFeedback(2)));
   ASSERT_TRUE(receiveId(receiver, protocol::defaultMasterId(2), received));
+  EXPECT_EQ(received.dlc, 8U);
+  EXPECT_EQ(received.data[0], 2U);
+}
+
+// The streamed path on real SocketCAN sockets: a send socket with receive disabled, a receive
+// socket filtered to the reply IDs, and three emulated motors answering the 24-byte broadcast.
+TEST(VcanLifecycle, StreamerRunsThreeBroadcastMotorsAt1kHzAndStopsOnASilentMotor)
+{
+  const char * interface_name = std::getenv("BXI_VCAN_IFACE");
+  if (interface_name == nullptr) {
+    GTEST_SKIP() << "BXI_VCAN_IFACE is not configured";
+  }
+  SocketCanBus tx_bus(CanFrameFormat::kFd);
+  SocketCanBus rx_bus(CanFrameFormat::kFd);
+  SocketCanBus emulator_bus(CanFrameFormat::kFd);
+  ASSERT_TRUE(tx_bus.open(interface_name)) << "vcan needs 'mtu 72' for CAN FD";
+  ASSERT_TRUE(rx_bus.open(interface_name));
+  ASSERT_TRUE(emulator_bus.open(interface_name));
+
+  std::atomic<int> responding_mask{0b111};  // bit k: motor k + 1 answers
+  EmulatorThread emulator([&]() {
+      CanFrame request;
+      if (!emulator_bus.recv(request, 10) || request.extended) {
+        return;
+      }
+      if (request.id >= 1 && request.id <= 3 && request.dlc == 8) {
+        emulator_bus.send(makeFeedback(static_cast<uint8_t>(request.id)));
+      } else if (request.id == 0x7FF && request.dlc == 24) {
+        for (uint8_t motor = 1; motor <= 3; ++motor) {
+          if ((responding_mask.load() & (1 << (motor - 1))) != 0) {
+            emulator_bus.send(makeFeedback(motor));
+          }
+        }
+      }
+    });
+
+  BxiSpec spec;
+  std::vector<std::unique_ptr<BxiActuatorDriver>> drivers;
+  std::vector<BxiActuatorDriver *> raw;
+  for (int id = 1; id <= 3; ++id) {
+    drivers.push_back(std::make_unique<BxiActuatorDriver>(
+      &tx_bus, id, 1, 0.0, -1.0, 1.0, 20.0, 1.0, spec, 30, 3));
+    ASSERT_TRUE(drivers.back()->enable().valid) << id;
+    raw.push_back(drivers.back().get());
+  }
+
+  // Switch to the streamed setup, as the hardware interface will after its sequential phase.
+  ASSERT_TRUE(rx_bus.setReceiveStandardIds({protocol::defaultMasterId(1),
+      protocol::defaultMasterId(2), protocol::defaultMasterId(3)}));
+  rx_bus.flushRx();
+  ASSERT_TRUE(tx_bus.setReceiveEnabled(false));
+  tx_bus.flushRx();
+
+  StreamConfig config;
+  config.period = std::chrono::milliseconds(1);
+  config.max_feedback_age = std::chrono::milliseconds(3);
+  config.broadcast = true;
+  std::atomic<bool> stop_all{false};
+  BxiBusStreamer streamer(&tx_bus, &rx_bus, raw, config,
+    [](const std::vector<StreamFeedback> &, std::vector<StreamCommand> &) {return true;},
+    &stop_all);
+  ASSERT_TRUE(streamer.start()) << streamer.error();
+  EXPECT_TRUE(streamer.waitForFirstFeedback(std::chrono::milliseconds(4)));
+  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+  EXPECT_FALSE(stop_all.load());
+
+  responding_mask = 0b011;  // motor 3 goes silent
+  for (int i = 0; i < 100 && !stop_all.load(); ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  EXPECT_TRUE(stop_all.load());
+  streamer.stop();
+  const auto stats = streamer.stats();
+  EXPECT_EQ(stats.fault, StreamFault::kFeedbackStale);
+  EXPECT_EQ(stats.fault_axis, 2);
+  EXPECT_GE(stats.cycles, 400U);
+  EXPECT_EQ(stats.frames_sent, stats.cycles);
+  EXPECT_GE(stats.replies[0] + 1, stats.cycles);
+  EXPECT_GE(stats.replies[1] + 1, stats.cycles);
+  EXPECT_EQ(stats.rx_ignored, 0U);  // the filter kept the 0x7FF commands out
+
+  // Back to the sequential path: acknowledged disable for motors 1 and 2, best effort for 3.
+  ASSERT_TRUE(tx_bus.setReceiveEnabled(true));
+  tx_bus.flushRx();
+  EXPECT_TRUE(drivers[0]->disable().valid);
+  EXPECT_TRUE(drivers[1]->disable().valid);
+  EXPECT_EQ(drivers[2]->state(), ActuatorState::kSafeStopped);
+  EXPECT_FALSE(drivers[2]->disable().valid);
+  emulator.stop();
 }
 
 TEST(VcanLifecycle, OptInKernelReceiveTimestampPrecedesUserspaceRead)

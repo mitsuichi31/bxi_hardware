@@ -21,6 +21,7 @@ add_library(${PROJECT_NAME} SHARED
   src/mit_protocol.cpp
   src/socketcan_bus.cpp
   src/bxi_actuator.cpp
+  src/bus_streamer.cpp
   src/bxi_system_interface.cpp
 )
 target_include_directories(${PROJECT_NAME} PUBLIC
@@ -55,6 +56,9 @@ if(BUILD_TESTING)
   ament_add_gtest(test_bxi_actuator test/test_bxi_actuator.cpp)
   target_link_libraries(test_bxi_actuator ${PROJECT_NAME})
   set_target_properties(test_bxi_actuator PROPERTIES BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}")
+  ament_add_gtest(test_bus_streamer test/test_bus_streamer.cpp)
+  target_link_libraries(test_bus_streamer ${PROJECT_NAME})
+  set_target_properties(test_bus_streamer PROPERTIES BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}")
   ament_add_gtest(test_activation_rollback test/test_activation_rollback.cpp)
   target_link_libraries(test_activation_rollback ${PROJECT_NAME})
   target_compile_definitions(test_activation_rollback PRIVATE

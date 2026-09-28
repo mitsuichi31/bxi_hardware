@@ -292,6 +292,9 @@ bool SocketCanBus::recv(CanFrame & out, int timeout_ms)
     if (cf.len > out.data.size()) {
       return false;  // Not produced by SocketCAN; guards the copy below.
     }
+    if ((cf.can_id & CAN_RTR_FLAG) != 0) {
+      continue;  // A remote frame carries no data and CanFrame cannot mark it.
+    }
     out.extended = (cf.can_id & CAN_EFF_FLAG) != 0;
     out.id = cf.can_id & (out.extended ? CAN_EFF_MASK : CAN_SFF_MASK);
     out.dlc = cf.len;
