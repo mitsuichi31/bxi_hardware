@@ -109,6 +109,16 @@ def summarize(stem, tolerance_ms=0.1):
     lines.append(format_distribution(
         "send interval", intervals(send_times), period_ns + tolerance_ns,
         f"over period+{tolerance_ms:g} ms"))
+    # Present in CSVs written since the command-age check was added; -1 when not checked.
+    if cycles and "command_age_ns" in cycles[0]:
+        command_ages = [int(row["command_age_ns"]) for row in cycles if int(row["command_age_ns"]) >= 0]
+        max_command_age_ns = int(metadata.get("max_command_age_ns", "0"))
+        if max_command_age_ns > 0:
+            lines.append(format_distribution(
+                "command age at slot start (latest write())", command_ages, max_command_age_ns,
+                f"over stop threshold {max_command_age_ns / 1e6:g} ms"))
+        else:
+            lines.append(format_distribution("command age at slot start (latest write())", command_ages))
 
     dropped_rx = int(metadata["dropped_rx"])
     rx_note = f" (first {len(replies)} replies only; {dropped_rx} not recorded)" if dropped_rx else ""

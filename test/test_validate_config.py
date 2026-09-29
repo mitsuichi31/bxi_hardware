@@ -134,6 +134,18 @@ def test_streamed_bus_requires_max_age_of_at_least_two_periods(tmp_path):
     assert any("greater than the maximum of 50" in error for error in errors)
 
 
+def test_command_max_age_is_optional_and_at_least_two_periods(tmp_path):
+    base = "{rx_mode: separate, stream_feedback_max_age_ms: 3"
+    assert transport_errors(tmp_path, base + "}") == []
+    assert transport_errors(tmp_path, base + ", stream_command_max_age_ms: 5}") == []
+    errors = transport_errors(tmp_path, base + ", stream_command_max_age_ms: 1.5}")
+    assert any("stream_command_max_age_ms must be at least two periods" in e for e in errors)
+    errors = transport_errors(tmp_path, base + ", stream_command_max_age_ms: 60}")
+    assert any("greater than the maximum of 50" in error for error in errors)
+    errors = transport_errors(tmp_path, "{stream_command_max_age_ms: 5}")
+    assert any("require rx_mode: separate" in error for error in errors)
+
+
 def test_stream_options_require_separate_rx(tmp_path):
     errors = transport_errors(tmp_path, "{tx_frame: broadcast}")
     assert any("require rx_mode: separate" in error for error in errors)

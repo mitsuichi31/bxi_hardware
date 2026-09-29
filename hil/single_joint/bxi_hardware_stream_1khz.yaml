@@ -12,6 +12,9 @@ can_transport:
     tx_frame: broadcast
     # 周期の3倍。制御要件が決まったら見直す。
     stream_feedback_max_age_ms: 3.0
+    # 最後の write() からこの時間を過ぎたら、その周期に Kp=Kd=0 を送って安全停止する（controller_manager の
+    # 更新が止まったとき。応答が届き続けると stream_feedback_max_age_ms では止まらないため）。既定と同じ値を明記する。
+    stream_command_max_age_ms: 5.0
     # 送受信スレッドの SCHED_FIFO 優先度（暫定値）。2026-09-29 の vcan 比較
     # （docs/test-reports/2026-09-29-bxi-stream-scheduling-vcan.md）で、controller_manager（FIFO 50）より
     # 下のこの条件は CPU 負荷ありでも安全停止せず良好だった。SCHED_OTHER は CPU 負荷で安全停止した。

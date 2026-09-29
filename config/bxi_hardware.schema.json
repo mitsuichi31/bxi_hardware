@@ -42,6 +42,7 @@
         "rx_mode": {"type": "string", "enum": ["sequential", "separate"]},
         "tx_frame": {"type": "string", "enum": ["unicast", "broadcast"]},
         "stream_feedback_max_age_ms": {"type": "number", "exclusiveMinimum": 0, "maximum": 50},
+        "stream_command_max_age_ms": {"type": "number", "exclusiveMinimum": 0, "maximum": 50},
         "hil_isolated_id1_broadcast_blocks": {"type": "integer", "const": 3},
         "send_thread_priority": {"type": "integer", "minimum": 1, "maximum": 98},
         "receive_thread_priority": {"type": "integer", "minimum": 1, "maximum": 98},

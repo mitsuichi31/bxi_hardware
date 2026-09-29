@@ -81,7 +81,7 @@ python3 /ws/src/bxi_hardware/hil/single_joint/analyze_worker_timing.py \
 
 `can_transport` で `rx_mode: separate` にしたバスは、上記の worker CSV ではなく、停止時にバスごとの `bxi_stream_<bus>_<時刻>_cycles.csv` と `_rx.csv` を保存する。同じく1バスあたり20,000周期分を事前確保し、周期中はファイルに書かない。
 
-- `_cycles.csv`：周期ごとの結果（`sent`、`skipped_late`、`skipped_burst`、`expired_after_hook`、`partial`、`stopped`）、予定時刻からの起床の遅れ、hook（`data_mutex_` の待ちを含む）の所要時間、予定時刻からの最初のフレームの送信の遅れ、フレーム数、軸ごとの「周期開始時の最新応答経過時間」（列名 `age_ns_<id>`、最初の送信前は -1）と新しい応答の有無（`fresh_<id>`）。
+- `_cycles.csv`：周期ごとの結果（`sent`、`skipped_late`、`skipped_burst`、`expired_after_hook`、`partial`、`stopped`）、予定時刻からの起床の遅れ、hook（`data_mutex_` の待ちを含む）の所要時間、予定時刻からの最初のフレームの送信の遅れ、フレーム数、軸ごとの「周期開始時の最新応答経過時間」（列名 `age_ns_<id>`、最初の送信前は -1）と新しい応答の有無（`fresh_<id>`）、最後の列に周期開始時の指令の古さ（最後の `write()` からの経過時間、列名 `command_age_ns`、最初の `write()` の前は -1。2026-09-29 の手順0で追加）。先頭行の `max_command_age_ns` がその停止しきい値（`stream_command_max_age_ms`）。停止ログの `送受信分離を停止` の行にも、その最大（`max_cmd_age`）が出る。
 
   - **周期開始時の最新応答経過時間**：送信スレッドが周期ごとに起きた時点で、最新の応答を受信してから何 ns 経ったか。送信するかどうかを決める前に測るので、スキップした周期や停止した周期にも記録される。`stream_feedback_max_age_ms` を超えると安全停止する。
   - **受信から次の送信までの時間**：送信した周期だけについて、最新の応答から実際の送信までの時間。`age_ns + (send_lateness_ns − wake_lateness_ns)` で求める（解析スクリプトが計算する）。

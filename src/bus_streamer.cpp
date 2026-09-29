@@ -118,6 +118,7 @@ const char * streamFaultName(StreamFault fault)
     case StreamFault::kEncodeFailed: return "command not encodable";
     case StreamFault::kForbiddenReply: return "reply from a motor that must be absent";
     case StreamFault::kOwnerRequested: return "owner requested stop";
+    case StreamFault::kCommandStale: return "command stale";
   }
   return "unknown";
 }
@@ -179,6 +180,12 @@ bool BxiBusStreamer::validate()
   }
   if (config_.max_feedback_age < 2 * config_.period) {
     error_ = "max feedback age must be at least two periods";
+    return false;
+  }
+  if (config_.max_command_age.count() != 0 &&
+    (config_.max_command_age < 2 * config_.period || config_.command_written_ns == nullptr))
+  {
+    error_ = "max_command_age must be 0 (off), or at least two periods with command_written_ns";
     return false;
   }
   std::set<int> ids;
@@ -534,25 +541,49 @@ void BxiBusStreamer::sendLoop()
       break;
     }
 
+    // A stalled owner loop leaves its last commands in place while replies keep arriving. When
+    // the latest write is too old, send zero-gain, zero-torque commands in this cycle instead of
+    // asking the hook, then stop. Checked in every cycle, including those that would be skipped
+    // below, and the zero-gain frames ignore the slot and burst rules: a late zero-gain command is
+    // still safe to send.
+    bool command_stale = false;
+    const int64_t last_command_ns = config_.max_command_age.count() > 0 ?
+      config_.command_written_ns->load(std::memory_order_relaxed) : 0;
+    if (last_command_ns != 0) {
+      const auto command_age = now - clock_type::time_point(clock_type::duration(last_command_ns));
+      if (row != nullptr) {
+        row->command_age_ns = toNanoseconds(command_age);
+      }
+      tx_stats_.max_command_age_ms =
+        std::max(tx_stats_.max_command_age_ms, toMilliseconds(command_age));
+      command_stale = command_age > config_.max_command_age;
+    }
+
     // Send nothing for a slot that is already a full period late, and never two frames within
     // half a period, so a stalled thread does not catch up in a burst.
     const bool late = now >= target + period;
-    if (late || (sent_any && now - last_send < period / 2)) {
+    if (!command_stale && (late || (sent_any && now - last_send < period / 2))) {
       set_outcome(late ? StreamCycleOutcome::kSkippedLate : StreamCycleOutcome::kSkippedBurst);
       ++tx_stats_.skipped_cycles;
       sent_previous_cycle = false;
       continue;
     }
 
-    const auto hook_start = clock_type::now();
-    const bool hook_ok = hook_(feedback, commands);
-    if (row != nullptr) {
-      row->hook_ns = toNanoseconds(clock_type::now() - hook_start);
-    }
-    if (!hook_ok) {
-      set_outcome(StreamCycleOutcome::kStopped);
-      fault(StreamFault::kOwnerRequested, -1);
-      break;
+    if (command_stale) {
+      for (size_t i = 0; i < n; ++i) {
+        commands[i] = StreamCommand{feedback[i].feedback.position, 0.0, 0.0, 0.0, 0.0};
+      }
+    } else {
+      const auto hook_start = clock_type::now();
+      const bool hook_ok = hook_(feedback, commands);
+      if (row != nullptr) {
+        row->hook_ns = toNanoseconds(clock_type::now() - hook_start);
+      }
+      if (!hook_ok) {
+        set_outcome(StreamCycleOutcome::kStopped);
+        fault(StreamFault::kOwnerRequested, -1);
+        break;
+      }
     }
     for (size_t i = 0; i < n && !faulted; ++i) {
       const auto & c = commands[i];
@@ -573,7 +604,8 @@ void BxiBusStreamer::sendLoop()
     // The hook may block, for example on the owner's data mutex. Check again before every frame
     // so that no command leaves after its slot has expired or after a stop was requested.
     const auto may_send = [&]() {
-        return tx_running_ && !stop_all_->load() && clock_type::now() < target + period;
+        return tx_running_ && !stop_all_->load() &&
+               (command_stale || clock_type::now() < target + period);
       };
     size_t frames_this_cycle = 0;
     bool window_closed = false;
@@ -588,11 +620,11 @@ void BxiBusStreamer::sendLoop()
           for (auto * driver : drivers_) {
             driver->latchCommunicationFault();
           }
-          set_outcome(StreamCycleOutcome::kStopped);
           fault(StreamFault::kSendFailed, -1);
-          break;
+          faulted = true;
+        } else {
+          ++frames_this_cycle;
         }
-        ++frames_this_cycle;
       }
     } else {
       for (size_t i = 0; i < n; ++i) {
@@ -617,6 +649,11 @@ void BxiBusStreamer::sendLoop()
       }
     }
     tx_stats_.frames_sent += frames_this_cycle;
+    if (command_stale) {
+      // Recorded before any exit below, including a send failure part-way through the motors.
+      tx_stats_.command_stale_zero_gain_frames = frames_this_cycle;
+      tx_stats_.command_stale_expected_frames = config_.broadcast ? 1U : n;
+    }
     if (row != nullptr) {
       row->frames = static_cast<uint8_t>(frames_this_cycle);
       if (frames_this_cycle > 0) {
@@ -633,6 +670,18 @@ void BxiBusStreamer::sendLoop()
     }
     if (faulted) {
       set_outcome(StreamCycleOutcome::kStopped);
+      break;
+    }
+    if (command_stale) {
+      set_outcome(StreamCycleOutcome::kStopped);
+      if (window_closed) {
+        // A stale cycle ignores the slot deadline, so only a stop request (the owner's stop, or
+        // another bus's fault) closes it. That stop owns the shutdown: end as an external stop
+        // without raising a fault of our own.
+        tx_stats_.stopped_externally = true;
+      } else {
+        fault(StreamFault::kCommandStale, -1);
+      }
       break;
     }
     if (window_closed) {

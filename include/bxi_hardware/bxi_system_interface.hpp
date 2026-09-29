@@ -71,6 +71,12 @@ protected:
   virtual void onStreamFeedbackConfirmed() {}
   // Test seam: called when a stopped stream starts its log and CSV output (reportStream()).
   virtual void onStreamReport(const std::string & /*bus_name*/) {}
+  // Test seam: called at the end of stopStream(), after the bus's threads have joined.
+  virtual void onStreamStopped(const std::string & /*bus_name*/) {}
+  // Test seam: called in releaseResources() just before the workers and monitors are joined.
+  virtual void onBeforeJoinWorkers() {}
+  // Test seam: the statistics of a stopped stream, as reportStream() logs them.
+  virtual void onStreamStats(const std::string & /*bus_name*/, const StreamStats & /*stats*/) {}
 
 private:
   struct WorkerTimingCycle
@@ -117,6 +123,9 @@ private:
     bool separate = false;   // rx_mode: separate
     bool broadcast = false;  // tx_frame: broadcast
     double stream_feedback_max_age_ms = 0.0;
+    // Safe-stop when write() has not run for this long (stalled control loop). Default: the
+    // larger of 5 ms and two stream periods.
+    double stream_command_max_age_ms = 0.0;
     size_t isolated_id1_broadcast_blocks = 0;  // hil_isolated_id1_broadcast_blocks
     int send_thread_priority = 0;     // SCHED_FIFO 1-98; 0 = SCHED_OTHER
     int receive_thread_priority = 0;  // SCHED_FIFO 1-98; 0 = SCHED_OTHER
@@ -155,6 +164,8 @@ private:
   std::map<std::string, BusTransport> bus_transport_;
   std::map<std::string, std::shared_ptr<CanBus>> rx_buses_;
   std::map<std::string, std::unique_ptr<BxiBusStreamer>> streamers_;
+  // steady_clock ns of the latest write(); read by every send thread (max_command_age).
+  std::atomic<int64_t> last_write_ns_{0};
   std::mutex stream_stop_mutex_;
   std::set<std::string> reported_streams_;  // streams already logged and written
   std::map<std::string, BxiSpec> specs_;

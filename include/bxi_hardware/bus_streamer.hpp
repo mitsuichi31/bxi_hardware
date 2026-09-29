@@ -47,6 +47,7 @@ enum class StreamFault
   kEncodeFailed,
   kForbiddenReply,
   kOwnerRequested,
+  kCommandStale,
 };
 
 const char * streamFaultName(StreamFault fault);
@@ -56,6 +57,18 @@ struct StreamConfig
   std::chrono::nanoseconds period{std::chrono::milliseconds(1)};
   // Safe-stop when a reply is older than this at the start of a cycle.
   std::chrono::nanoseconds max_feedback_age{std::chrono::milliseconds(3)};
+  // Safe-stop when the owner's latest command write, stored by the owner in *command_written_ns
+  // as steady_clock nanoseconds since its epoch, is older than this at the start of a cycle
+  // (0 = off). Replies can keep arriving while the owner's control loop is stalled, so the reply
+  // age alone does not detect it. Checked in every cycle, including late ones; the stale cycle
+  // sends zero-gain, zero-torque commands to every motor regardless of the slot deadline, then
+  // stops with kCommandStale. If a stop request comes first (the owner's stop, another bus's
+  // fault), the remaining frames are not sent and the stream ends as an external stop instead;
+  // if a send fails, it ends as kSendFailed. StreamStats::command_stale_zero_gain_frames counts
+  // what was sent either way. Not checked while the stored value is 0 (no write yet). The atomic
+  // must outlive the streamer.
+  std::chrono::nanoseconds max_command_age{0};
+  const std::atomic<int64_t> * command_written_ns = nullptr;
   // One FD frame on ID 0x7FF with 8-byte blocks at (id - 1) * 8, instead of one frame per motor.
   bool broadcast = false;
   // Single-motor HIL only: pad the broadcast to this many blocks with zero-gain, zero-torque
@@ -97,6 +110,8 @@ struct StreamCycleRecord
   int64_t wake_lateness_ns = 0;  // wake-up after the scheduled slot start
   int64_t hook_ns = 0;           // time in the owner hook, including its lock waits
   int64_t send_lateness_ns = -1;  // first frame after the slot start; -1 if nothing was sent
+  // Age of the owner's latest command at the start of the cycle; -1 when not checked.
+  int64_t command_age_ns = -1;
   uint8_t frames = 0;
   StreamCycleOutcome outcome = StreamCycleOutcome::kSent;
 };
@@ -136,6 +151,10 @@ struct StreamStats
   std::vector<uint64_t> replies;                   // per axis
   std::vector<uint64_t> cycles_without_new_reply;  // per axis, statistics only
   std::vector<double> max_age_ms;                  // per axis
+  double max_command_age_ms = 0.0;  // largest checked command age; 0 while unchecked
+  // On a command-age stop: zero-gain frames sent in the stopping cycle, out of the expected count.
+  size_t command_stale_zero_gain_frames = 0;
+  size_t command_stale_expected_frames = 0;
   uint64_t rx_frames = 0;
   uint64_t rx_ignored = 0;
   uint64_t forbidden_replies = 0;
@@ -169,6 +188,9 @@ public:
   // True once every axis has a reply received after the first streamed send; false on timeout
   // or fault.
   bool waitForFirstFeedback(std::chrono::nanoseconds timeout);
+  // Asks the send thread to stop sending, without waiting. No frame leaves after the request is
+  // seen. stop() still has to join. Lets an owner stop several buses before joining any of them.
+  void requestStop() {tx_running_ = false;}
   // Joins the send thread, then the receive thread. Safe to call more than once.
   void stop();
 
@@ -236,6 +258,7 @@ private:
   std::atomic<bool> tx_done_{false};
   // steady_clock ticks of the first streamed send; 0 until then.
   std::atomic<int64_t> first_send_ns_{0};
+
   std::thread rx_thread_;
   std::thread tx_thread_;
 

@@ -237,6 +237,7 @@ bool BxiSystemInterface::parseConfig()
       }
       BusTransport transport;
       bool has_max_age = false;
+      bool has_command_max_age = false;
       bool has_thread_setting = false;
       for (const auto & item : entry.second) {
         const auto key = item.first.as<std::string>();
@@ -259,6 +260,9 @@ bool BxiSystemInterface::parseConfig()
         } else if (key == "stream_feedback_max_age_ms") {
           transport.stream_feedback_max_age_ms = item.second.as<double>();
           has_max_age = true;
+        } else if (key == "stream_command_max_age_ms") {
+          transport.stream_command_max_age_ms = item.second.as<double>();
+          has_command_max_age = true;
         } else if (key == "send_thread_priority" || key == "receive_thread_priority") {
           const int priority = item.second.as<int>();
           if (priority < 1 || priority > 98) {
@@ -295,12 +299,13 @@ bool BxiSystemInterface::parseConfig()
       }
 
       if (!transport.separate) {
-        if (transport.broadcast || has_max_age || transport.isolated_id1_broadcast_blocks != 0 ||
-          has_thread_setting)
+        if (transport.broadcast || has_max_age || has_command_max_age ||
+          transport.isolated_id1_broadcast_blocks != 0 || has_thread_setting)
         {
           RCLCPP_ERROR(logger(), "can_transport.%s: tx_frame: broadcast、"
-            "stream_feedback_max_age_ms、hil_isolated_id1_broadcast_blocks、"
-            "send/receive_thread_priority、thread_cpus は rx_mode: separate が必要", bus.c_str());
+            "stream_feedback_max_age_ms、stream_command_max_age_ms、"
+            "hil_isolated_id1_broadcast_blocks、send/receive_thread_priority、thread_cpus は "
+            "rx_mode: separate が必要", bus.c_str());
           return false;
         }
       } else if (!has_max_age || !std::isfinite(transport.stream_feedback_max_age_ms) ||
@@ -311,6 +316,21 @@ bool BxiSystemInterface::parseConfig()
         RCLCPP_ERROR(logger(), "can_transport.%s.stream_feedback_max_age_ms は必須で、"
           "周期の2倍（%.3f ms）以上 50 ms 以下", bus.c_str(), 2.0 * period_ms);
         return false;
+      }
+      if (transport.separate) {
+        if (!has_command_max_age) {
+          transport.stream_command_max_age_ms = std::max(5.0, 2.0 * period_ms);
+        }
+        if (!std::isfinite(transport.stream_command_max_age_ms) ||
+          transport.stream_command_max_age_ms < 2.0 * period_ms ||
+          transport.stream_command_max_age_ms > 50.0)
+        {
+          // write() must run at least every two stream periods; the controller_manager period
+          // must be shorter than this value with margin.
+          RCLCPP_ERROR(logger(), "can_transport.%s.stream_command_max_age_ms は周期の2倍"
+            "（%.3f ms）以上 50 ms 以下", bus.c_str(), 2.0 * period_ms);
+          return false;
+        }
       }
 
       auto ids = bus_motor_ids[bus];
@@ -568,6 +588,8 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_activate(
     }
 
     running_ = true;
+    // No write() of this activation yet; the send threads skip the command-age check until one.
+    last_write_ns_.store(0, std::memory_order_relaxed);
     for (auto & [bus_name, live] : live_joints_) {
       if (bus_transport_[bus_name].separate) {
         if (!startStream(bus_name, live)) {
@@ -636,6 +658,21 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_deactivate(
 
 void BxiSystemInterface::releaseResources()
 {
+  // Stop the send threads before joining the monitors. controller_manager has already stopped
+  // calling write(); a stream left running while the monitors join (several ms) sees the command
+  // age pass stream_command_max_age_ms and would report a stalled control loop during a normal
+  // deactivation. Clearing running_ first sends the monitors down their normal-deactivation
+  // path; stopStream() is idempotent and serialized with a monitor that is handling a fault.
+  running_ = false;
+  // Ask every send thread to stop before joining any of them: joining one bus can take several
+  // ms, and another bus still sending meanwhile would see its command age grow as well.
+  for (const auto & [bus_name, streamer] : streamers_) {
+    streamer->requestStop();
+  }
+  for (const auto & [bus_name, streamer] : streamers_) {
+    stopStream(bus_name);
+  }
+  onBeforeJoinWorkers();
   stopWorkers();
   // Streams stop before any disable so that the send sockets receive acknowledgements again.
   std::set<size_t> streamed_joints;
@@ -780,6 +817,9 @@ bool BxiSystemInterface::startStream(
   config.period = std::chrono::nanoseconds(static_cast<int64_t>(1e9 / can_hz_));
   config.max_feedback_age = std::chrono::duration_cast<std::chrono::nanoseconds>(
     std::chrono::duration<double, std::milli>(transport.stream_feedback_max_age_ms));
+  config.max_command_age = std::chrono::duration_cast<std::chrono::nanoseconds>(
+    std::chrono::duration<double, std::milli>(transport.stream_command_max_age_ms));
+  config.command_written_ns = &last_write_ns_;
   config.broadcast = transport.broadcast;
   config.send_priority = transport.send_thread_priority;
   config.receive_priority = transport.receive_thread_priority;
@@ -838,9 +878,10 @@ bool BxiSystemInterface::startStream(
     return false;
   }
   streamers_[bus_name] = std::move(streamer);
-  RCLCPP_INFO(logger(), "[%s] 送受信分離を開始 (%zu motors, %s, %dHz, 鮮度しきい値 %.1f ms)",
+  RCLCPP_INFO(logger(), "[%s] 送受信分離を開始 (%zu motors, %s, %dHz, 鮮度しきい値 %.1f ms, "
+    "指令の古さのしきい値 %.1f ms)",
     bus_name.c_str(), indices.size(), transport.broadcast ? "broadcast" : "unicast", can_hz_,
-    transport.stream_feedback_max_age_ms);
+    transport.stream_feedback_max_age_ms, transport.stream_command_max_age_ms);
   return true;
 }
 
@@ -928,6 +969,7 @@ void BxiSystemInterface::stopStream(const std::string & bus_name)
   }
   rx_bus->second->close();
   rx_buses_.erase(rx_bus);
+  onStreamStopped(bus_name);
 }
 
 void BxiSystemInterface::reportStream(const std::string & bus_name)
@@ -946,6 +988,7 @@ void BxiSystemInterface::reportStream(const std::string & bus_name)
   }
   onStreamReport(bus_name);
   const auto stats = streamer->stats();
+  onStreamStats(bus_name, stats);
   std::string per_axis;
   for (size_t k = 0; k < stats.replies.size(); ++k) {
     char text[96];
@@ -956,12 +999,14 @@ void BxiSystemInterface::reportStream(const std::string & bus_name)
     per_axis += text;
   }
   RCLCPP_INFO(logger(), "[%s] 送受信分離を停止: cycles=%llu skipped=%llu partial=%llu "
-    "frames=%llu fault=%s axis=%d external=%s%s", bus_name.c_str(),
+    "frames=%llu fault=%s axis=%d external=%s max_cmd_age=%.3fms stale_zero_gain=%zu/%zu%s",
+    bus_name.c_str(),
     static_cast<unsigned long long>(stats.cycles),
     static_cast<unsigned long long>(stats.skipped_cycles),
     static_cast<unsigned long long>(stats.partial_cycles),
     static_cast<unsigned long long>(stats.frames_sent), streamFaultName(stats.fault),
-    stats.fault_axis, stats.stopped_externally ? "yes" : "no", per_axis.c_str());
+    stats.fault_axis, stats.stopped_externally ? "yes" : "no", stats.max_command_age_ms,
+    stats.command_stale_zero_gain_frames, stats.command_stale_expected_frames, per_axis.c_str());
   if (!worker_timing_dir_.empty()) {
     writeStreamTiming(bus_name, *streamer);
   }
@@ -1000,6 +1045,7 @@ void BxiSystemInterface::writeStreamTiming(
     };
   const std::string metadata = "#period_ns=" + std::to_string(config.period.count()) +
     ",max_feedback_age_ns=" + std::to_string(config.max_feedback_age.count()) +
+    ",max_command_age_ns=" + std::to_string(config.max_command_age.count()) +
     ",broadcast=" + (config.broadcast ? "1" : "0") + ",can_ids=" + id_list +
     ",dropped_cycles=" + std::to_string(trace.cycle_count - cycle_rows) +
     ",dropped_rx=" + std::to_string(trace.rx_count - rx_rows) +
@@ -1015,7 +1061,8 @@ void BxiSystemInterface::writeStreamTiming(
   for (const int id : ids) {
     cycle_file << ",age_ns_" << id << ",fresh_" << id;
   }
-  cycle_file << '\n';
+  // Last, so that older readers keep their column positions.
+  cycle_file << ",command_age_ns\n";
   for (size_t r = 0; r < cycle_rows; ++r) {
     const auto & row = trace.cycles[r];
     cycle_file << row.cycle << ',' << streamCycleOutcomeName(row.outcome) << ',' <<
@@ -1025,7 +1072,7 @@ void BxiSystemInterface::writeStreamTiming(
       cycle_file << ',' << trace.age_ns[r * trace.axes + a] << ',' <<
         static_cast<int>(trace.fresh[r * trace.axes + a]);
     }
-    cycle_file << '\n';
+    cycle_file << ',' << row.command_age_ns << '\n';
   }
 
   const auto rx_path = stem + "_rx.csv";
@@ -1286,6 +1333,9 @@ hardware_interface::return_type BxiSystemInterface::write(
     tgt_kd_[i] = kd;
     tgt_eff_[i] = eff;
   }
+  // Streamed buses safe-stop when this stops advancing (stream_command_max_age_ms).
+  last_write_ns_.store(
+    std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_relaxed);
   return hardware_interface::return_type::OK;
 }
 

@@ -251,6 +251,42 @@ bool waitForReadError(BxiSystemInterface & system, clock_type::duration timeout)
   return false;
 }
 
+// Calls write() every period on its own thread, as the controller_manager loop does. The
+// streamed bus safe-stops when write() stops advancing (stream_command_max_age_ms).
+class Writer
+{
+public:
+  Writer(BxiSystemInterface & system, clock_type::duration period)
+  : thread_([this, &system, period]() {
+        while (running_) {
+          if (system.write(rclcpp::Time(), rclcpp::Duration(0, 0)) !=
+          hardware_interface::return_type::OK)
+          {
+            ++errors_;
+          }
+          last_ = clock_type::now().time_since_epoch().count();
+          std::this_thread::sleep_for(period);
+        }
+      }) {}
+  ~Writer() {stop();}
+  // Stops writing; returns the time of the last write().
+  clock_type::time_point stop()
+  {
+    running_ = false;
+    if (thread_.joinable()) {
+      thread_.join();
+    }
+    return clock_type::time_point(clock_type::duration(last_.load()));
+  }
+  int errors() const {return errors_.load();}
+
+private:
+  std::atomic<bool> running_{true};
+  std::atomic<int64_t> last_{0};
+  std::atomic<int> errors_{0};
+  std::thread thread_;
+};
+
 struct Rate
 {
   int can_hz;
@@ -281,10 +317,13 @@ TEST_P(StreamedSystem, RunsAndDeactivatesWithAcknowledgedDisables)
     hardware_interface::CallbackReturn::SUCCESS);
   ASSERT_EQ(system.on_activate(rclcpp_lifecycle::State()),
     hardware_interface::CallbackReturn::SUCCESS);
-  EXPECT_EQ(system.write(rclcpp::Time(), rclcpp::Duration(0, 0)),
-    hardware_interface::return_type::OK);
-  std::this_thread::sleep_for(300ms);
-  EXPECT_EQ(readOnce(system), hardware_interface::return_type::OK);
+  {
+    Writer writer(system, std::chrono::nanoseconds(1'000'000'000 / rate.can_hz));
+    std::this_thread::sleep_for(300ms);
+    EXPECT_EQ(readOnce(system), hardware_interface::return_type::OK);
+    writer.stop();
+    EXPECT_EQ(writer.errors(), 0);
+  }
   const int frames = motors.broadcast_frames.load();
   EXPECT_GE(frames, rate.can_hz * 3 / 10 * 8 / 10);
   EXPECT_EQ(motors.last_broadcast_length.load(), 24);
@@ -435,6 +474,133 @@ TEST(StreamedSystemAt1kHz, RepliesCrossingTheCycleBoundaryDoNotStop)
     hardware_interface::CallbackReturn::SUCCESS);
 }
 
+class RecordsStreamStats : public BxiSystemInterface
+{
+public:
+  std::mutex mutex;
+  std::vector<StreamStats> stats;
+
+  // Joining the monitors took 8.9 ms in a launch on vcan (2026-09-29); make the test at least
+  // that slow so that a stream still running here would pass the 5 ms command-age limit.
+  std::chrono::milliseconds join_delay{0};
+  // Stopping the first bus takes this long, as a slow thread join could.
+  std::chrono::milliseconds first_stop_delay{0};
+
+protected:
+  void onStreamStats(const std::string &, const StreamStats & s) override
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    stats.push_back(s);
+  }
+  void onBeforeJoinWorkers() override {std::this_thread::sleep_for(join_delay);}
+  void onStreamStopped(const std::string &) override
+  {
+    if (!first_stopped_.exchange(true)) {
+      std::this_thread::sleep_for(first_stop_delay);
+    }
+  }
+
+private:
+  std::atomic<bool> first_stopped_{false};
+};
+
+TEST(StreamedSystemAt1kHz, StalledWriteSafeStopsAndDisablesWhileRepliesContinue)
+{
+  const char * iface = std::getenv("BXI_VCAN_IFACE");
+  if (iface == nullptr) {
+    GTEST_SKIP() << "BXI_VCAN_IFACE is not configured";
+  }
+  MotorEmulator motors(iface, {1, 2, 3});
+  ASSERT_TRUE(motors.opened());
+  RecordsStreamStats system;
+  // No stream_command_max_age_ms: the default (5 ms at 1 kHz) applies.
+  ASSERT_EQ(system.on_init(hardwareInfo(streamConfig(iface, 1000, 3.0, true, 3), jointNames(3))),
+    hardware_interface::CallbackReturn::SUCCESS);
+  ASSERT_EQ(system.on_activate(rclcpp_lifecycle::State()),
+    hardware_interface::CallbackReturn::SUCCESS);
+  Writer writer(system, 1ms);
+  std::this_thread::sleep_for(100ms);
+  ASSERT_EQ(readOnce(system), hardware_interface::return_type::OK);
+
+  // The control loop stalls; the motors keep answering, so only the command age can stop it.
+  const auto last_write = writer.stop();
+  EXPECT_EQ(writer.errors(), 0);
+  ASSERT_TRUE(waitForReadError(system, 500ms));
+  const double detect_ms =
+    std::chrono::duration<double, std::milli>(clock_type::now() - last_write).count();
+  EXPECT_GE(detect_ms, 5.0);
+  EXPECT_LE(detect_ms, 5.0 + 1.0 + 2.0);
+
+  const auto deadline = clock_type::now() + 500ms;
+  while (clock_type::now() < deadline &&
+    !(motors.disables(1) > 0 && motors.disables(2) > 0 && motors.disables(3) > 0))
+  {
+    std::this_thread::sleep_for(1ms);
+  }
+  for (int id = 1; id <= 3; ++id) {
+    EXPECT_GE(motors.disables(id), 1) << id;
+  }
+  const int frames = motors.broadcast_frames.load();
+  std::this_thread::sleep_for(20ms);
+  EXPECT_EQ(motors.broadcast_frames.load(), frames);
+  EXPECT_EQ(system.on_deactivate(rclcpp_lifecycle::State()),
+    hardware_interface::CallbackReturn::SUCCESS);
+  std::lock_guard<std::mutex> lock(system.mutex);
+  ASSERT_EQ(system.stats.size(), 1U);
+  EXPECT_EQ(system.stats[0].fault, StreamFault::kCommandStale);
+}
+
+// controller_manager stops calling write() before it deactivates the hardware. The streams stop
+// first in on_deactivate(), so a normal deactivation shortly after the last write() is not
+// reported as a stalled control loop.
+TEST(StreamedSystemAt1kHz, NormalDeactivationAfterTheLastWriteIsNotACommandStall)
+{
+  const char * iface = std::getenv("BXI_VCAN_IFACE");
+  if (iface == nullptr) {
+    GTEST_SKIP() << "BXI_VCAN_IFACE is not configured";
+  }
+  MotorEmulator motors(iface, {1, 2, 3});
+  ASSERT_TRUE(motors.opened());
+  RecordsStreamStats system;
+  system.join_delay = 10ms;
+  ASSERT_EQ(system.on_init(hardwareInfo(streamConfig(iface, 1000, 3.0, true, 3), jointNames(3))),
+    hardware_interface::CallbackReturn::SUCCESS);
+  ASSERT_EQ(system.on_activate(rclcpp_lifecycle::State()),
+    hardware_interface::CallbackReturn::SUCCESS);
+  {
+    Writer writer(system, 1ms);
+    std::this_thread::sleep_for(100ms);
+    writer.stop();
+  }
+  // Well inside the 5 ms limit, like the controller deactivation that precedes the hardware's.
+  std::this_thread::sleep_for(2ms);
+  ASSERT_EQ(system.on_deactivate(rclcpp_lifecycle::State()),
+    hardware_interface::CallbackReturn::SUCCESS);
+  std::lock_guard<std::mutex> lock(system.mutex);
+  ASSERT_EQ(system.stats.size(), 1U);
+  EXPECT_EQ(system.stats[0].fault, StreamFault::kNone);
+  EXPECT_LT(system.stats[0].max_command_age_ms, 5.0);
+  for (int id = 1; id <= 3; ++id) {
+    EXPECT_GE(motors.disables(id), 1) << id;
+  }
+}
+
+TEST(StreamedSystemAt1kHz, InvalidCommandMaxAgeFailsConfiguration)
+{
+  const char * iface = std::getenv("BXI_VCAN_IFACE");
+  if (iface == nullptr) {
+    GTEST_SKIP() << "BXI_VCAN_IFACE is not configured";
+  }
+  for (const char * value : {"1.5", "60"}) {
+    auto config = streamConfig(iface, 1000, 3.0, true, 3);
+    config.replace(config.find("stream_feedback_max_age_ms"), 0,
+      std::string("stream_command_max_age_ms: ") + value + ", ");
+    BxiSystemInterface system;
+    EXPECT_EQ(system.on_init(hardwareInfo(config, jointNames(3))),
+      hardware_interface::CallbackReturn::ERROR) << value;
+  }
+}
+
 TEST(StreamedSystemAt1kHz, UnicastStreamRunsAndDeactivates)
 {
   const char * iface = std::getenv("BXI_VCAN_IFACE");
@@ -480,7 +646,11 @@ TEST(StreamedSystemAt1kHz, TimingDirectoryReceivesStreamCsvs)
     hardware_interface::CallbackReturn::SUCCESS);
   ASSERT_EQ(system.on_activate(rclcpp_lifecycle::State()),
     hardware_interface::CallbackReturn::SUCCESS);
-  std::this_thread::sleep_for(200ms);
+  {
+    Writer writer(system, 1ms);
+    std::this_thread::sleep_for(200ms);
+    writer.stop();
+  }
   ASSERT_EQ(system.on_deactivate(rclcpp_lifecycle::State()),
     hardware_interface::CallbackReturn::SUCCESS);
 
@@ -501,19 +671,26 @@ TEST(StreamedSystemAt1kHz, TimingDirectoryReceivesStreamCsvs)
   std::string header;
   std::getline(cycles, metadata);
   std::getline(cycles, header);
-  EXPECT_EQ(metadata.rfind("#period_ns=1000000,max_feedback_age_ns=3000000,broadcast=1,"
-    "can_ids=1;2;3,", 0), 0U) << metadata;
+  EXPECT_EQ(metadata.rfind("#period_ns=1000000,max_feedback_age_ns=3000000,"
+    "max_command_age_ns=5000000,broadcast=1,can_ids=1;2;3,", 0), 0U) << metadata;
   EXPECT_NE(metadata.find("tx_thread=SCHED_"), std::string::npos) << metadata;
   EXPECT_EQ(header, "cycle,outcome,wake_lateness_ns,hook_ns,send_lateness_ns,frames,"
-    "age_ns_1,fresh_1,age_ns_2,fresh_2,age_ns_3,fresh_3");
+    "age_ns_1,fresh_1,age_ns_2,fresh_2,age_ns_3,fresh_3,command_age_ns");
   int cycle_rows = 0;
   int sent_rows = 0;
+  int checked_rows = 0;  // command_age_ns >= 0: at least one write() before the cycle
   for (std::string line; std::getline(cycles, line); ) {
     ++cycle_rows;
     sent_rows += line.find(",sent,") != std::string::npos ? 1 : 0;
+    const auto command_age = std::stoll(line.substr(line.rfind(',') + 1));
+    if (command_age >= 0) {
+      ++checked_rows;
+      EXPECT_LE(command_age, 5'000'000) << line;
+    }
   }
   EXPECT_GE(cycle_rows, 150);
   EXPECT_GE(sent_rows, 150);
+  EXPECT_GE(checked_rows, 150);
 
   std::ifstream rx(rx_files[0]);
   std::getline(rx, metadata);
@@ -708,6 +885,52 @@ TEST(StreamedSystemTwoBuses, FaultOnOneBusDisablesTheOther)
   EXPECT_EQ(motors_b.broadcast_frames.load(), frames_b);
   EXPECT_EQ(system.on_deactivate(rclcpp_lifecycle::State()),
     hardware_interface::CallbackReturn::SUCCESS);
+}
+
+// Every send thread is asked to stop before any bus is joined, so a slow stop of one bus does
+// not leave another bus sending while write() has stopped.
+TEST(StreamedSystemTwoBuses, SlowStopOfOneBusDoesNotStallTheOther)
+{
+  const char * iface_a = std::getenv("BXI_VCAN_IFACE");
+  const char * iface_b = std::getenv("BXI_VCAN_IFACE_B");
+  if (iface_a == nullptr || iface_b == nullptr) {
+    GTEST_SKIP() << "BXI_VCAN_IFACE and BXI_VCAN_IFACE_B are not configured";
+  }
+  MotorEmulator motors_a(iface_a, {1});
+  MotorEmulator motors_b(iface_b, {1});
+  ASSERT_TRUE(motors_a.opened());
+  ASSERT_TRUE(motors_b.opened());
+  const std::string a = iface_a;
+  const std::string b = iface_b;
+  const std::string config =
+    "active_can_buses: [" + a + ", " + b + "]\n"
+    "can_frame_format: {" + a + ": fd, " + b + ": fd}\n"
+    "defaults: {control_timeout_ms: 5, maximum_consecutive_timeouts: 3, can_hz: 1000}\n"
+    "can_transport:\n"
+    "  " + a + ": {rx_mode: separate, tx_frame: broadcast, stream_feedback_max_age_ms: 3}\n"
+    "  " + b + ": {rx_mode: separate, tx_frame: broadcast, stream_feedback_max_age_ms: 3}\n"
+    "joints:\n" + jointYaml("joint1", a, 1) + jointYaml("joint2", b, 1);
+  RecordsStreamStats system;
+  system.first_stop_delay = 10ms;
+  ASSERT_EQ(system.on_init(hardwareInfo(config, {"joint1", "joint2"})),
+    hardware_interface::CallbackReturn::SUCCESS);
+  ASSERT_EQ(system.on_activate(rclcpp_lifecycle::State()),
+    hardware_interface::CallbackReturn::SUCCESS);
+  {
+    Writer writer(system, 1ms);
+    std::this_thread::sleep_for(100ms);
+    writer.stop();
+  }
+  ASSERT_EQ(system.on_deactivate(rclcpp_lifecycle::State()),
+    hardware_interface::CallbackReturn::SUCCESS);
+  std::lock_guard<std::mutex> lock(system.mutex);
+  ASSERT_EQ(system.stats.size(), 2U);
+  for (const auto & s : system.stats) {
+    EXPECT_EQ(s.fault, StreamFault::kNone);
+    EXPECT_LT(s.max_command_age_ms, 5.0);
+  }
+  EXPECT_GE(motors_a.disables(1), 1);
+  EXPECT_GE(motors_b.disables(1), 1);
 }
 
 }  // namespace

@@ -71,3 +71,26 @@ def test_marks_reply_statistics_when_the_reply_trace_filled(tmp_path):
 def test_tolerance_changes_the_late_counts(tmp_path):
     lines = summarize(write_capture(tmp_path), tolerance_ms=0.5)
     assert "over 0.5 ms=0/3" in next(line for line in lines if line.startswith("send lateness"))
+
+
+def test_reports_command_age_when_the_column_is_present(tmp_path):
+    stem = tmp_path / "bxi_stream_vcan0_2"
+    metadata = METADATA.replace("max_feedback_age_ns=3000000,",
+                                "max_feedback_age_ns=3000000,max_command_age_ns=5000000,")
+    cycles = [
+        "cycle,outcome,wake_lateness_ns,hook_ns,send_lateness_ns,frames,"
+        "age_ns_1,fresh_1,age_ns_2,fresh_2,command_age_ns",
+        # Not checked before the first write().
+        "0,sent,50000,10000,60000,1,-1,0,-1,0,-1",
+        "1,sent,40000,10000,50000,1,500000,1,700000,1,900000",
+        "2,stopped,40000,0,50000,1,500000,1,700000,1,6000000",
+    ]
+    Path(f"{stem}_cycles.csv").write_text(metadata + "\n".join(cycles) + "\n")
+    Path(f"{stem}_rx.csv").write_text(
+        metadata + "can_id,received_ns,rx_kernel_realtime_ns,rx_userspace_realtime_ns,rx_hardware_raw_ns\n")
+    line = next(line for line in summarize(stem) if line.startswith("command age at slot start"))
+    assert "max=6.0000" in line and "over stop threshold 5 ms=1/2" in line
+
+
+def test_older_csv_without_command_age_has_no_command_age_line(tmp_path):
+    assert not any(line.startswith("command age") for line in summarize(write_capture(tmp_path)))

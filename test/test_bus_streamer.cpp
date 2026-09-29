@@ -150,6 +150,8 @@ public:
   std::atomic<bool> send_ok{true};
   // Runs after each accepted send; set before the stream starts.
   std::function<void()> after_send;
+  // Makes send() fail for the frames it returns true for; set before the stream starts.
+  std::function<bool(const CanFrame &)> reject;
 
 private:
   std::mutex mutex_;
@@ -174,7 +176,7 @@ public:
   bool isOpen() const override {return true;}
   bool send(const CanFrame & frame) override
   {
-    if (!link_.send_ok) {
+    if (!link_.send_ok || (link_.reject && link_.reject(frame))) {
       return false;
     }
     link_.onSend(frame);
@@ -318,6 +320,366 @@ TEST(BusStreamer, StartRejectsInvalidSetups)
     Rig rig({1});
     auto c = config(1ms, false);
     c.padded_broadcast_blocks = 3;
+    EXPECT_FALSE(rig.makeStreamer(c)->start());
+  }
+}
+
+// Periodic write() of the owner's control loop, as BxiSystemInterface::write() does.
+class CommandWriter
+{
+public:
+  CommandWriter(std::atomic<int64_t> & stamp, std::chrono::nanoseconds interval)
+  : stamp_(stamp), thread_([this, interval]() {
+        while (running_) {
+          stamp_.store(clock_type::now().time_since_epoch().count());
+          last_ = clock_type::now();
+          std::this_thread::sleep_for(interval);
+        }
+      }) {}
+  ~CommandWriter() {stop();}
+  // Stops writing and returns the time of the last write.
+  clock_type::time_point stop()
+  {
+    running_ = false;
+    if (thread_.joinable()) {
+      thread_.join();
+    }
+    return last_;
+  }
+
+private:
+  std::atomic<int64_t> & stamp_;
+  std::atomic<bool> running_{true};
+  clock_type::time_point last_{};
+  std::thread thread_;
+};
+
+// kp and kd raw fields of the 8-byte MIT command block (12 bits each).
+std::pair<uint32_t, uint32_t> rawKpKd(const std::array<uint8_t, 8> & block)
+{
+  const uint32_t kp = (static_cast<uint32_t>(block[3] & 0x0F) << 8) | block[4];
+  const uint32_t kd = (static_cast<uint32_t>(block[5]) << 4) | (block[6] >> 4);
+  return {kp, kd};
+}
+
+std::array<uint8_t, 8> broadcastBlock(const CanFrame & frame, size_t index)
+{
+  std::array<uint8_t, 8> block{};
+  std::copy_n(frame.data.begin() + static_cast<std::ptrdiff_t>(index * 8), 8, block.begin());
+  return block;
+}
+
+BxiBusStreamer::CycleHook gainHook()
+{
+  return [](const std::vector<StreamFeedback> &, std::vector<StreamCommand> & commands) {
+           for (auto & command : commands) {
+             command = StreamCommand{0.0, 0.0, 10.0, 1.0, 0.0};
+           }
+           return true;
+         };
+}
+
+TEST(BusStreamer, CommandAgeIsNotCheckedBeforeTheFirstWrite)
+{
+  Rig rig({1});
+  std::atomic<int64_t> stamp{0};
+  auto c = config(1ms, true);
+  c.max_command_age = 5ms;
+  c.command_written_ns = &stamp;
+  auto streamer = rig.makeStreamer(c, gainHook());
+  ASSERT_TRUE(streamer->start());
+  std::this_thread::sleep_for(50ms);
+  EXPECT_FALSE(rig.stop_all);
+  streamer->stop();
+  const auto stats = streamer->stats();
+  EXPECT_EQ(stats.fault, StreamFault::kNone);
+  EXPECT_EQ(stats.max_command_age_ms, 0.0);
+}
+
+TEST(BusStreamer, RegularWritesKeepRunningBelowTheCommandAgeLimit)
+{
+  Rig rig({1, 2, 3});
+  std::atomic<int64_t> stamp{0};
+  auto c = config(1ms, true);
+  c.max_command_age = 5ms;
+  c.command_written_ns = &stamp;
+  c.trace_cycles = 200;
+  auto streamer = rig.makeStreamer(c, gainHook());
+  // Writes every 3 ms stay below the 5 ms limit even though several cycles see the same write.
+  CommandWriter writer(stamp, 3ms);
+  ASSERT_TRUE(streamer->start());
+  std::this_thread::sleep_for(100ms);
+  EXPECT_FALSE(rig.stop_all);
+  streamer->stop();
+  writer.stop();
+  const auto stats = streamer->stats();
+  EXPECT_EQ(stats.fault, StreamFault::kNone);
+  EXPECT_GT(stats.max_command_age_ms, 1.0);
+  EXPECT_LT(stats.max_command_age_ms, 5.0);
+  const auto & trace = streamer->trace();
+  size_t checked = 0;
+  for (size_t r = 0; r < std::min(trace.cycle_count, trace.cycles.size()); ++r) {
+    checked += trace.cycles[r].command_age_ns >= 0 ? 1 : 0;
+  }
+  EXPECT_GT(checked, 50U);
+}
+
+TEST(BusStreamer, StaleCommandsSendZeroGainThenStopWhileRepliesContinue)
+{
+  Rig rig({1, 2, 3});
+  const size_t enable_frames = rig.link.sent().size();
+  std::atomic<int64_t> stamp{0};
+  auto c = config(1ms, true);
+  c.max_command_age = 5ms;
+  c.command_written_ns = &stamp;
+  auto streamer = rig.makeStreamer(c, gainHook());
+  CommandWriter writer(stamp, 1ms);
+  ASSERT_TRUE(streamer->start());
+  ASSERT_TRUE(streamer->waitForFirstFeedback(10ms));
+  std::this_thread::sleep_for(30ms);
+  // The control loop stalls; the motors keep answering, so the reply age stays fresh.
+  const auto last_write = writer.stop();
+  const auto stopped_at = rig.waitForStop(1s);
+  ASSERT_TRUE(stopped_at.has_value());
+  const double elapsed_ms = toMs(*stopped_at - last_write);
+  // Stops in the first cycle whose start sees an age over 5 ms: within one period after that,
+  // plus 1 ms for thread wake-up in the test environment.
+  EXPECT_GE(elapsed_ms, 5.0);
+  EXPECT_LE(elapsed_ms, 5.0 + 1.0 + 1.0);
+  streamer->stop();
+  const auto stats = streamer->stats();
+  EXPECT_EQ(stats.fault, StreamFault::kCommandStale);
+  EXPECT_EQ(stats.fault_axis, -1);
+  EXPECT_GT(stats.max_command_age_ms, 5.0);
+  // Not a communication fault: every motor stays enabled for the owner's normal disable.
+  for (const auto & driver : rig.drivers) {
+    EXPECT_EQ(driver->state(), ActuatorState::kEnabled);
+  }
+  const auto sent = rig.link.sent();
+  ASSERT_GE(sent.size(), enable_frames + 2U);
+  const auto & last = sent.back();
+  const auto & before = sent[sent.size() - 2];
+  ASSERT_EQ(last.id, 0x7FFU);
+  ASSERT_EQ(before.id, 0x7FFU);
+  for (size_t block = 0; block < 3; ++block) {
+    EXPECT_EQ(rawKpKd(broadcastBlock(last, block)), std::make_pair(0U, 0U)) << block;
+    EXPECT_NE(rawKpKd(broadcastBlock(before, block)).first, 0U) << block;
+  }
+}
+
+TEST(BusStreamer, StaleCycleSendsZeroGainToEveryMotorPastTheSlotDeadline)
+{
+  Rig rig({1, 2, 3});
+  std::atomic<int64_t> stamp{0};
+  std::atomic<bool> slow_sends{false};
+  // Once the control loop has stalled, each frame takes 1.5 ms, so the 1 ms slot closes after the
+  // first per-motor frame.
+  rig.link.after_send = [&slow_sends]() {
+      if (slow_sends) {
+        std::this_thread::sleep_for(1500us);
+      }
+    };
+  auto c = config(1ms, false);
+  c.max_feedback_age = 10ms;  // slow sends delay the replies too
+  c.max_command_age = 5ms;
+  c.command_written_ns = &stamp;
+  auto streamer = rig.makeStreamer(c, gainHook());
+  CommandWriter writer(stamp, 1ms);
+  ASSERT_TRUE(streamer->start());
+  ASSERT_TRUE(streamer->waitForFirstFeedback(10ms));
+  std::this_thread::sleep_for(20ms);
+  writer.stop();
+  slow_sends = true;
+  ASSERT_TRUE(rig.waitForStop(1s).has_value());
+  streamer->stop();
+  const auto stats = streamer->stats();
+  ASSERT_EQ(stats.fault, StreamFault::kCommandStale);
+  EXPECT_EQ(stats.command_stale_zero_gain_frames, 3U);
+  EXPECT_EQ(stats.command_stale_expected_frames, 3U);
+  const auto sent = rig.link.sent();
+  ASSERT_GE(sent.size(), 3U);
+  for (size_t k = 0; k < 3; ++k) {
+    const auto & frame = sent[sent.size() - 3 + k];
+    EXPECT_EQ(frame.id, static_cast<uint32_t>(k + 1));
+    EXPECT_EQ(rawKpKd(frame.data8()), std::make_pair(0U, 0U)) << k;
+  }
+}
+
+TEST(BusStreamer, StalenessIsDetectedInACycleThatWouldBeSkippedAsLate)
+{
+  Rig rig({1, 2, 3});
+  std::atomic<int64_t> stamp{0};
+  std::atomic<bool> stall_hook{false};
+  auto c = config(1ms, true);
+  c.max_feedback_age = 30ms;  // the stalled hook also delays reply processing
+  c.max_command_age = 5ms;
+  c.command_written_ns = &stamp;
+  c.trace_cycles = 1000;
+  auto streamer = rig.makeStreamer(c,
+      [&stall_hook](const std::vector<StreamFeedback> &, std::vector<StreamCommand> & commands) {
+        for (auto & command : commands) {
+          command = StreamCommand{0.0, 0.0, 10.0, 1.0, 0.0};
+        }
+        if (stall_hook.exchange(false)) {
+          std::this_thread::sleep_for(12ms);  // the next slots are already late
+        }
+        return true;
+      });
+  CommandWriter writer(stamp, 1ms);
+  ASSERT_TRUE(streamer->start());
+  ASSERT_TRUE(streamer->waitForFirstFeedback(10ms));
+  std::this_thread::sleep_for(20ms);
+  writer.stop();
+  stall_hook = true;
+  ASSERT_TRUE(rig.waitForStop(1s).has_value());
+  streamer->stop();
+  const auto stats = streamer->stats();
+  ASSERT_EQ(stats.fault, StreamFault::kCommandStale);
+  EXPECT_EQ(stats.command_stale_zero_gain_frames, 1U);
+  const auto & trace = streamer->trace();
+  ASSERT_GT(trace.cycle_count, 0U);
+  ASSERT_LE(trace.cycle_count, trace.cycles.size());
+  const auto & last = trace.cycles[trace.cycle_count - 1];
+  EXPECT_EQ(last.outcome, StreamCycleOutcome::kStopped);
+  // The stopping cycle woke at least a full period late: without the check before the skip,
+  // it would have been skipped.
+  EXPECT_GE(last.wake_lateness_ns, 1'000'000);
+  EXPECT_GT(last.command_age_ns, 5'000'000);
+  const auto sent = rig.link.sent();
+  ASSERT_FALSE(sent.empty());
+  for (size_t block = 0; block < 3; ++block) {
+    EXPECT_EQ(rawKpKd(broadcastBlock(sent.back(), block)), std::make_pair(0U, 0U)) << block;
+  }
+}
+
+TEST(BusStreamer, FailedZeroGainSendStopsAsASendFailure)
+{
+  Rig rig({1});
+  std::atomic<int64_t> stamp{0};
+  auto c = config(1ms, true);
+  c.max_command_age = 5ms;
+  c.command_written_ns = &stamp;
+  // Only the zero-gain broadcast fails to send; the gain commands before it go out.
+  rig.link.reject = [](const CanFrame & frame) {
+      return frame.id == 0x7FFU && rawKpKd(broadcastBlock(frame, 0)).first == 0U;
+    };
+  auto streamer = rig.makeStreamer(c, gainHook());
+  CommandWriter writer(stamp, 1ms);
+  ASSERT_TRUE(streamer->start());
+  ASSERT_TRUE(streamer->waitForFirstFeedback(10ms));
+  std::this_thread::sleep_for(20ms);
+  writer.stop();
+  ASSERT_TRUE(rig.waitForStop(1s).has_value());
+  streamer->stop();
+  const auto stats = streamer->stats();
+  // The zero-gain send failed in the stale cycle, so it stops as a send failure.
+  EXPECT_EQ(stats.fault, StreamFault::kSendFailed);
+  EXPECT_GT(stats.max_command_age_ms, 5.0);
+  EXPECT_EQ(stats.command_stale_zero_gain_frames, 0U);
+  // A send failure is a communication fault: the motor is latched for the best-effort disable.
+  EXPECT_EQ(rig.drivers[0]->state(), ActuatorState::kSafeStopped);
+}
+
+bool isZeroGainUnicast(const CanFrame & frame, uint32_t id)
+{
+  return frame.id == id && frame.dlc == 8 && rawKpKd(frame.data8()) == std::make_pair(0U, 0U);
+}
+
+TEST(BusStreamer, ZeroGainSendFailurePartWayRecordsTheFramesSent)
+{
+  Rig rig({1, 2, 3});
+  std::atomic<int64_t> stamp{0};
+  // Motor 1's zero-gain frame goes out; motor 2's fails.
+  rig.link.reject = [](const CanFrame & frame) {return isZeroGainUnicast(frame, 2);};
+  auto c = config(1ms, false);
+  c.max_command_age = 5ms;
+  c.command_written_ns = &stamp;
+  auto streamer = rig.makeStreamer(c, gainHook());
+  CommandWriter writer(stamp, 1ms);
+  ASSERT_TRUE(streamer->start());
+  ASSERT_TRUE(streamer->waitForFirstFeedback(10ms));
+  std::this_thread::sleep_for(20ms);
+  writer.stop();
+  ASSERT_TRUE(rig.waitForStop(1s).has_value());
+  streamer->stop();
+  const auto stats = streamer->stats();
+  EXPECT_EQ(stats.fault, StreamFault::kSendFailed);
+  EXPECT_EQ(stats.fault_axis, 1);
+  EXPECT_EQ(stats.command_stale_zero_gain_frames, 1U);
+  EXPECT_EQ(stats.command_stale_expected_frames, 3U);
+  // Motor 2's failed send latches its safe-stop, which sends a disable afterwards, so look at the
+  // last frame for motor 1 rather than the last frame overall.
+  const auto sent = rig.link.sent();
+  const auto last_to_1 = std::find_if(sent.rbegin(), sent.rend(),
+      [](const CanFrame & frame) {return frame.id == 1U;});
+  ASSERT_NE(last_to_1, sent.rend());
+  EXPECT_TRUE(isZeroGainUnicast(*last_to_1, 1));
+}
+
+// A stop request that arrives while the zero-gain frames go out owns the shutdown: the stream
+// ends as an external stop, not as a command-age fault.
+class StopDuringZeroGain : public ::testing::TestWithParam<bool> {};
+
+TEST_P(StopDuringZeroGain, EndsAsAnExternalStop)
+{
+  const bool other_bus_fault = GetParam();
+  Rig rig({1, 2, 3});
+  std::atomic<int64_t> stamp{0};
+  std::atomic<BxiBusStreamer *> target{nullptr};
+  // Motor 1's zero-gain frame goes out, then the stop request arrives before motor 2's frame.
+  rig.link.reject = [&](const CanFrame & frame) {
+      if (isZeroGainUnicast(frame, 1)) {
+        if (other_bus_fault) {
+          rig.stop_all = true;
+        } else if (auto * streamer = target.load()) {
+          streamer->requestStop();
+        }
+      }
+      return false;
+    };
+  auto c = config(1ms, false);
+  c.max_command_age = 5ms;
+  c.command_written_ns = &stamp;
+  auto streamer = rig.makeStreamer(c, gainHook());
+  target = streamer.get();
+  CommandWriter writer(stamp, 1ms);
+  ASSERT_TRUE(streamer->start());
+  ASSERT_TRUE(streamer->waitForFirstFeedback(10ms));
+  std::this_thread::sleep_for(20ms);
+  writer.stop();
+  const auto deadline = clock_type::now() + 1s;
+  while (clock_type::now() < deadline && !streamer->sendFinished()) {
+    std::this_thread::sleep_for(100us);
+  }
+  ASSERT_TRUE(streamer->sendFinished());
+  streamer->stop();
+  const auto stats = streamer->stats();
+  EXPECT_EQ(stats.fault, StreamFault::kNone);
+  EXPECT_TRUE(stats.stopped_externally);
+  EXPECT_EQ(stats.command_stale_zero_gain_frames, 1U);
+  EXPECT_EQ(stats.command_stale_expected_frames, 3U);
+  // Only the other bus's fault raised the shared stop flag; this stream did not.
+  EXPECT_EQ(rig.stop_all.load(), other_bus_fault);
+  EXPECT_TRUE(isZeroGainUnicast(rig.link.sent().back(), 1));
+}
+
+INSTANTIATE_TEST_SUITE_P(
+  OwnerStopOrOtherBusFault, StopDuringZeroGain, ::testing::Values(false, true));
+
+TEST(BusStreamer, CommandAgeLimitNeedsTwoPeriodsAndAWriteStamp)
+{
+  std::atomic<int64_t> stamp{0};
+  {
+    Rig rig({1});
+    auto c = config(1ms, false);
+    c.max_command_age = 5ms;  // no command_written_ns
+    EXPECT_FALSE(rig.makeStreamer(c)->start());
+  }
+  {
+    Rig rig({1});
+    auto c = config(1ms, false);
+    c.max_command_age = 1500us;
+    c.command_written_ns = &stamp;
     EXPECT_FALSE(rig.makeStreamer(c)->start());
   }
 }
