@@ -45,6 +45,8 @@ class SimulatedController(Node):
         self.stops = 0
         self.csv_path = "/tmp/simulated_trajectory.csv"
         self.stop_unapplied = False
+        self.keepalive_times = []
+        self.holding_at = 0.0
         self.pub = self.create_publisher(Status, "/hil_trajectory/status", 10)
         self.create_subscription(UInt32, "/hil_trajectory/keepalive", self.keepalive, 10)
         if start:
@@ -68,6 +70,7 @@ class SimulatedController(Node):
         return response
 
     def keepalive(self, msg):
+        self.keepalive_times.append(time.monotonic())
         if msg.data == 1 and self.status.state == Status.ARMED:
             self.status.state = Status.RUNNING
             self.started_at = time.monotonic()
@@ -109,6 +112,7 @@ class SimulatedController(Node):
                     self.release("release")
                 else:
                     self.status.state = Status.HOLDING
+                    self.holding_at = now
         if self.released_at and now - self.released_at > 0.55:
             self.status.record_state = Status.RECORD_WRITTEN
             self.status.csv_path = self.csv_path
@@ -342,6 +346,7 @@ def test_missing_stop_response_remains_failure(controller):
                                stderr=subprocess.PIPE, text=True, env=os.environ.copy())
     try:
         time.sleep(0.7)
+        signaled = time.monotonic()
         process.send_signal(signal.SIGINT)
         stdout, stderr = process.communicate(timeout=5)
     finally:
@@ -350,6 +355,23 @@ def test_missing_stop_response_remains_failure(controller):
             process.communicate()
     assert process.returncode != 0, stdout + stderr
     assert "停止の確認ができない" in stderr
+    # The lease must be allowed to expire while ~/stop is being waited for (~1 s).
+    late = [t for t in controller.keepalive_times if t > signaled + 0.15]
+    assert not late, f"{len(late)} keepalives after SIGINT"
+
+
+def test_keepalive_stops_when_finish_and_stop_do_not_answer(controller):
+    for service in list(controller.services):
+        if service.srv_name in ("/hil_trajectory/finish", "/hil_trajectory/stop"):
+            controller.destroy_service(service)
+    result = command(["hold"])
+    assert result.returncode != 0
+    assert "~/finish" in result.stderr
+    assert "停止の確認ができない" in result.stderr
+    assert controller.holding_at > 0
+    # ~/finish is given 1 s; after that failure, waiting for ~/stop must not extend the lease.
+    late = [t for t in controller.keepalive_times if t > controller.holding_at + 1.2]
+    assert not late, f"{len(late)} keepalives after ~/finish failed"
 
 
 def test_stop_response_without_application_is_not_confirmed(controller):

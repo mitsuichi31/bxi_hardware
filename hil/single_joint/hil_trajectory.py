@@ -263,13 +263,15 @@ class TrajectoryClient(Node):
         return expected
 
     def stop_run(self):
-        # Best effort. Even if the service is unavailable, stop keepalive and let the lease expire.
+        # Best effort. Keepalive stops before the first wait, so the lease expires even when the
+        # service never answers; the saved request id still confirms which run was stopped.
+        current_id = self.id
+        self.id = 0
         try:
             previous_stops = self.status.applied_stop_count if self.status is not None else 0
             response = self.call(self.stop_client, Trigger.Request(), 1.0, "~/stop", check=False)
             if not response.success:
                 raise Abort("~/stop が拒否した")
-            current_id = self.id
             self.until(lambda: self.status is not None and
                        self.status.applied_stop_count > previous_stops and
                        (current_id == 0 or self.status.applied_request_id == current_id) and
@@ -280,8 +282,6 @@ class TrajectoryClient(Node):
             print("~/stop の適用と脱力値の書き込みを確認", file=sys.stderr, flush=True)
         except Exception as exc:
             print("停止の確認ができない: " + str(exc), file=sys.stderr, flush=True)
-        finally:
-            self.id = 0
 
 
 def make_request(args):

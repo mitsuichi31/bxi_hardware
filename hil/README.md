@@ -373,7 +373,7 @@ ramp と SIN 波の目標を、トピック経由のスクリプトではなく�
 - 毎周期の記録：開始要求を適用した周期から、力を抜いた周期の `record_tail` 後まで、あらかじめ確保した領域に書き、RT ではないタイマーが CSV（`hil_trajectory_<要求番号>_<時刻>.csv`）に書き出す。書き出すまで次の開始は受け付けない。書き出しに失敗したら記録を残したまま1秒ごとに再試行し（`~/status` の記録の状態は「失敗」）、その間も次の開始は受け付けない。CSV の最後の列 `write_ok` は、その周期の書き込みがすべて通ったか（1 / 0）。満杯になったら欠落した周期を数える（制御は続ける）。
 - `update()` はメモリを確保せず（単体試験で確かめている）、止まる可能性のあるロックを取らない（try_lock と atomic だけ）。
 
-`hil_trajectory.py` は手順3の指令コマンドで、controller に開始を要求して要求番号付き keepalive を20 Hzで送り、正常終了・CSV 保存まで確認する。SIN 波では保存した controller CSV の振幅一定区間から追従誤差、振幅比、位相遅れ、停止時間を集計する。`~/start` の応答なし、`~/finish` / `~/stop` の異常、心拍切れ、書き込み失敗、Ctrl+C は終了コード1と `[中止]` で区別する。引数の例（controller を別途起動した vcan 用）:
+`hil_trajectory.py` は手順3の指令コマンドで、controller に開始を要求して要求番号付き keepalive を20 Hzで送り、正常終了・CSV 保存まで確認する。SIN 波では保存した controller CSV の振幅一定区間から追従誤差、振幅比、位相遅れ、停止時間を集計する。`~/start` の応答なし、`~/finish` / `~/stop` の異常、心拍切れ、書き込み失敗、Ctrl+C は終了コード1と `[中止]` で区別する。異常を検出したら、`~/stop` を呼ぶ前に keepalive を止める（`~/stop` が応答しなくても、リースの時間で力が抜ける）。停止の適用は保存した要求番号で確かめる。引数の例（controller を別途起動した vcan 用）:
 
 ```bash
 ros2 run bxi_hardware hil_trajectory.py --kp 10 --kd 2 --hold 1 hold
