@@ -21,8 +21,11 @@ can_transport:
     send_thread_priority: 45
     receive_thread_priority: 46
 defaults:
-  # 逐次で行う enable・初期フィードバック・disable の応答待ちに使う。
-  control_timeout_ms: 3
+  # 逐次で行う enable・初期フィードバック・disable の応答待ちに使う（送受信分離の運転中は使わない）。
+  # 2026-09-29 の HIL 段階1で、enable 直後の初期フィードバックへの応答が、モーターの文字出力
+  # （STATE : 02 MOTOR / Enter Motor Mode、約 3.4 ms）の後に回されて 2.92 ms かかり、3 ms では
+  # 起動に失敗した。余裕を見て 10 ms にする。1 kHz の停止判定は stream_feedback_max_age_ms で行う。
+  control_timeout_ms: 10
   maximum_consecutive_timeouts: 3
   can_hz: 1000
   temperature_sensor_fault_below_c: -20.0
