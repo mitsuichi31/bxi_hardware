@@ -21,6 +21,8 @@
 #include <thread>
 #include <vector>
 
+#include "bxi_hardware/hil_trajectory.hpp"
+
 namespace {
 using Clock = std::chrono::steady_clock;
 constexpr double kPi = 3.14159265358979323846;
@@ -100,31 +102,30 @@ Options parse(int argc, char **argv) {
         o.friction_velocity > 0 && o.stribeck_velocity > 0)) {
     throw std::runtime_error("Options outside allowed range (see --help)");
   }
-  if (o.amplitude * 2 * kPi * o.frequency > o.max_velocity)
-    throw std::runtime_error("Sine peak velocity exceeds --max-velocity");
+  // An upper bound over the whole trajectory, including the envelope derivative while the
+  // amplitude ramps.
+  const double bound = bxi_hardware::hil::SineTrajectory(
+    0.0, o.amplitude, o.frequency, o.cycles, o.ramp_cycles).velocityUpperBound();
+  if (bound > o.max_velocity)
+    throw std::runtime_error(
+      "Sine velocity bound (including the amplitude ramps) exceeds --max-velocity");
   return o;
 }
 
+// Targets come from bxi_hardware::hil::SineTrajectory (the same formulas as sine_command.py);
+// the other fields are for summarize().
 struct Trajectory {
   double center, amplitude, omega, ramp, flat, duration;
+  bxi_hardware::hil::SineTrajectory sine;
   explicit Trajectory(const Options &o, double c)
     : center(c), amplitude(o.amplitude), omega(2 * kPi * o.frequency),
       ramp(o.ramp_cycles / o.frequency), flat(o.cycles / o.frequency),
-      duration(2 * ramp + flat) {}
+      duration(2 * ramp + flat),
+      sine(c, o.amplitude, o.frequency, o.cycles, o.ramp_cycles) {}
 
   std::pair<double, double> at(double t) const {
-    t = std::clamp(t, 0.0, duration);
-    double a = amplitude, da = 0;
-    if (ramp > 0 && t < ramp) {
-      const double x = t / ramp;
-      a = amplitude * 0.5 * (1 - std::cos(kPi * x));
-      da = amplitude * 0.5 * kPi / ramp * std::sin(kPi * x);
-    } else if (ramp > 0 && t > ramp + flat) {
-      const double x = std::min((t - ramp - flat) / ramp, 1.0);
-      a = amplitude * 0.5 * (1 + std::cos(kPi * x));
-      da = -amplitude * 0.5 * kPi / ramp * std::sin(kPi * x);
-    }
-    return {center + a * std::sin(omega * t), da * std::sin(omega * t) + a * omega * std::cos(omega * t)};
+    const auto s = sine.at(t);
+    return {s.position, s.velocity};
   }
 };
 
@@ -269,9 +270,8 @@ int run(const Options &o) {
       break;
     }
     const auto [target, target_velocity] = trajectory.at(t);
-    const double magnitude = o.friction_ff + (o.friction_static - o.friction_ff) *
-      std::exp(-std::abs(target_velocity) / o.stribeck_velocity);
-    const double ff = magnitude * std::tanh(target_velocity / o.friction_velocity);
+    const double ff = bxi_hardware::hil::frictionTorque(
+      target_velocity, o.friction_ff, o.friction_velocity, o.friction_static, o.stribeck_velocity);
     if (std::abs(target_velocity) > o.max_velocity) {
       aborted = "Target velocity exceeds --max-velocity";
       break;

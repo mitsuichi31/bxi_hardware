@@ -18,7 +18,8 @@ Fs を省略すると一定値 Fc の上乗せになる。実測の速度では�
 
 実行前に止める:
   - center ± amplitude が --lower / --upper（bxi_hardware.yaml の範囲）をはみ出す
-  - 最大速度 amplitude × 2πf が --max-velocity を超える
+  - 目標速度の上界が --max-velocity を超える（振幅一定の区間の amplitude × 2πf に、振幅を
+    立ち上げ・立ち下げる間の包絡線の微分の最大を足した値。Trajectory.velocity_bound()）
 実行中に中止し、Kp=0 の指令（その場で力を抜く）を送って終わる:
   - Kp × |目標 − 位置| + |上乗せトルク| が --max-torque [N·m] を超えた
   - /joint_states が 0.2 秒以上届かない
@@ -142,6 +143,19 @@ class Trajectory:
                     -self.amplitude * 0.5 * math.pi / self.ramp * math.sin(math.pi * x))
         return self.amplitude, 0.0
 
+    def velocity_bound(self):
+        """軌道全体の目標速度の絶対値の上界 [rad/s]（真の最大より小さくならない）。
+
+        目標速度は包絡線の微分を含む（v = da/dt × sin + a × ω × cos）ので、振幅 × ω だけでは
+        立ち上げ・立ち下げの間の値を見落とす。|v| ≤ max|da/dt| + A × ω = A × π / (2 × 立ち上げの時間)
+        + A × ω（立ち上げがなければ A × ω）。立ち上げの区間を刻んで調べる方法は、刻みより短い
+        立ち上げの山を見落とすので使わない。C++ の bxi_hardware::hil::SineTrajectory::velocityUpperBound
+        と同じ式。
+        """
+        if self.ramp <= 0.0:
+            return self.amplitude * self.omega
+        return self.amplitude * self.omega + self.amplitude * 0.5 * math.pi / self.ramp
+
     def at(self, t):
         """(目標位置, 目標速度)"""
         t = min(max(t, 0.0), self.duration)
@@ -227,12 +241,17 @@ def main():
     ap.add_argument("--lower", type=float, default=-0.5, help="関節の下限 [rad]（bxi_hardware.yaml と合わせる）")
     ap.add_argument("--upper", type=float, default=0.5, help="関節の上限 [rad]")
     ap.add_argument("--max-kp", type=float, default=20.0)
-    ap.add_argument("--max-velocity", type=float, default=2.0, help="最大速度 amplitude×2πf の上限 [rad/s]")
+    ap.add_argument("--max-velocity", type=float, default=2.0, help="目標速度の上界の上限 [rad/s]（立ち上げ・立ち下げの間を含む）")
     ap.add_argument("--max-torque", type=float, default=5.0, help="Kp×誤差 の上限 [N·m]")
     ap.add_argument("--release", action="store_true", help="終了時に Kp=0 にして力を抜く")
     ap.add_argument("--log", type=pathlib.Path, default=None,
                     help="CSV の保存先（既定: /ws/log/ があればその中、なければカレント）")
     args = ap.parse_args()
+    # nan や inf は比較が偽になるので、上限の検査（速度、トルクなど）をすり抜ける。最初に拒否する。
+    not_finite = [name for name, value in vars(args).items()
+                  if isinstance(value, float) and not math.isfinite(value)]
+    if not_finite:
+        raise SystemExit("有限でない値: " + "、".join("--" + name.replace("_", "-") for name in not_finite))
 
     if not 0.0 < args.amplitude <= 0.5:
         raise SystemExit("--amplitude は 0 より大きく 0.5 rad 以下にする")
@@ -256,9 +275,12 @@ def main():
         raise SystemExit("--friction-velocity は 0 より大きくする")
     if not 10.0 <= args.rate <= 500.0:
         raise SystemExit("--rate は 10〜500 Hz にする")
-    peak_velocity = args.amplitude * 2.0 * math.pi * args.frequency
+    # 立ち上げ・立ち下げの間の目標速度（包絡線の微分を含む）も含めた、軌道全体の上界
+    peak_velocity = Trajectory(0.0, args.amplitude, args.frequency, args.cycles,
+                               args.ramp_cycles).velocity_bound()
     if peak_velocity > args.max_velocity:
-        raise SystemExit(f"最大速度 {peak_velocity:.2f} rad/s が --max-velocity {args.max_velocity} を超える")
+        raise SystemExit(f"目標速度の上界 {peak_velocity:.2f} rad/s が --max-velocity {args.max_velocity} を超える"
+                         "（立ち上げ・立ち下げの間を含む）")
 
     stop = StopRequest()
     rclpy.init(signal_handler_options=SignalHandlerOptions.NO)

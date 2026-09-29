@@ -89,6 +89,20 @@ class Ramp(Node):
         return self.position
 
 
+def ramp_setpoint(start, target, speed, elapsed):
+    """経過時間 elapsed [s] の (目標位置, 目標速度)。
+
+    start から target まで speed [rad/s] で目標を動かし、着いたら target で止める。
+    C++ の bxi_hardware::hil::RampTrajectory と同じ式。
+    """
+    dist = target - start
+    ramp_time = abs(dist) / speed
+    direction = math.copysign(1.0, dist)
+    if elapsed < ramp_time:
+        return start + direction * speed * elapsed, direction * speed
+    return target, 0.0
+
+
 def release(node):
     """その場の位置で Kp=Kd=0 の指令を5回送る（その場で力を抜く）。"""
     for _ in range(5):
@@ -109,6 +123,11 @@ def main():
     ap.add_argument("--max-torque", type=float, default=5.0, help="Kp×誤差 の上限 [N·m]")
     ap.add_argument("--release", action="store_true", help="終了時に Kp=0 にして力を抜く")
     args = ap.parse_args()
+    # nan や inf は比較が偽になるので、上限の検査（速度、トルクなど）をすり抜ける。最初に拒否する。
+    not_finite = [name for name, value in vars(args).items()
+                  if isinstance(value, float) and not math.isfinite(value)]
+    if not_finite:
+        raise SystemExit("有限でない値: " + "、".join("--" + name.replace("_", "-") for name in not_finite))
     if not 0.0 < args.kp <= args.max_kp:
         raise SystemExit(f"--kp は 0 より大きく {args.max_kp} 以下にする（--max-kp で変更）")
     if not 0.0 <= args.kd <= 5.0:
@@ -128,7 +147,6 @@ def main():
     dist = args.target - start
     print(f"今の位置 {start:+.4f} rad → 目標 {args.target:+.4f} rad（差 {dist:+.4f} rad、{math.degrees(dist):+.1f}°）")
     ramp_time = abs(dist) / args.speed
-    direction = math.copysign(1.0, dist)
     t0 = time.monotonic()
     last_print = -1.0
     aborted = None
@@ -137,14 +155,9 @@ def main():
             aborted = stop.reason
             break
         elapsed = time.monotonic() - t0
-        if elapsed < ramp_time:
-            p_des = start + direction * args.speed * elapsed
-            v_des = direction * args.speed
-        else:
-            p_des = args.target
-            v_des = 0.0
-            if elapsed >= ramp_time + args.hold:
-                break
+        p_des, v_des = ramp_setpoint(start, args.target, args.speed, elapsed)
+        if elapsed >= ramp_time and elapsed >= ramp_time + args.hold:
+            break
         rclpy.spin_once(node, timeout_sec=0.0)
         if time.monotonic() - node.stamp > 0.2:
             aborted = "/joint_states が 0.2 秒以上途切れた"

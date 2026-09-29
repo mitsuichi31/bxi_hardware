@@ -311,7 +311,7 @@ ros2 run bxi_hardware sine_command.py --amplitude 0.2 --frequency 1.0 --kp 30 --
 
 - 中心は実行時の位置。振幅は最初と最後の 1 周期（`--ramp-cycles`）で 0 からなめらかに増減する。
 - 実行前に止める条件: 中心 ± 振幅が `--lower` / `--upper`（既定 ±0.5 rad、`bxi_hardware.yaml` と合わせる）をはみ出す、
-  最大速度（振幅 × 2π × 周波数）が `--max-velocity`（既定 2 rad/s）を超える、`--center` が今の位置と違う。
+  目標速度の上界が `--max-velocity`（既定 2 rad/s）を超える（上界は 振幅 × 2π × 周波数 ＋ 振幅 × π /（2 × 立ち上げの時間）で、振幅を立ち上げ・立ち下げる間の包絡線の微分を含めた真の最大より小さくならない。2026-09-29 に Python 版・C++ 版とも修正。それまでは振幅 × 2π × 周波数だけを見ていて、立ち上げを短くすると、例えば振幅 0.1 rad・0.5 Hz・立ち上げ 0.000001 周期では立ち下げ中の目標速度が約 78,540 rad/s になっても通っていた）、`--center` が今の位置と違う。
 - 実行中に中止して力を抜く条件: `Kp × 誤差` が `--max-torque`（既定 5 N·m）を超える、`/joint_states` が 0.2 秒以上途切れる、Ctrl+C。
 - 目標・位置・速度・トルクを `/ws/log/sine_<日時>.csv` に保存し、振幅一定の区間の追従誤差、振幅比、位相の遅れを表示する。
 - 表示される位相の遅れには、ROS 内の遅れ（指令 → controller_manager → 状態 → `/joint_states`）が含まれる。
@@ -350,7 +350,7 @@ ros2 run bxi_hardware sine_command_cpp --amplitude 0.3 --frequency 0.2 --cycles 
   --kp 20 --kd 1 --rate 200 --release
 ```
 
-既定の中心は開始時の現在位置。目標位置・目標速度は Python 版と同じ立ち上げ／立ち下げ付きの SIN 波で、`/joint1_command/commands` に送る。`--friction-ff` などの摩擦補償オプション、位置・速度・トルクの上限も Python 版に合わせてある。`--help` で引数一覧を確認できる。
+既定の中心は開始時の現在位置。目標位置・目標速度は Python 版と同じ立ち上げ／立ち下げ付きの SIN 波で、計算は `bxi_hardware::hil::SineTrajectory`（`include/bxi_hardware/hil_trajectory.hpp`。Python 版と同じ値になることを `test/test_hil_trajectory.cpp` の表の試験で確かめている）、`/joint1_command/commands` に送る。`--friction-ff` などの摩擦補償オプション、位置・速度・トルクの上限も Python 版に合わせてある。`--help` で引数一覧を確認できる。
 
 送信予定は `steady_clock` の絶対時刻で 5 ms 間隔に置く。処理が遅れて次の予定を過ぎた場合は古い指令を連続送信せず、その周期を飛ばして現時刻の目標を送る。実行後に予定時刻を過ぎた周期数と最大遅れを表示する。実際の指令時刻・状態を `sine_cpp_<日時>.csv` に記録する。CSV の先頭 7 列は Python 版と同じで、末尾の `lateness_ms` は予定時刻からの遅れ。振幅一定区間の RMS 誤差、最大誤差、振幅比、位相遅れも表示する。
 

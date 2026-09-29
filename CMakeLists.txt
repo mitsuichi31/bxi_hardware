@@ -23,6 +23,7 @@ add_library(${PROJECT_NAME} SHARED
   src/bxi_actuator.cpp
   src/bus_streamer.cpp
   src/bxi_system_interface.cpp
+  src/hil_trajectory.cpp
 )
 target_include_directories(${PROJECT_NAME} PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -48,6 +49,7 @@ target_link_libraries(bxi_vcan_motor_emulator ${PROJECT_NAME})
 
 add_executable(sine_command_cpp hil/single_joint/sine_command.cpp)
 ament_target_dependencies(sine_command_cpp rclcpp sensor_msgs std_msgs)
+target_link_libraries(sine_command_cpp ${PROJECT_NAME})
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
@@ -80,6 +82,12 @@ if(BUILD_TESTING)
   ament_add_pytest_test(test_analyze_stream_timing test/test_analyze_stream_timing.py)
   ament_add_pytest_test(test_compare_stream_scheduling test/test_compare_stream_scheduling.py)
   ament_add_pytest_test(test_sine_trajectory test/test_sine_trajectory.py)
+  ament_add_pytest_test(test_trajectory_reference test/test_trajectory_reference.py)
+  ament_add_gtest(test_hil_trajectory test/test_hil_trajectory.cpp)
+  target_link_libraries(test_hil_trajectory ${PROJECT_NAME})
+  target_compile_definitions(test_hil_trajectory PRIVATE
+    BXI_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+  set_target_properties(test_hil_trajectory PROPERTIES BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}")
 endif()
 
 install(
