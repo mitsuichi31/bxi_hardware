@@ -124,6 +124,95 @@ vcan 上の値は、ホストのスケジューリングの比較であり、実
 
 同じ条件で `can_frame_format.can0` だけを変えた CAN FD / CAN FD+BRS の実測は、ワークスペース側の `docs/test-reports/2026-09-27-bxi-worker-can-fd.md` に記録した。CAN取引時間の中央値は、Classic 1.3082 ms、FD（BRSなし）1.3272 ms、FD+BRS 1.2572 ms。3モードとも worker の作業時間は5 ms以内だが、周期開始間隔は約5.1 msのままだった。既定の `bxi_hardware.yaml` は Classic CAN のままにしている。
 
+## 段階6 実機試験前の確認（送受信分離、1 kHz）
+
+`bxi_hardware_stream_1khz.yaml` と `controllers_1khz.yaml` で実機を動かす前に、毎回この節を確認し、その結果を試験のレポートに残す。前提と段階は、ワークスペース側の `docs/plans/20260928_bxi_worker_stream_broadcast_plan.md` の「HILの前提と段階」を参照。
+
+**決まっていること（2026-09-29）**
+
+- **独立電源遮断：** 試験者が、電源装置（OWON SPE6103）の出力スイッチでモーターの電源を切る。ソフトウェアの disable には頼らない。
+- **bus-off：** 自動で復帰させない。`docker/can_setup.sh` の既定は `restart-ms 0`。復帰は下記「bus-off からの復帰」の手順で行う。
+- **指令：** ベンダーの回答を待たずに、下記「0以外の指令の範囲」の中で、安全を確認しながら Kp・Kd・トルクが0でない指令の動作確認を進める（2026-09-29 に決定）。
+  - モーターは `can_timeout=0` で、通信が途絶えても最後の指令を保持する。ホストのプロセスが落ちると、最後の指令（目標位置と Kp・Kd・トルク）が残る。その場合は電源装置の出力を切って止める。
+  - `bxi_hardware_stream_1khz.yaml` の既定ゲインは 0 のままにする。位置だけの指令では力が出ないので、ゲインは指令スクリプトで明示する。
+
+**試験ごとに記録すること（直前に確認し、確認した時刻を書く）**
+
+| 項目 | 確認の内容 |
+|---|---|
+| 日時・試験者 | 誰が電源遮断を担当するか |
+| 電源遮断 | 出力スイッチにすぐ手が届く位置にいること。出力 ON を確認した時刻 |
+| モーター | 固定されていること。周囲に人や物がないこと |
+| CAN | `ip -details -statistics link show can0` で、`ERROR-ACTIVE`、TEC/REC 0/0、`restart-ms 0`。ほかに `can0` へ送信するプロセスがないこと |
+| 割り込みスレッド | `ps -eLo pid,tid,cls,rtprio,psr,comm \| grep irq/16` で、PCAN の割り込みスレッドの方式・優先度・CPU（`can0` を UP にした後） |
+| 版と設定 | ワークスペースと `src/bxi_hardware` のコミット、使う設定ファイル、送受信スレッドの優先度 |
+| 計測 | `BXI_WORKER_TIMING_DIR` の出力先。試験前後の CAN 統計を記録すること |
+
+**0以外の指令の範囲**
+
+2026-09-25 の HIL（classic・200 Hz・逐次）で使った値と、指令スクリプトの中止条件を上限にする。送受信分離・1 kHz ではまだ使っていないので、小さい値から段階的に上げる。
+
+| 項目 | 上限 | 根拠 |
+|---|---|---|
+| 指令の手段 | `ramp_command.py` / `sine_command.py` | 下記の中止条件が組み込まれている。トピックに直接指令を送らない |
+| 位置 | `bxi_hardware.yaml` の `lower` / `upper`（±0.5 rad）の内側 | ドライバとスクリプトの両方でクランプ・確認する |
+| Kp | 20（スクリプトの `--max-kp` の既定値）。30 までは `--max-kp` を明示して上げる | 2026-09-25 に Kp 30 まで実施 |
+| Kd | 2 | 2026-09-25 に Kd 1〜2 で実施 |
+| スクリプトが監視する式 | 5 N·m（`--max-torque` の既定値）。超えたらスクリプトが力を抜く。`ramp_command.py` は Kp × 位置の誤差の絶対値、`sine_command.py` はそれに上乗せトルクの絶対値を足した値を監視する。**どちらも Kd の項（速度の誤差）を含まないので、モーターが出す総トルクの上限ではない** | スクリプトの中止条件 |
+| 上乗せトルク（摩擦の打ち消し） | 1 N·m | 2026-09-25 に 0.9〜1.0 N·m で実施 |
+| 速度 | 2 rad/s（`sine_command.py` の `--max-velocity` の既定値） | スクリプトの中止条件 |
+| 電源 | 電源装置の電流制限 5 A のまま | 2026-09-25 の構成 |
+
+- 最初は `ramp_command.py 0.0 --kp 10 --kd 2`（今の位置付近での保持）から始め、`ramp_command.py 0.2`、`sine_command.py --amplitude 0.1 --frequency 0.5` の順に進める。
+- 終わるときは `--release` で力を抜く。
+- `/joint_states` が 0.2 秒以上途切れると、スクリプトが力を抜いて止まる。
+- 上限を超える値を使うときは、先に根拠と手順をこの節に追記する。
+
+**止めるとき**
+
+- **制御できていない動き**（想定外の動き、止まらない動き）や、**指令スクリプトの異常終了・ホストの異常**のときは、最後の指令が残っている可能性がある。**先に電源装置の出力を直ちに切り**、その後で launch を止める。
+- **動きが制御下にある異常**（異常な温度、CAN のエラー、`Overrun detected` の多発など）のときは、Ctrl+C で止める。disable の応答が確認できないときは、電源装置の出力を切る。
+- bus-off になったら、下記の手順で止めて復帰する。
+
+**bus-off からの復帰**
+
+`restart-ms 0` では、bus-off になると `can0` は自動では復帰しない。そのあいだは disable を含めてフレームを送れないので、モーター（`can_timeout=0`）は最後の指令を保持する。HWIF 側は送信に失敗して安全停止する想定だが、実機では確かめていない。
+
+1. **電源装置の出力を切る。** モーターを止める唯一の確実な手段である。
+2. HIL の launch を Ctrl+C で止める。
+3. 状態を記録する。bus-off の直後の値を残し、復帰で消える前に保存する。
+   ```bash
+   ip -details -statistics link show can0   # state BUS-OFF、TEC/REC、bus-off / bus-error の回数
+   sudo dmesg | grep -i -E "can0|peak" | tail -20
+   ```
+4. 原因を調べる。
+   - 両機器の電源を切った状態で、CAN_H–CAN_L 間の抵抗を測る（約 60 Ω が正常）。
+   - コネクタと配線を見る。
+   - `can0` へ送信しているほかのプロセスがないか確かめる。
+   - `can_setup.sh` のビットレートとサンプル点を確かめる。
+5. `can0` を設定し直して UP する。`can_setup.sh` は、いったん DOWN にしてから設定し直して UP する。これでコントローラの状態とエラーカウンタが初期化される想定だが、bus-off からの復帰では実機で確かめていない。復帰後の値を必ず確認し、`ERROR-ACTIVE`・TEC/REC 0/0 でなければ先に進まない。
+   ```bash
+   ./docker/can_setup.sh can0
+   ip -details -statistics link show can0   # ERROR-ACTIVE、TEC/REC 0/0、restart-ms 0 を確かめる
+   ```
+6. モーターの電源を入れ、何も送らずに 10 秒ほど見て、エラーが出ないことを確かめる。これで分かるのは、送信していない間にエラーが出ないことだけである。
+   ```bash
+   timeout 10 candump -e 'can0,0~0,#FFFFFFFF'   # エラーフレームだけを表示。何も出なければよい
+   ip -details -statistics link show can0     # カウンタが増えていないこと
+   ```
+7. 通信が成り立つことを、ゲイン0の低レート診断で確かめる。`bxi_probe` の `--menu-only` は enable を送らず、disable の応答を確かめてから、ゲイン0・トルク0の指令だけを送る。前後の CAN 統計を比べ、次を確かめる。
+   - 20回送って20回応答があること
+   - TX・RX が送受信した分だけ増えていること
+   - TEC/REC が 0 のままで、bus-error・bus-off・drop が増えていないこと
+   ```bash
+   ip -details -statistics link show can0
+   ros2 run bxi_hardware bxi_probe --iface can0 --can-id 1 --format fd --broadcast --menu-only \
+     --stream --count 20 --rate 50
+   ip -details -statistics link show can0
+   ```
+8. この節の「試験ごとに記録すること」からやり直す。再開後の最初の HIL は、ゲイン0の短時間から始める。
+9. 同じ日に2回目の bus-off が起きたら、その日の試験は中止し、原因が分かるまで再開しない。
+
 ## 1. 前提の確認（bxi_probe、モーターは力を出さない）
 
 ```bash
