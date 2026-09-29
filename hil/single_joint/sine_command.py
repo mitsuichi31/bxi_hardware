@@ -22,7 +22,8 @@ Fs を省略すると一定値 Fc の上乗せになる。実測の速度では�
 実行中に中止し、Kp=0 の指令（その場で力を抜く）を送って終わる:
   - Kp × |目標 − 位置| + |上乗せトルク| が --max-torque [N·m] を超えた
   - /joint_states が 0.2 秒以上届かない
-  - Ctrl+C
+  - Ctrl+C（SIGINT）または SIGTERM（終了時の表示の直前までに受ければ、主ループの後や --release の送信中でも
+    必ず力を抜いて [中止] を表示する。それより後に受けた合図は処理せず [終了後の合図] と表示する）
 正常に終わったときは中心位置で保持したまま終わる（--release を付けると力を抜く）。
 
 目標と実際の位置・速度・トルクを CSV に保存し、終了後に追従の結果（誤差、振幅比、位相の遅れ）を表示する。
@@ -39,13 +40,48 @@ import csv
 import datetime as dt
 import math
 import pathlib
+import signal
 import time
 
 import numpy as np
 import rclpy
 from rclpy.node import Node
+from rclpy.signals import SignalHandlerOptions
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64MultiArray
+
+
+class StopRequest:
+    """Ctrl+C（SIGINT）と SIGTERM を受けたことを覚えるだけのハンドラ。
+
+    例外は投げない。KeyboardInterrupt だと、主ループの後の spin_once や Kp=Kd=0 の送信の途中で
+    Ctrl+C を受けたときに、送信を飛ばして終わってしまうため。rclpy の SIGINT ハンドラは使わない
+    （Ctrl+C でコンテキストを閉じ、その後の spin と publish が RCLError になるため）。
+
+    保証の範囲：close()（終了時の表示の直前）までに受けた合図は、必ず中止として扱い、Kp=Kd=0 を送って
+    [中止] を表示してから終わる。close() より後に受けた合図は処理せず late に残し、読めれば
+    [終了後の合図] を表示する。その場合は呼び出し側（hil_stage3_container.sh）が NG として launch を止め、
+    disable する。
+    """
+
+    def __init__(self):
+        self.reason = None
+        self.late = None
+        self.closed = False
+        signal.signal(signal.SIGINT, self._on_signal)
+        signal.signal(signal.SIGTERM, self._on_signal)
+
+    def _on_signal(self, signum, frame):
+        name = "Ctrl+C" if signum == signal.SIGINT else "SIGTERM"
+        if self.closed:
+            self.late = self.late or name
+        elif self.reason is None:
+            self.reason = name
+
+    def close(self):
+        """合図の受付を締め切り、それまでに受けた合図を返す。"""
+        self.closed = True
+        return self.reason
 
 
 class Sine(Node):
@@ -160,6 +196,13 @@ def summarize(rows, traj):
               f"軸の最大速度 {peak:.2f} rad/s（目標の最大 {traj.amplitude * traj.omega:.2f} rad/s）")
 
 
+def release(node):
+    """その場の位置で Kp=Kd=0 の指令を5回送る（その場で力を抜く）。"""
+    for _ in range(5):
+        node.send(node.position, 0.0, 0.0, 0.0)
+        time.sleep(0.02)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--joint", default="joint1")
@@ -217,7 +260,8 @@ def main():
     if peak_velocity > args.max_velocity:
         raise SystemExit(f"最大速度 {peak_velocity:.2f} rad/s が --max-velocity {args.max_velocity} を超える")
 
-    rclpy.init()
+    stop = StopRequest()
+    rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
     node = Sine(args.joint)
     start = node.wait_state(2.0)
     if start is None:
@@ -254,39 +298,39 @@ def main():
     next_tick = t0
     last_print = -1.0
     aborted = None
-    try:
-        while True:
-            elapsed = time.monotonic() - t0
-            if elapsed > traj.duration + args.hold:
-                break
-            rclpy.spin_once(node, timeout_sec=0.0)
-            if time.monotonic() - node.stamp > 0.2:
-                aborted = "/joint_states が 0.2 秒以上途切れた"
-                break
-            p_des, v_des = traj.at(elapsed)
-            ff = friction_torque(v_des, args.friction_ff, args.friction_velocity,
-                                 args.friction_static, args.stribeck_velocity)
-            est = args.kp * abs(p_des - node.position) + abs(ff)
-            if est > args.max_torque:
-                aborted = f"位置の誤差が大きい（Kp×誤差 + 上乗せ = {est:.2f} N·m > {args.max_torque}）"
-                break
-            node.send(p_des, v_des, args.kp, args.kd, ff)
-            rows.append({"t": elapsed, "target": p_des, "target_velocity": v_des, "friction_ff": ff,
-                         "position": node.position, "velocity": node.velocity, "effort": node.effort})
-            if elapsed - last_print >= 0.5:
-                print(f"  t={elapsed:5.2f}s  目標 {p_des:+.4f}  位置 {node.position:+.4f}  "
-                      f"誤差 {node.position - p_des:+.4f}  トルク {node.effort:+.2f}")
-                last_print = elapsed
-            next_tick += period
-            time.sleep(max(0.0, next_tick - time.monotonic()))
-    except KeyboardInterrupt:
-        aborted = "Ctrl+C"
+    while True:
+        if stop.reason:
+            aborted = stop.reason
+            break
+        elapsed = time.monotonic() - t0
+        if elapsed > traj.duration + args.hold:
+            break
+        rclpy.spin_once(node, timeout_sec=0.0)
+        if time.monotonic() - node.stamp > 0.2:
+            aborted = "/joint_states が 0.2 秒以上途切れた"
+            break
+        p_des, v_des = traj.at(elapsed)
+        ff = friction_torque(v_des, args.friction_ff, args.friction_velocity,
+                             args.friction_static, args.stribeck_velocity)
+        est = args.kp * abs(p_des - node.position) + abs(ff)
+        if est > args.max_torque:
+            aborted = f"位置の誤差が大きい（Kp×誤差 + 上乗せ = {est:.2f} N·m > {args.max_torque}）"
+            break
+        node.send(p_des, v_des, args.kp, args.kd, ff)
+        rows.append({"t": elapsed, "target": p_des, "target_velocity": v_des, "friction_ff": ff,
+                     "position": node.position, "velocity": node.velocity, "effort": node.effort})
+        if elapsed - last_print >= 0.5:
+            print(f"  t={elapsed:5.2f}s  目標 {p_des:+.4f}  位置 {node.position:+.4f}  "
+                  f"誤差 {node.position - p_des:+.4f}  トルク {node.effort:+.2f}")
+            last_print = elapsed
+        next_tick += period
+        time.sleep(max(0.0, next_tick - time.monotonic()))
 
     rclpy.spin_once(node, timeout_sec=0.05)
-    if aborted or args.release:
-        for _ in range(5):
-            node.send(node.position, 0.0, 0.0, 0.0)
-            time.sleep(0.02)
+    released = False
+    if aborted or stop.reason or args.release:
+        release(node)
+        released = True
 
     try:
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -297,13 +341,23 @@ def main():
         print(f"\n記録: {log_path}（{len(rows)} 行）")
     except OSError as e:
         print(f"\n[注意] CSV を保存できない: {e}")
+    if not (aborted or stop.reason):
+        summarize(rows, traj)
 
+    # 合図の受付をここで締め切る。ここまでに受けた合図（CSV の保存や結果の表示の途中を含む）は
+    # 中止として扱い、まだなら Kp=Kd=0 を送る。
+    received = stop.close()
+    if received and not aborted:
+        aborted = received
+    if aborted and not released:
+        release(node)
+        released = True
     if aborted:
         print(f"[中止] {aborted}。Kp=Kd=0 を送って力を抜いた")
-    else:
-        summarize(rows, traj)
     print(f"終了時: 位置 {node.position:+.4f} rad"
-          + ("、力を抜いた" if (aborted or args.release) else "、中心位置で保持中"))
+          + ("、力を抜いた" if released else "、中心位置で保持中"))
+    if stop.late:   # 締め切り後に受けた合図は処理しない（呼び出し側が launch を止めて disable する）
+        print(f"\n[終了後の合図] {stop.late} を終了処理の最後に受けた。Kp=Kd=0 は送っていない")
     node.destroy_node()
     rclpy.shutdown()
 

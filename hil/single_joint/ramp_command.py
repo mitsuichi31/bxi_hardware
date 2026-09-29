@@ -8,7 +8,8 @@ velocity には目標位置の動く速さ（到達後は 0）を送る。effort
 次のときは中止し、Kp=0 の指令（その場で力を抜く）を送って終わる:
   - Kp × |目標 − 位置| が --max-torque [N·m] を超えた
   - /joint_states が 0.2 秒以上届かない
-  - Ctrl+C
+  - Ctrl+C（SIGINT）または SIGTERM（終了時の表示の直前までに受ければ、主ループの後や --release の送信中でも
+    必ず力を抜いて [中止] を表示する。それより後に受けた合図は処理せず [終了後の合図] と表示する）
 正常に終わったときは、目標位置で保持したまま終わる（--release を付けると力を抜く）。
 
 例:
@@ -18,12 +19,47 @@ velocity には目標位置の動く速さ（到達後は 0）を送る。effort
 
 import argparse
 import math
+import signal
 import time
 
 import rclpy
 from rclpy.node import Node
+from rclpy.signals import SignalHandlerOptions
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64MultiArray
+
+
+class StopRequest:
+    """Ctrl+C（SIGINT）と SIGTERM を受けたことを覚えるだけのハンドラ。
+
+    例外は投げない。KeyboardInterrupt だと、主ループの後の spin_once や Kp=Kd=0 の送信の途中で
+    Ctrl+C を受けたときに、送信を飛ばして終わってしまうため。rclpy の SIGINT ハンドラは使わない
+    （Ctrl+C でコンテキストを閉じ、その後の spin と publish が RCLError になるため）。
+
+    保証の範囲：close()（終了時の表示の直前）までに受けた合図は、必ず中止として扱い、Kp=Kd=0 を送って
+    [中止] を表示してから終わる。close() より後に受けた合図は処理せず late に残し、読めれば
+    [終了後の合図] を表示する。その場合は呼び出し側（hil_stage3_container.sh）が NG として launch を止め、
+    disable する。
+    """
+
+    def __init__(self):
+        self.reason = None
+        self.late = None
+        self.closed = False
+        signal.signal(signal.SIGINT, self._on_signal)
+        signal.signal(signal.SIGTERM, self._on_signal)
+
+    def _on_signal(self, signum, frame):
+        name = "Ctrl+C" if signum == signal.SIGINT else "SIGTERM"
+        if self.closed:
+            self.late = self.late or name
+        elif self.reason is None:
+            self.reason = name
+
+    def close(self):
+        """合図の受付を締め切り、それまでに受けた合図を返す。"""
+        self.closed = True
+        return self.reason
 
 
 class Ramp(Node):
@@ -53,6 +89,13 @@ class Ramp(Node):
         return self.position
 
 
+def release(node):
+    """その場の位置で Kp=Kd=0 の指令を5回送る（その場で力を抜く）。"""
+    for _ in range(5):
+        node.send(node.position, 0.0, 0.0, 0.0)
+        time.sleep(0.02)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("target", type=float, help="目標位置 [rad]")
@@ -73,7 +116,8 @@ def main():
     if not 0.0 < args.speed <= 2.0:
         raise SystemExit("--speed は 0〜2 rad/s にする")
 
-    rclpy.init()
+    stop = StopRequest()
+    rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
     node = Ramp(args)
     start = node.wait_state(2.0)
     if start is None:
@@ -88,43 +132,52 @@ def main():
     t0 = time.monotonic()
     last_print = -1.0
     aborted = None
-    try:
-        while True:
-            elapsed = time.monotonic() - t0
-            if elapsed < ramp_time:
-                p_des = start + direction * args.speed * elapsed
-                v_des = direction * args.speed
-            else:
-                p_des = args.target
-                v_des = 0.0
-                if elapsed >= ramp_time + args.hold:
-                    break
-            rclpy.spin_once(node, timeout_sec=0.0)
-            if time.monotonic() - node.stamp > 0.2:
-                aborted = "/joint_states が 0.2 秒以上途切れた"
+    while True:
+        if stop.reason:
+            aborted = stop.reason
+            break
+        elapsed = time.monotonic() - t0
+        if elapsed < ramp_time:
+            p_des = start + direction * args.speed * elapsed
+            v_des = direction * args.speed
+        else:
+            p_des = args.target
+            v_des = 0.0
+            if elapsed >= ramp_time + args.hold:
                 break
-            est = args.kp * abs(p_des - node.position)
-            if est > args.max_torque:
-                aborted = f"位置の誤差が大きい（Kp×誤差 = {est:.2f} N·m > {args.max_torque}）"
-                break
-            node.send(p_des, v_des, args.kp, args.kd)
-            if elapsed - last_print >= 0.2:
-                print(f"  t={elapsed:5.2f}s  目標 {p_des:+.4f}  位置 {node.position:+.4f}")
-                last_print = elapsed
-            time.sleep(1.0 / args.rate)
-    except KeyboardInterrupt:
-        aborted = "Ctrl+C"
+        rclpy.spin_once(node, timeout_sec=0.0)
+        if time.monotonic() - node.stamp > 0.2:
+            aborted = "/joint_states が 0.2 秒以上途切れた"
+            break
+        est = args.kp * abs(p_des - node.position)
+        if est > args.max_torque:
+            aborted = f"位置の誤差が大きい（Kp×誤差 = {est:.2f} N·m > {args.max_torque}）"
+            break
+        node.send(p_des, v_des, args.kp, args.kd)
+        if elapsed - last_print >= 0.2:
+            print(f"  t={elapsed:5.2f}s  目標 {p_des:+.4f}  位置 {node.position:+.4f}")
+            last_print = elapsed
+        time.sleep(1.0 / args.rate)
 
     rclpy.spin_once(node, timeout_sec=0.05)
-    if aborted or args.release:
-        for _ in range(5):
-            node.send(node.position, 0.0, 0.0, 0.0)
-            time.sleep(0.02)
+    released = False
+    if aborted or stop.reason or args.release:
+        release(node)
+        released = True
+    # 合図の受付をここで締め切る。ここまでに受けた合図は中止として扱い、まだなら Kp=Kd=0 を送る。
+    received = stop.close()
+    if received and not aborted:
+        aborted = received
+    if aborted and not released:
+        release(node)
+        released = True
     if aborted:
         print(f"\n[中止] {aborted}。Kp=Kd=0 を送って力を抜いた")
     err = node.position - args.target
     print(f"終了時: 位置 {node.position:+.4f} rad（目標との差 {err:+.4f} rad、{math.degrees(err):+.2f}°）"
-          + ("、力を抜いた" if (aborted or args.release) else "、目標位置で保持中"))
+          + ("、力を抜いた" if released else "、目標位置で保持中"))
+    if stop.late:   # 締め切り後に受けた合図は処理しない（呼び出し側が launch を止めて disable する）
+        print(f"\n[終了後の合図] {stop.late} を終了処理の最後に受けた。Kp=Kd=0 は送っていない")
     node.destroy_node()
     rclpy.shutdown()
 
