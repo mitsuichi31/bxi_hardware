@@ -367,11 +367,21 @@ ramp と SIN 波の目標を、トピック経由のスクリプトではなく�
 - `~/status`（`bxi_hardware/msg/HilTrajectoryStatus`、約 50 Hz）：状態、適用した要求番号と停止の数、終わりの理由、経過時間、目標と位置、記録の状態と CSV のパス。受け付けと適用の区別はここで確かめる。
 - 中止の条件（その周期のうちに位置 = 現在位置、速度 0、Kp = Kd = 0、トルク 0 を書く）：Kp × |目標 − 位置| + |上乗せ| > `max_torque`、|目標速度| > `max_velocity`、位置・速度・トルクのどれかが有限でない、周期（単調時計の `period`）が 0 以下・`max_period` 超、リースの途切れ、開始の周期での範囲外（SIN 波の中心 ± 振幅）と実行時間の超過。
 - command への書き込みが1つでも失敗したら（`set_value()` がロックを取れない）、実行中・保持中はその周期のうちに中止（`write failed`）して、力を抜く値を書き直す。`write_failures` は書き込みに失敗した周期を1周期1回だけ数え、同じ周期の脱力値の書き込みが成功しても CSV の `write_ok` は 0 にする。脱力値の書き込みは毎周期試みる。今回の実行で一度も5項目をすべて書けていない間は、`~/status` の `release_write_pending` を true にする。成功するまで記録を完了せず、次の開始も受け付けない。
-- `release_write_pending` が続く間は、controller だけでは脱力を保証できない。HIL の指令コマンドとランナーは `write_failures` の増加を異常として扱い、launch を止めて HWIF の disable 応答を確認する。disable を確認できなければ電源装置の出力を切る。この監視は手順3で指令コマンドとランナーに実装する。
+- `release_write_pending` が続く間は、controller だけでは脱力を保証できない。`hil_trajectory.py` は `write_failures` の増加を検出すると `[中止]` と終了コード1で終わる。段階3R・4Rのランナーは、これを NG として launch を止め、HWIF の disable 応答を確認する必要がある。disable を確認できなければ電源装置の出力を切る。ランナーへの組み込みは計画の手順4で行う。
 - `~/start` と `~/finish` の受け付けの判断は、`update()` が毎周期必ず書く atomic の状態で行う（`~/status` の写しは try_lock なので古いことがある）。開始要求を取り出した周期から、記録を書き出し終えるまでは次の開始を受け付けない。
 - 経過時間は `period` の積算で数える（`update()` の `time` は ROS の時計で飛ぶことがあるので使わない）。
 - 毎周期の記録：開始要求を適用した周期から、力を抜いた周期の `record_tail` 後まで、あらかじめ確保した領域に書き、RT ではないタイマーが CSV（`hil_trajectory_<要求番号>_<時刻>.csv`）に書き出す。書き出すまで次の開始は受け付けない。書き出しに失敗したら記録を残したまま1秒ごとに再試行し（`~/status` の記録の状態は「失敗」）、その間も次の開始は受け付けない。CSV の最後の列 `write_ok` は、その周期の書き込みがすべて通ったか（1 / 0）。満杯になったら欠落した周期を数える（制御は続ける）。
 - `update()` はメモリを確保せず（単体試験で確かめている）、止まる可能性のあるロックを取らない（try_lock と atomic だけ）。
+
+`hil_trajectory.py` は手順3の指令コマンドで、controller に開始を要求して要求番号付き keepalive を20 Hzで送り、正常終了・CSV 保存まで確認する。SIN 波では保存した controller CSV の振幅一定区間から追従誤差、振幅比、位相遅れ、停止時間を集計する。`~/start` の応答なし、`~/finish` / `~/stop` の異常、心拍切れ、書き込み失敗、Ctrl+C は終了コード1と `[中止]` で区別する。引数の例（controller を別途起動した vcan 用）:
+
+```bash
+ros2 run bxi_hardware hil_trajectory.py --kp 10 --kd 2 --hold 1 hold
+ros2 run bxi_hardware hil_trajectory.py --kp 10 --kd 2 --speed 0.3 --release ramp 0.2
+ros2 run bxi_hardware hil_trajectory.py --kp 20 --kd 1 --amplitude 0.1 --frequency 0.5 --release sine
+```
+
+実機では、ランナーが異常終了を受けて disable を確認する経路を接続し、vcan で検証してから使う。指令コマンド単体の正常終了はモーターの disable を示さない。
 
 ### SIN 波の結果（2026-09-25、Kp 20 / Kd 1、classic 200 Hz）
 

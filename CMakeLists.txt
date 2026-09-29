@@ -114,6 +114,7 @@ if(BUILD_TESTING)
   ament_add_pytest_test(test_compare_stream_scheduling test/test_compare_stream_scheduling.py)
   ament_add_pytest_test(test_sine_trajectory test/test_sine_trajectory.py)
   ament_add_pytest_test(test_trajectory_reference test/test_trajectory_reference.py)
+  ament_add_pytest_test(test_hil_trajectory_command test/test_hil_trajectory_command.py TIMEOUT 45)
   ament_add_gtest(test_hil_trajectory_controller test/test_hil_trajectory_controller.cpp)
   target_link_libraries(test_hil_trajectory_controller bxi_hil_controllers)
   set_target_properties(test_hil_trajectory_controller PROPERTIES BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}")
@@ -136,6 +137,7 @@ install(DIRECTORY hil/ DESTINATION share/${PROJECT_NAME}/hil
 install(FILES hil/single_joint/single_joint_hil.launch.py
   DESTINATION share/${PROJECT_NAME}/hil/single_joint)
 install(PROGRAMS hil/single_joint/ramp_command.py hil/single_joint/sine_command.py
+  hil/single_joint/hil_trajectory.py
   DESTINATION lib/${PROJECT_NAME})
 install(TARGETS bxi_probe bxi_vcan_motor_emulator sine_command_cpp
   DESTINATION lib/${PROJECT_NAME})
