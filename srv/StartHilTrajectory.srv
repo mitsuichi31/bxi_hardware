@@ -1,0 +1,25 @@
+# HilTrajectoryController の ~/start。受け付けたかどうかと要求番号を返す。
+# RT 側が実際に開始したかどうかは ~/status で確かめる（受け付けと適用は別）。
+uint8 HOLD=0
+uint8 RAMP=1
+uint8 SINE=2
+uint8 kind
+float64 target             # RAMP：目標位置 [rad]
+float64 speed              # RAMP：速さ [rad/s]
+float64 amplitude          # SINE：振幅 [rad]（中心は開始の周期の現在位置）
+float64 frequency          # SINE：周波数 [Hz]
+float64 cycles             # SINE：振幅一定の周期数
+float64 ramp_cycles        # SINE：立ち上げ・立ち下げの周期数
+float64 friction_kinetic   # SINE：動摩擦の打ち消し [N·m]
+float64 friction_static    # SINE：静止摩擦の打ち消し [N·m]（負の値：動摩擦と同じ）
+float64 friction_velocity  # SINE：向きの切り替え幅 [rad/s]
+float64 stribeck_velocity  # SINE：Stribeck の速さ [rad/s]
+float64 kp
+float64 kd
+float64 hold               # 軌道の後に保持する時間 [s]
+bool release               # true：保持の後に Kp=Kd=0 にする
+float64 lease              # keepalive が途切れてから力を抜くまでの時間 [s]
+---
+bool accepted
+uint32 request_id
+string message

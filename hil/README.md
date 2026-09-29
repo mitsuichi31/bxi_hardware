@@ -356,6 +356,23 @@ ros2 run bxi_hardware sine_command_cpp --amplitude 0.3 --frequency 0.2 --cycles 
 
 状態が 0.2 秒以上届かない、指令の上限を超える、Ctrl+C の場合は Kp=Kd=0 の指令を 5 回送って終了する。通常終了時は中心位置を保持し、`--release` を指定すると力を抜く。C++ と `sleep_until` だけでハードリアルタイムになるわけではない。ROS 2 の配送、controller_manager と CAN の周期も独立しているため、CSV の時刻は CAN バス上の送信時刻を表さない。最初は可動範囲と荷重を確認して小振幅から実行する。
 
+### RT 軌道 controller（`bxi_hardware/HilTrajectoryController`、HIL ではまだ使っていない）
+
+ramp と SIN 波の目標を、トピック経由のスクリプトではなく、controller_manager の `update()`（1 kHz）の中で毎周期計算する controller。計画はワークスペース側の `docs/plans/20260929_bxi_rt_trajectory_controller_plan.md`（手順2）。段階3R・4R（計画の手順5）で使う予定で、今の HIL の設定（`controllers_1khz.yaml`）にはまだ入れていない。
+
+- 使うインターフェース：command は `<joint>/position`・`velocity`・`kp`・`kd`・`effort`、state は `<joint>/position`・`velocity`・`effort`（`joint1_command` と同じ command を使うので、同時には有効にできない）。
+- パラメータ：`joint`（既定 `joint1`）、`lower` / `upper`（±0.5 rad）、`max_kp`（20、30 まで）、`max_torque`（5 N·m）、`max_velocity`（2 rad/s）、`max_period`（5 ms）、`arm_timeout`（1 秒）、`record_tail`（0.5 秒）、`record_seconds`（120 秒）、`max_run_seconds`（60 秒）、`output_dir`（空なら環境変数 `BXI_WORKER_TIMING_DIR`）。
+- サービス：`~/start`（`bxi_hardware/srv/StartHilTrajectory`。種類 hold / ramp / sine と数値。受け付けたかと要求番号を返す）、`~/finish`（保持中だけ。正常終了）、`~/stop`（いつでも。停止を優先）。
+- `~/keepalive`（`std_msgs/UInt32`、要求番号）：適用した要求と同じ番号で、受け付けの後に届いたものだけを数える。最初の1件で軌道を始め（それまでは力を抜いたまま）、1秒来なければ動かずに中止する。実行中と保持中は、最後の keepalive からリースの時間を超えると中止して力を抜く。
+- `~/status`（`bxi_hardware/msg/HilTrajectoryStatus`、約 50 Hz）：状態、適用した要求番号と停止の数、終わりの理由、経過時間、目標と位置、記録の状態と CSV のパス。受け付けと適用の区別はここで確かめる。
+- 中止の条件（その周期のうちに位置 = 現在位置、速度 0、Kp = Kd = 0、トルク 0 を書く）：Kp × |目標 − 位置| + |上乗せ| > `max_torque`、|目標速度| > `max_velocity`、位置・速度・トルクのどれかが有限でない、周期（単調時計の `period`）が 0 以下・`max_period` 超、リースの途切れ、開始の周期での範囲外（SIN 波の中心 ± 振幅）と実行時間の超過。
+- command への書き込みが1つでも失敗したら（`set_value()` がロックを取れない）、実行中・保持中はその周期のうちに中止（`write failed`）して、力を抜く値を書き直す。`write_failures` は書き込みに失敗した周期を1周期1回だけ数え、同じ周期の脱力値の書き込みが成功しても CSV の `write_ok` は 0 にする。脱力値の書き込みは毎周期試みる。今回の実行で一度も5項目をすべて書けていない間は、`~/status` の `release_write_pending` を true にする。成功するまで記録を完了せず、次の開始も受け付けない。
+- `release_write_pending` が続く間は、controller だけでは脱力を保証できない。HIL の指令コマンドとランナーは `write_failures` の増加を異常として扱い、launch を止めて HWIF の disable 応答を確認する。disable を確認できなければ電源装置の出力を切る。この監視は手順3で指令コマンドとランナーに実装する。
+- `~/start` と `~/finish` の受け付けの判断は、`update()` が毎周期必ず書く atomic の状態で行う（`~/status` の写しは try_lock なので古いことがある）。開始要求を取り出した周期から、記録を書き出し終えるまでは次の開始を受け付けない。
+- 経過時間は `period` の積算で数える（`update()` の `time` は ROS の時計で飛ぶことがあるので使わない）。
+- 毎周期の記録：開始要求を適用した周期から、力を抜いた周期の `record_tail` 後まで、あらかじめ確保した領域に書き、RT ではないタイマーが CSV（`hil_trajectory_<要求番号>_<時刻>.csv`）に書き出す。書き出すまで次の開始は受け付けない。書き出しに失敗したら記録を残したまま1秒ごとに再試行し（`~/status` の記録の状態は「失敗」）、その間も次の開始は受け付けない。CSV の最後の列 `write_ok` は、その周期の書き込みがすべて通ったか（1 / 0）。満杯になったら欠落した周期を数える（制御は続ける）。
+- `update()` はメモリを確保せず（単体試験で確かめている）、止まる可能性のあるロックを取らない（try_lock と atomic だけ）。
+
 ### SIN 波の結果（2026-09-25、Kp 20 / Kd 1、classic 200 Hz）
 
 | 条件 | 摩擦の打ち消し | 誤差 RMS / 最大 [rad] | 振幅比 | 位相の遅れ | 止まっている時間 |
