@@ -95,6 +95,8 @@ To change a value, type 'prefix' = 'value''ENTER'
 
 （実際には `[0]`〜`[559]` のすべての項目が出る。全体はワークスペースの `log/bxi_motor_info_20260930.txt`。キャリブレーションやゼロ点の設定の後は `encoder_offset`・`usr_enc*_offset` などが変わる。）
 
+**モーターを1台ずつ検査して記録を残すとき**は、[`scripts/inspect_bxi_motor.py`](../../../scripts/inspect_bxi_motor.py) を使う。電源を入れたときの起動ログから `s`・`p` の出力までを、`log/bxi_motor_inspection/<日付>/<識別ID>_<時刻>.txt` に残す（使い方は [`scripts/README.md`](../../../scripts/README.md)）。
+
 **送り方：[`scripts/show_bxi_motor_info.py`](../../../scripts/show_bxi_motor_info.py)**（ホストで、launch が動いていない MENU の状態で）
 
 ```bash
