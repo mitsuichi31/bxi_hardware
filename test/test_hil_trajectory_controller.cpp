@@ -862,6 +862,26 @@ TEST_F(HilTrajectoryControllerTest, FailedCsvWriteKeepsTheRecordAndRefusesTheNex
   EXPECT_TRUE(controller_->requestStart(ramp()).accepted);
 }
 
+TEST_F(HilTrajectoryControllerTest, RecordEndedByDeactivationIsWrittenOnDestruction)
+{
+  // The HIL runner stops the launch at once on an NG: the run ends by deactivation and the status
+  // timer does not run again. The record must still reach a CSV.
+  startAndArm(ramp());
+  steps(20);
+  ASSERT_EQ(controller_->on_deactivate(rclcpp_lifecycle::State()),
+    controller_interface::CallbackReturn::SUCCESS);
+  controller_.reset();
+  std::vector<std::filesystem::path> files;
+  for (const auto & entry : std::filesystem::directory_iterator(out_dir_)) {
+    files.push_back(entry.path());
+  }
+  ASSERT_EQ(files.size(), 1U);
+  std::ifstream file(files[0]);
+  std::string metadata;
+  std::getline(file, metadata);
+  EXPECT_NE(metadata.find("end_reason=deactivated"), std::string::npos) << metadata;
+}
+
 class NoOutputDir : public HilTrajectoryControllerTest
 {
 public:

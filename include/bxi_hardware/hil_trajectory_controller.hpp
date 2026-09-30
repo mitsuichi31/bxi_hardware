@@ -120,6 +120,9 @@ public:
     uint8_t write_ok = 1;       // every command interface took the value this cycle
   };
 
+  // Writes a record completed by the last deactivation (see the .cpp).
+  ~HilTrajectoryController() override;
+
   controller_interface::CallbackReturn on_init() override;
   controller_interface::InterfaceConfiguration command_interface_configuration() const override;
   controller_interface::InterfaceConfiguration state_interface_configuration() const override;

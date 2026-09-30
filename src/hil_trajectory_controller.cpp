@@ -84,6 +84,18 @@ const char * HilTrajectoryController::endReasonName(EndReason reason)
   return "unknown";
 }
 
+HilTrajectoryController::~HilTrajectoryController()
+{
+  // When the launch is stopped during or right after a run (as the HIL runner does on an NG), the
+  // deactivation completes the record but the status timer never runs again. controller_manager
+  // destroys the controllers only after it has shut the hardware down, so writing the file here
+  // does not delay the HWIF's disable (on_deactivate() and on_shutdown() run before it).
+  try {
+    writeCompletedRecord();
+  } catch (...) {
+  }
+}
+
 controller_interface::CallbackReturn HilTrajectoryController::on_init()
 {
   auto_declare<std::string>("joint", "joint1");
