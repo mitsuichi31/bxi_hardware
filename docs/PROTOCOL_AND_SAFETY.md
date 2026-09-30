@@ -12,7 +12,7 @@
 
 ## 実機で確認した事項（2026-09-25）
 
-PCAN-M.2 の `can0` から SocketCAN で BXI7010-19 を 1 台確認した。ファームウェアは code 0.2.2 / config 0.2、`can_id` は 1、`master_id` は 0x11。bxi_usb2can は使用していない。詳細は `minibexkai_docs/research/20260925_bxi_motor_pcan_socketcan_verification.md` を参照。
+PCAN-M.2 の `can0` から SocketCAN で BXI7010-19 を 1 台確認した（このモーターは、この確認の後、2026-09-27 までに交換した。交換後のモーターも HW の表示・ファームウェアの版・ID・`can_timeout`・MIT の範囲は同じ。[`MOTOR_CONFIG_AND_STATUS.md`](MOTOR_CONFIG_AND_STATUS.md)）。ファームウェアは code 0.2.2 / config 0.2、`can_id` は 1、`master_id` は 0x11。bxi_usb2can は使用していない。詳細は `minibexkai_docs/research/20260925_bxi_motor_pcan_socketcan_verification.md` を参照。
 
 - `can_id` が 1 のとき、応答 ID は 0x011、応答の先頭バイトは `master_id` ではなく `can_id` の 0x01 だった。この観測だけでは、応答 ID の計算がビット OR か加算かは区別できない。
 - MIT 指令 1 回につき応答 1 回を確認した（Classic CAN の 50 Hz では 150 回中 148 回、FD+BRS では 1000 回中 1000 回）。
@@ -44,7 +44,7 @@ ID 16 以上の応答動作を実機で確認するまで、設定、アクチ�
 
 `defaults.temperature_sensor_fault_below_c`（デフォルト -20 ℃）を下回る値は、NTC の断線または故障として扱う。そのセンサーを報告温度から除外し、故障への遷移時に警告を 1 回記録する。残るセンサーの値で 80 ℃ の過熱停止を判定し続ける。
 
-両センサーが故障すると、報告温度は NaN になる。起動中なら有効化を失敗としてロールバックし、運転中なら全バスの制御を止めて全モーターの disable を試みる。NTC2 が約 -29 ℃ を示す HIL モーターについては、BXI に調査を依頼している間も、単一センサー故障だけでは停止しない。
+両センサーが故障すると、報告温度は NaN になる。起動中なら有効化を失敗としてロールバックし、運転中なら全バスの制御を止めて全モーターの disable を試みる。片方のセンサーの故障だけでは停止しない。交換前の HIL モーター（2026-09-25 まで）は NTC2 が約 -29 ℃ を示し、この扱いで運転した。今のモーター（2026-09-27 から）は NTC1・NTC2 とも正常な値を示す。
 
 ## CAN フレーム形式
 

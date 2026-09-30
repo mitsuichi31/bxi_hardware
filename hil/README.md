@@ -393,7 +393,7 @@ vcan での確かめ方（開発コンテナの中、vcan0 を mtu 72 で作っ�
 - `python3 /ws/tools/verify_rt_trajectory_vcan.py --scenario <名前>`：launch・模擬モーター・`candump` を起動し、指令コマンドを動かして判定する。`normal`・`sequence` のほか、停止と故障の経路（`sigint`・`heartbeat`・`kill9`・`kill_holding`・`start_lost`・`start_delay`・`stop_delay`・`stall`・`stop_all_blocked`）。故障の経路は、上記の `test_fault.*` と、試験専用の `bxi_hardware/HilUpdateStallController`（別ライブラリ `bxi_hil_test_controllers`。`~/stall` の後の `update()` で `stall_ms` だけ止まり、controller_manager の更新の停止を再現する。`BXI_ALLOW_TEST_FAULTS=1` がないと設定でエラー）を使う。
 - `python3 /ws/tools/verify_hil_runner_vcan.py --stage stage3r|stage4r [--scenario normal|motion_no|disconnect|kill_command]`：ランナーのコンテナ側を、ホスト側の代わりをしながら動かす。ランナーには `BXI_HIL_VCAN_IFACE=vcan0` を渡し、CAN 設定の can0 を vcan に差し替えさせる（ホスト側の入口は設定しない）。
 
-### SIN 波の結果（2026-09-25、Kp 20 / Kd 1、classic 200 Hz）
+### SIN 波の結果（2026-09-25、交換前のモーター、Kp 20 / Kd 1、classic 200 Hz）
 
 | 条件 | 摩擦の打ち消し | 誤差 RMS / 最大 [rad] | 振幅比 | 位相の遅れ | 止まっている時間 |
 |---|---|---|---|---|---|
@@ -427,7 +427,7 @@ vcan での確かめ方（開発コンテナの中、vcan0 を mtu 72 で作っ�
   止まっては滑る動きは少し残る。安全チェックの値（Kp × 誤差 + 上乗せ）は最大約 1.7 N·m。
 - 現時点の推奨: `--kp 40 --max-kp 40 --friction-ff 0.8 --friction-static 1.0 --friction-velocity 0.02`（Kd 1）。
 
-## 3. 結果（2026-09-25、BXI7010-19、can0 classic、200 Hz）
+## 3. 結果（2026-09-25、BXI7010-19（交換前のモーター）、can0 classic、200 Hz）
 
 `bxi_probe`（手順 1）:
 

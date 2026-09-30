@@ -26,18 +26,26 @@ BXI モーター（1軸の HIL では BXI7010-19、`can_id` 1）の設定とス�
 
 ### 1b. モーター本体の設定（ファームウェア）
 
-モーター本体にも設定がある。2026-09-24〜25 の調査での値：
+モーター本体にも設定がある。**HIL のモーターは、2026-09-25 の確認の後、2026-09-27 の起動ログの前に交換した**（交換後も HW の表示は `Bxi_motor_70`、ファームウェアは同じ版）。今のモーターの値は、2026-09-30 に `scripts/show_bxi_motor_info.py` で読んだもの（記録はワークスペースの `log/bxi_motor_info_20260930.txt`）。
 
-| 設定 | 値 | 意味 |
-|---|---|---|
-| ファームウェア | code 0.2.2、config 0.2（BUILD Aug 19 2026） | |
-| `can_id` / `master_id` | 1 / 0x11 | 指令の ID と応答の ID |
-| `can_timeout` | 0 | タイムアウト無効。**通信が止まっても最後の指令を保持し続ける** |
-| `mit_mode` / `mit_aux_enable` | 1 / 0 | |
-| `max_pos` / `max_vel` / `max_tor` | 12.5 / 45 / 80 | MIT の範囲（`MOTOR_70.yaml` と一致） |
-| `kp_max` / `kd_max` | 500 / 5 | 同上 |
-| `usr_enc1_offset` / `usr_enc2_offset` | −21951 / 0.340230 | ユーザーゼロ点の基準 |
-| `protect_temperature_low` / `high` | 100 / 110 ℃ | モーター側の温度保護 |
+| 設定 | 今のモーター（2026-09-30） | 交換前のモーター（2026-09-24〜25） | 意味 |
+|---|---|---|---|
+| ファームウェア | code 0.2.2、config 0.2（BUILD Aug 19 2026。2026-09-27 の起動ログ） | 同じ | |
+| `can_id` / `master_id` | 1 / 0x11 | 同じ | 指令の ID と応答の ID |
+| `can_timeout` | 0 | 同じ | タイムアウト無効。**通信が止まっても最後の指令を保持し続ける** |
+| `mit_mode` / `mit_aux_enable` | 1 / 0 | 同じ | |
+| `max_pos` / `max_vel` / `max_tor` | 12.5 / 45 / 80 | 同じ | MIT の範囲（`MOTOR_70.yaml` と一致） |
+| `kp_max` / `kd_max` | 500 / 5 | 同じ | 同上 |
+| `reduction_ratio` / `motor_pole_pairs` | 19.545706 / 10 | 同じ | 減速比と極対数 |
+| `current_limit` / `torquet_limit` | 48 / 48 | 同じ | |
+| `protect_temperature_low` / `high` | 100 / 110 ℃ | 同じ | モーター側の温度保護 |
+| `protect_under_voltage` / `over_voltage` | 12 / 72 V | 同じ | |
+| `encoder_offset` / `enco_offset` | 36714 / 317.596313 | 37415 / 243.09（2026-09-24 のキャリブレーションの後） | キャリブレーションの結果（モーターごとに違う） |
+| `usr_enc1_offset` / `usr_enc2_offset` | −19669 / −2.919834 | −5647 / 0.283631（2026-09-25 に `x` でゼロ点を設定し直した後） | ユーザーゼロ点の基準（モーターごとに違う） |
+| `crc` | 0x5cc1e803 | 0x54ab600f | 設定の CRC |
+| NTC2（温度センサー） | 正常（2026-09-27 の起動ログで 31.1 ℃、2026-09-30 の `p` で 31.0 ℃） | 故障（約 −28 ℃ を示した） | |
+
+`bxi_hardware` が前提にしている設定（ID、`can_timeout`、MIT の範囲）は、交換の前後で同じだった。
 
 `bxi_hardware` には、モーター本体の設定を読む機能はない。ワークスペースの `scripts/` に、CAN で文字コマンドを使うスクリプトがある（[`scripts/README.md`](../../../scripts/README.md)）。**設定の一覧は、文字コマンド `s` で読む**（下記「文字コマンドで読む」）。
 
@@ -52,7 +60,7 @@ BXI モーター（1軸の HIL では BXI7010-19、`can_id` 1）の設定とス�
 
 モーターには文字のコンソールがあり、CAN で使える。入力は `0x7E0 + can_id`（`0x7E1`）に ASCII を8バイトずつ送り、コマンドの文字には CR LF（`0D 0A`）を付ける。Esc は `1B` の1バイト。出力は `0x7F0 + can_id`（`0x7F1`）に ASCII で返る。
 
-**`s` の出力（2026-09-24 にシリアルで起動ログの後に `s` を送った記録、ワークスペースの外の `~/devel/BXI 調査/boot.txt` から抜粋）：**
+**`s` の出力（2026-09-30、今のモーター、`scripts/show_bxi_motor_info.py` で PCAN から読んだもの。抜粋）：**
 
 ```text
 STATE : 07 SETUP
@@ -61,7 +69,7 @@ Configuration Options
   [0] config_version = 0x00000002 (read only)
   [1] motor_pole_pairs = 10
   [5] reduction_ratio = 19.545706
-  [7] encoder_offset = 30832
+  [7] encoder_offset = 36714
   [16-143] offset_lut[128]
   [144-503] enco_offset_lut[360]
   [504] calib_valid = 1
@@ -78,14 +86,14 @@ Configuration Options
   [533] max_pos = 12.500000
   [536] kp_max = 500.000000
   [537] kd_max = 5.000000
-  [538] usr_enc1_offset = -21951
-  [539] usr_enc2_offset = 0.340230
+  [538] usr_enc1_offset = -19669
+  [539] usr_enc2_offset = -2.919834
   [541] master_id = 0x11  (rewrite use 0d)
-  [559] crc = 0x770e6933 (read only)
+  [559] crc = 0x5cc1e803 (read only)
 To change a value, type 'prefix' = 'value''ENTER'
 ```
 
-（実際には `[0]`〜`[559]` のすべての項目が出る。キャリブレーションの後は `encoder_offset` などが変わる。）
+（実際には `[0]`〜`[559]` のすべての項目が出る。全体はワークスペースの `log/bxi_motor_info_20260930.txt`。キャリブレーションやゼロ点の設定の後は `encoder_offset`・`usr_enc*_offset` などが変わる。）
 
 **送り方：[`scripts/show_bxi_motor_info.py`](../../../scripts/show_bxi_motor_info.py)**（ホストで、launch が動いていない MENU の状態で）
 
@@ -99,7 +107,7 @@ cd ~/devel/minibexkai_ros2_ws
 - `ros2_control_node` が動いていたら、何も送らずに終了コード2で止める（`p`・`s`・Esc は Motor Mode を解除するため）。
 - CAN チャンネルは 1 Mbps・`ERROR-ACTIVE` であること（スクリプトが確かめる）。表示だけで、ファイルには残さない（`| tee` で残す）。
 - 同じフォルダの [`find_bxi_can_id.py`](../../../scripts/find_bxi_can_id.py) は、`p` を ID 1〜15 に送ってモーターの CAN ID を調べる。[`bxi_single_joint_comm_test.sh`](../../../scripts/bxi_single_joint_comm_test.sh) は `p` と `bxi_probe`（ゲイン0）で1軸の通信を試験する（2026-09-27 に実機で実施）。
-- 試験は `scripts/test_bxi_text_console_scripts.py`（vcan の模擬コンソール）。**`show_bxi_motor_info.py` を実機で使った記録はない。**
+- 試験は `scripts/test_bxi_text_console_scripts.py`（vcan の模擬コンソール）。**2026-09-30 に実機（今のモーター、PCAN の `can0`）で使い、`p` と `s` の出力を読み、Esc で `01 MENU` に戻った。**
 
 `cansend`・`candump` で同じことをするとき：
 
@@ -112,7 +120,7 @@ cansend can0 7E1#1B                                 # Esc：MENU に戻す（SET
 kill %1
 ```
 
-- 実機の PCAN（SocketCAN）から確かめたのは `p` と Esc（2026-09-25・27）と、受信だけの起動ログ（2026-09-27）まで。`s` は bxi_usb2can 経由（CAN）で確かめたもので、**PCAN からの `s` は確かめていない。**
+- 実機の PCAN（SocketCAN）からは、`p` と Esc（2026-09-25・27）、受信だけの起動ログ（2026-09-27）、`s`（2026-09-30、`show_bxi_motor_info.py`）を確かめた。
 - `p` は MENU の状態で送る（SETUP のままだと `Invalid state!get :70` になる）。
 
 **文字コマンドの一覧（起動ログのメニュー）と扱い：**
@@ -144,18 +152,24 @@ kill %1
 
 - 状態の例：`00 STARTUP`（起動中）、`01 MENU`（待機。力を出さない）、`02 MOTOR`（Motor Mode。MIT の指令で動く）、`07 SETUP`（設定の操作中）。
 - MIT の応答は MENU の状態でも返る。**応答があるだけでは Motor Mode に入ったことは分からない。** 状態は `STATE` の行で確かめる。
-- 2026-09-25 の SYSTEM INFO の例（抜粋）：
+- 2026-09-30 の SYSTEM INFO の例（今のモーター）：
 
   ```text
+  ========== SYSTEM INFO ==========
   APP: NORMAL | STATE: 01 MENU
-  BUS: 23.979 V
+  BUS: 23.867 V
   FOC: DISARMED | PWM: OFF
-  TEMP[C]: NTC1=30.5 NTC2=-27.8 WND=-22.8 DRV=42.7 coeff=1.00
-  ENC1: raw=27085 pos=-0.000
-  !!! NTC2 FAIL: -27.8C !!!
+  TEMP[C]: NTC1=32.2 NTC2=31.0 WND=30.0 DRV=43.5 coeff=1.00
+  ENC1: raw=25975 pos=0.196
+  ENC2: angle=-163.105 deg pos=0.012 turn
+  TICK: 7217525
+  =================================
+  Invalid state!get :d
+  Invalid state!get :a
   ```
 
-  この HIL のモーターは NTC2 が故障していて、約 −28 ℃ を示す。HWIF は NTC2 を除外し、NTC1 で温度を監視する（[`PROTOCOL_AND_SAFETY.md`](PROTOCOL_AND_SAFETY.md) の「温度センサー故障」）。
+  - 末尾の `Invalid state!get :d`・`:a` は、コマンドに付けた CR（0x0D）と LF（0x0A）をモーターが受け付けなかったという表示で、問題ない。
+  - 交換前のモーターは NTC2 が故障していて、約 −28 ℃ を示し、`!!! NTC2 FAIL` と表示していた。HWIF は −20 ℃ を下回るセンサーを除外し、残りのセンサーで温度を監視する（[`PROTOCOL_AND_SAFETY.md`](PROTOCOL_AND_SAFETY.md) の「温度センサー故障」）。今のモーターは NTC1・NTC2 とも正常な値。
 
 **注意：** 文字コマンドは、launch が動いていない（MENU の）ときに送る。1 kHz で指令を送っている間に文字コマンドを混ぜたときの動きは確かめていない。
 
@@ -179,5 +193,5 @@ kill %1
 
 ## 3. まだ確かめていないこと・扱わないこと
 
-- **モーター本体の設定を CAN から読む方法は、文字コマンド `s`（`scripts/show_bxi_motor_info.py`）だけで、PCAN（SocketCAN）からの `s` と、このスクリプトはまだ実機で使っていない。** CAN のレジスタ読み出しには、このファームウェアのアドレスの一覧が必要（入手の方法は未定）。
+- モーター本体の設定を CAN から読む方法は、文字コマンド `s`（`scripts/show_bxi_motor_info.py`、2026-09-30 に実機で確認）。 CAN のレジスタ読み出しには、このファームウェアのアドレスの一覧が必要（入手の方法は未定）。
 - 設定の書き込み・保存は、このパッケージでは扱わない（BXI_Tool で行う）。2026-09-25 の調査スクリプトは、ワークスペースの外（`minibexkai_docs/research/logs/20260925_bxi_socketcan/scripts/`、python-can の仮想環境）にある。
