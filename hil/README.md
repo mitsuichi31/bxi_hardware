@@ -154,7 +154,7 @@ vcan 上の値は、ホストのスケジューリングの比較であり、実
 
 | 項目 | 上限 | 根拠 |
 |---|---|---|
-| 指令の手段 | `ramp_command.py` / `sine_command.py`。段階3R・4R（RT 軌道 controller、実機では未実施）では `hil_trajectory.py` | 下記の中止条件が組み込まれている（RT 版では controller の中止条件）。トピックに直接指令を送らない |
+| 指令の手段 | `ramp_command.py` / `sine_command.py`。段階3R・4R（RT 軌道 controller、2026-09-30 に実機で実施）では `hil_trajectory.py` | 下記の中止条件が組み込まれている（RT 版では controller の中止条件）。トピックに直接指令を送らない |
 | 位置 | `bxi_hardware.yaml` の `lower` / `upper`（±0.5 rad）の内側 | ドライバとスクリプトの両方でクランプ・確認する |
 | Kp | 20（スクリプトの `--max-kp` の既定値）。30 までは `--max-kp` を明示して上げる | 2026-09-25 に Kp 30 まで実施 |
 | Kd | 2 | 2026-09-25 に Kd 1〜2 で実施 |
@@ -281,7 +281,7 @@ NTC2 が異常なモーターでは `NTC2 (byte 7) reads -28.6 degC; treating it
 ```bash
 # 端末2（コンテナ内。VS Code のターミナルを「+」で追加するか、docker compose exec minibex_dev bash）
 source install/setup.bash
-ros2 topic echo /joint_states --once                     # 位置・温度の確認
+ros2 topic echo /joint_states --once                     # 位置の確認（温度は /dynamic_joint_states。起動ログの Enable 行にも出る）
 ros2 run bxi_hardware ramp_command.py 0.0 --kp 10 --kd 2  # 今の位置付近で保持
 ros2 run bxi_hardware ramp_command.py 0.2 --kp 10 --kd 2  # 約 11° 動かす
 ros2 run bxi_hardware ramp_command.py 0.0 --kp 20 --kd 2 --release   # 戻して力を抜く
@@ -356,9 +356,9 @@ ros2 run bxi_hardware sine_command_cpp --amplitude 0.3 --frequency 0.2 --cycles 
 
 状態が 0.2 秒以上届かない、指令の上限を超える、Ctrl+C の場合は Kp=Kd=0 の指令を 5 回送って終了する。通常終了時は中心位置を保持し、`--release` を指定すると力を抜く。C++ と `sleep_until` だけでハードリアルタイムになるわけではない。ROS 2 の配送、controller_manager と CAN の周期も独立しているため、CSV の時刻は CAN バス上の送信時刻を表さない。最初は可動範囲と荷重を確認して小振幅から実行する。
 
-### RT 軌道 controller（`bxi_hardware/HilTrajectoryController`、HIL ではまだ使っていない）
+### RT 軌道 controller（`bxi_hardware/HilTrajectoryController`）
 
-ramp と SIN 波の目標を、トピック経由のスクリプトではなく、controller_manager の `update()`（1 kHz）の中で毎周期計算する controller。計画はワークスペース側の `docs/plans/20260929_bxi_rt_trajectory_controller_plan.md`、vcan での結果は `docs/test-reports/2026-09-29-bxi-rt-trajectory-vcan-step4.md`（手順4、2026-09-30 に完了）。段階3R・4R用の `controllers_1khz_rt.yaml` は vcan で確かめたが、実機ではまだ使っていない。既存の `controllers_1khz.yaml` は変更していない。
+ramp と SIN 波の目標を、トピック経由のスクリプトではなく、controller_manager の `update()`（1 kHz）の中で毎周期計算する controller。計画はワークスペース側の `docs/plans/20260929_bxi_rt_trajectory_controller_plan.md`、vcan での結果は `docs/test-reports/2026-09-29-bxi-rt-trajectory-vcan-step4.md`（手順4、2026-09-30 に完了）。段階3R・4R用の `controllers_1khz_rt.yaml` で、2026-09-30 に実機の段階3R（ramp）・段階4R（SIN 波の最初の条件）に合格した（ワークスペース側の `docs/test-reports/2026-09-30-bxi-hil-stage3r-rt-ramp.md`・`2026-09-30-bxi-hil-stage4r-rt-sine.md`）。既存の `controllers_1khz.yaml` は変更していない。controller の一覧と組み合わせ方は [`docs/CONTROLLERS.md`](../docs/CONTROLLERS.md)。
 
 - 実行環境：`single_joint_hil.launch.py` は `ros2_control_node` に `LD_BIND_NOW=1` を渡す（遅延バインディングのままだと、開始の周期の `update()` で動的リンカがシンボルを解決し、35〜92 µs かかった）。`controllers_1khz_rt.yaml` は controller_manager の更新スレッドを CPU 11 に、`bxi_hardware_stream_1khz.yaml` は送受信スレッドを CPU 9 に固定する（`cpu_affinity`・`thread_cpus`。ワークスペース側の `docs/plans/20260930_bxi_cpu_affinity_plan.md`）。vcan での `update()` の最大は 31.1 µs。
 

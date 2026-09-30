@@ -17,6 +17,10 @@ BXI MIT制御アクチュエータ向けの共通ROS 2 `SystemInterface`です�
 
 `implemented`は実機検証済みを意味しません。実機への通電は独立した安全レビュー後に限ります。
 
+## controller
+
+このパッケージが提供する controller（RT 軌道 controller `bxi_hardware/HilTrajectoryController` と試験専用の `bxi_hardware/HilUpdateStallController`）、設定で使っている外部の controller、その組み合わせ方と HWIF との取り決めは [`docs/CONTROLLERS.md`](docs/CONTROLLERS.md) にまとめた。
+
 ## Dev Container test
 
 ```bash
