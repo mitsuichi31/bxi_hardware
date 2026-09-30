@@ -23,6 +23,7 @@ def generate_launch_description():
     config_file = LaunchConfiguration("config_file")
     spec_dir = LaunchConfiguration("spec_dir")
     controllers_file = LaunchConfiguration("controllers_file")
+    controller_name = LaunchConfiguration("controller_name")
 
     robot_description = ParameterValue(
         Command([
@@ -46,6 +47,9 @@ def generate_launch_description():
             "controllers_file",
             default_value=PathJoinSubstitution([hil_dir, "controllers.yaml"]),
             description="controller_manager の設定（更新周期・RT優先度・controller）"),
+        DeclareLaunchArgument(
+            "controller_name", default_value="joint1_command",
+            description="起動する指令 controller（joint1_command / hil_trajectory）"),
         Node(
             package="robot_state_publisher",
             executable="robot_state_publisher",
@@ -56,6 +60,10 @@ def generate_launch_description():
             executable="ros2_control_node",
             parameters=[controllers_file],
             output="screen",
+            # Resolve every symbol at load time. With lazy binding, the first call of each function
+            # (e.g. the first trajectory cycle) runs the dynamic linker inside update(): 35-92 µs
+            # on vcan vs 4-10 µs with this set (log/rt_first_cycle_20260930).
+            additional_env={"LD_BIND_NOW": "1"},
         ),
         Node(
             package="controller_manager",
@@ -65,6 +73,6 @@ def generate_launch_description():
         Node(
             package="controller_manager",
             executable="spawner",
-            arguments=["joint1_command"],
+            arguments=[controller_name],
         ),
     ])

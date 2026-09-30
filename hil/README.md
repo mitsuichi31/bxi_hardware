@@ -358,7 +358,7 @@ ros2 run bxi_hardware sine_command_cpp --amplitude 0.3 --frequency 0.2 --cycles 
 
 ### RT 軌道 controller（`bxi_hardware/HilTrajectoryController`、HIL ではまだ使っていない）
 
-ramp と SIN 波の目標を、トピック経由のスクリプトではなく、controller_manager の `update()`（1 kHz）の中で毎周期計算する controller。計画はワークスペース側の `docs/plans/20260929_bxi_rt_trajectory_controller_plan.md`（手順2）。段階3R・4R（計画の手順5）で使う予定で、今の HIL の設定（`controllers_1khz.yaml`）にはまだ入れていない。
+ramp と SIN 波の目標を、トピック経由のスクリプトではなく、controller_manager の `update()`（1 kHz）の中で毎周期計算する controller。計画はワークスペース側の `docs/plans/20260929_bxi_rt_trajectory_controller_plan.md`。段階3R・4R用に `controllers_1khz_rt.yaml` を用意したが、実機ではまだ使っていない。vcan の処理時間が仮基準50 µsを超える場合があり、手順4の評価を続けている。既存の `controllers_1khz.yaml` は変更していない。
 
 - 使うインターフェース：command は `<joint>/position`・`velocity`・`kp`・`kd`・`effort`、state は `<joint>/position`・`velocity`・`effort`（`joint1_command` と同じ command を使うので、同時には有効にできない）。
 - パラメータ：`joint`（既定 `joint1`）、`lower` / `upper`（±0.5 rad）、`max_kp`（20、30 まで）、`max_torque`（5 N·m）、`max_velocity`（2 rad/s）、`max_period`（5 ms）、`arm_timeout`（1 秒）、`record_tail`（0.5 秒）、`record_seconds`（120 秒）、`max_run_seconds`（60 秒）、`output_dir`（空なら環境変数 `BXI_WORKER_TIMING_DIR`）。
@@ -367,7 +367,7 @@ ramp と SIN 波の目標を、トピック経由のスクリプトではなく�
 - `~/status`（`bxi_hardware/msg/HilTrajectoryStatus`、約 50 Hz）：状態、適用した要求番号と停止の数、終わりの理由、経過時間、目標と位置、記録の状態と CSV のパス。受け付けと適用の区別はここで確かめる。
 - 中止の条件（その周期のうちに位置 = 現在位置、速度 0、Kp = Kd = 0、トルク 0 を書く）：Kp × |目標 − 位置| + |上乗せ| > `max_torque`、|目標速度| > `max_velocity`、位置・速度・トルクのどれかが有限でない、周期（単調時計の `period`）が 0 以下・`max_period` 超、リースの途切れ、開始の周期での範囲外（SIN 波の中心 ± 振幅）と実行時間の超過。
 - command への書き込みが1つでも失敗したら（`set_value()` がロックを取れない）、実行中・保持中はその周期のうちに中止（`write failed`）して、力を抜く値を書き直す。`write_failures` は書き込みに失敗した周期を1周期1回だけ数え、同じ周期の脱力値の書き込みが成功しても CSV の `write_ok` は 0 にする。脱力値の書き込みは毎周期試みる。今回の実行で一度も5項目をすべて書けていない間は、`~/status` の `release_write_pending` を true にする。成功するまで記録を完了せず、次の開始も受け付けない。
-- `release_write_pending` が続く間は、controller だけでは脱力を保証できない。`hil_trajectory.py` は `write_failures` の増加を検出すると `[中止]` と終了コード1で終わる。段階3R・4Rのランナーは、これを NG として launch を止め、HWIF の disable 応答を確認する必要がある。disable を確認できなければ電源装置の出力を切る。ランナーへの組み込みは計画の手順4で行う。
+- `release_write_pending` が続く間は、controller だけでは脱力を保証できない。`hil_trajectory.py` は `write_failures` の増加を検出すると `[中止]` と終了コード1で終わる。段階3R・4Rのランナーは、これを NG として launch を止め、HWIF の disable 応答を確認する。disable を確認できなければ電源装置の出力を切る。ランナーの実機での一連の確認は未実施。
 - `~/start` と `~/finish` の受け付けの判断は、`update()` が毎周期必ず書く atomic の状態で行う（`~/status` の写しは try_lock なので古いことがある）。開始要求を取り出した周期から、記録を書き出し終えるまでは次の開始を受け付けない。
 - 経過時間は `period` の積算で数える（`update()` の `time` は ROS の時計で飛ぶことがあるので使わない）。
 - 毎周期の記録：開始要求を適用した周期から、力を抜いた周期の `record_tail` 後まで、あらかじめ確保した領域に書き、RT ではないタイマーが CSV（`hil_trajectory_<要求番号>_<時刻>.csv`）に書き出す。書き出すまで次の開始は受け付けない。書き出しに失敗したら記録を残したまま1秒ごとに再試行し（`~/status` の記録の状態は「失敗」）、その間も次の開始は受け付けない。CSV の最後の列 `write_ok` は、その周期の書き込みがすべて通ったか（1 / 0）。満杯になったら欠落した周期を数える（制御は続ける）。

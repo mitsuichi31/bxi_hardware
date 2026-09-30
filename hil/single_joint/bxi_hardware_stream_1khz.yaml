@@ -23,6 +23,10 @@ can_transport:
     # （60/61）を比べてから確定する。
     send_thread_priority: 45
     receive_thread_priority: 46
+    # 送受信スレッドを P コアの CPU 9 に固定する（2026-09-30、案B）。controller_manager（CPU 11）とは別の
+    # 物理コアにし、有線 LAN の割り込みが載る CPU 4〜6 と CPU 0 を避ける。PCAN の割り込み（実機で CPU 18）は
+    # 動かさない。検討：docs/plans/20260930_bxi_cpu_affinity_plan.md（ワークスペース側）
+    thread_cpus: [9]
 defaults:
   # 逐次で行う enable・初期フィードバック・disable の応答待ちに使う（送受信分離の運転中は使わない）。
   # 2026-09-29 の HIL 段階1で、enable 直後の初期フィードバックへの応答が、モーターの文字出力

@@ -31,6 +31,7 @@ class SimulatedController(Node):
         self.status.position = 0.03
         self.status.record_state = Status.RECORD_NONE
         self.start_request = None
+        self.next_id = 1
         self.started_at = 0.0
         self.released_at = 0.0
         self.run_seconds = run_seconds
@@ -61,17 +62,20 @@ class SimulatedController(Node):
         if self.start_delay:
             time.sleep(self.start_delay)
         self.start_request = request
+        self.released_at = 0.0
         self.status.state = Status.ARMED
-        self.status.applied_request_id = 1
+        self.status.applied_request_id = self.next_id
         self.status.record_state = Status.RECORD_RECORDING
+        self.status.end_reason = ""
         response.accepted = True
-        response.request_id = 1
+        response.request_id = self.next_id
+        self.next_id += 1
         self.in_start = False
         return response
 
     def keepalive(self, msg):
         self.keepalive_times.append(time.monotonic())
-        if msg.data == 1 and self.status.state == Status.ARMED:
+        if msg.data == self.status.applied_request_id and self.status.state == Status.ARMED:
             self.status.state = Status.RUNNING
             self.started_at = time.monotonic()
 
@@ -155,6 +159,14 @@ def test_finish_and_csv(controller):
     assert "終了時: 終了で力を抜いた" in result.stdout
     assert "CSV: /tmp/simulated_trajectory.csv" in result.stdout
     assert controller.stops == 0
+
+
+def test_next_run_after_saved_normal_release(controller):
+    first = command(["hold"])
+    assert first.returncode == 0, first.stdout + first.stderr
+    second = command(["--release", "hold"])
+    assert second.returncode == 0, second.stdout + second.stderr
+    assert "要求番号 2" in second.stdout
 
 
 def test_release(controller):

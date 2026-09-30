@@ -201,8 +201,14 @@ class TrajectoryClient(Node):
     def run(self, request):
         self.until(lambda: self.status is not None and self.keepalive_pub.get_subscription_count() > 0,
                    2.0, "~/status と keepalive の接続")
-        if self.status.state != HilTrajectoryStatus.IDLE:
-            raise Abort("controller が待機中ではない")
+        previous_finished = (
+            self.status.state == HilTrajectoryStatus.RELEASED and
+            self.status.end_reason in ("finish", "release") and
+            self.status.record_state == HilTrajectoryStatus.RECORD_WRITTEN and
+            not self.status.release_write_pending
+        )
+        if self.status.state != HilTrajectoryStatus.IDLE and not previous_finished:
+            raise Abort("controller が待機中でも、前の実行の記録を書き出した正常終了でもない")
         if not math.isfinite(self.status.position):
             raise Abort("現在位置が有限でない")
         self.baseline_write_failures = self.status.write_failures
