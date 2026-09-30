@@ -17,6 +17,10 @@ BXI MIT制御アクチュエータ向けの共通ROS 2 `SystemInterface`です�
 
 `implemented`は実機検証済みを意味しません。実機への通電は独立した安全レビュー後に限ります。
 
+## 1軸での動作確認
+
+モーター1台で状態を見る・動かす・正式な試験をする手順は [`hil/SINGLE_JOINT_GUIDE.md`](hil/SINGLE_JOINT_GUIDE.md) にまとめた。詳しい設定と結果は [`hil/README.md`](hil/README.md)。
+
 ## controller
 
 このパッケージが提供する controller（RT 軌道 controller `bxi_hardware/HilTrajectoryController` と試験専用の `bxi_hardware/HilUpdateStallController`）、設定で使っている外部の controller、その組み合わせ方と HWIF との取り決めは [`docs/CONTROLLERS.md`](docs/CONTROLLERS.md) にまとめた。
