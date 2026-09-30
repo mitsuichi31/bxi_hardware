@@ -204,6 +204,7 @@ tools/hil_stage3r.sh            # 例
 
 - [`README.md`](README.md)：設定・RT スケジューリング・計測・bus-off からの復帰・結果の詳細
 - [`../docs/CONTROLLERS.md`](../docs/CONTROLLERS.md)：controller の一覧と違い
+- [`../docs/MOTOR_CONFIG_AND_STATUS.md`](../docs/MOTOR_CONFIG_AND_STATUS.md)：モーターの設定（yaml とモーター本体）とステータスの確認方法
 - [`../docs/PROTOCOL_AND_SAFETY.md`](../docs/PROTOCOL_AND_SAFETY.md)：MIT プロトコルと安全上の判断
 - ワークスペース側の `docs/test-reports/`：各段階の試験レポート
 

@@ -19,7 +19,7 @@ BXI MIT制御アクチュエータ向けの共通ROS 2 `SystemInterface`です�
 
 ## 1軸での動作確認
 
-モーター1台で状態を見る・動かす・正式な試験をする手順は [`hil/SINGLE_JOINT_GUIDE.md`](hil/SINGLE_JOINT_GUIDE.md) にまとめた。詳しい設定と結果は [`hil/README.md`](hil/README.md)。
+モーター1台で状態を見る・動かす・正式な試験をする手順は [`hil/SINGLE_JOINT_GUIDE.md`](hil/SINGLE_JOINT_GUIDE.md) にまとめた。モーターの設定（yaml とモーター本体）とステータスの確認方法は [`docs/MOTOR_CONFIG_AND_STATUS.md`](docs/MOTOR_CONFIG_AND_STATUS.md)。詳しい設定と結果は [`hil/README.md`](hil/README.md)。
 
 ## controller
 
