@@ -100,7 +100,7 @@ python3 /ws/src/bxi_hardware/hil/single_joint/analyze_stream_timing.py \
 
 実機を使わずに、controller_manager（1 kHz・`SCHED_FIFO` 50、`controllers_1khz.yaml`）と送受信分離（`bxi_hardware_stream_1khz.yaml` を vcan 用に書き換えたもの）を同時に動かし、送受信スレッドのスケジューリング条件を比べられる。
 
-- `bxi_vcan_motor_emulator`：vcan 専用の模擬モーター。個別ID宛ての指令にはすぐに応答し、`0x7FF` のブロードキャストには `--delay-us` 後に応答する。`--replies-per-command` で応答を増やすと、受信側の負荷を上げられる。`ros2 run` 経由では SIGINT がツールに届かないため、`$(ros2 pkg prefix bxi_hardware)/lib/bxi_hardware/bxi_vcan_motor_emulator` を直接起動する。
+- `bxi_vcan_motor_emulator`：vcan 専用の模擬モーター。個別ID宛ての指令にはすぐに応答し、`0x7FF` のブロードキャストには `--delay-us` 後に応答する。既定では応答の位置・速度・トルクは中央値のまま。`--follow 1` では、Kp > 0 の指令を受けると応答の位置を指令の位置へ一次遅れ（時定数 50 ms）で近づける（段階3R・4Rのランナーの bag の判定を vcan で通すための簡単な追従で、力学は模擬しない）。`--replies-per-command` で応答を増やすと、受信側の負荷を上げられる。`ros2 run` 経由では SIGINT がツールに届かないため、`$(ros2 pkg prefix bxi_hardware)/lib/bxi_hardware/bxi_vcan_motor_emulator` を直接起動する。
 - `compare_stream_scheduling.py`：次の条件ごとに設定を作り、模擬モーターと `single_joint_hil.launch.py` を起動し、CSV・ログ・`summary.tsv` を出力先にまとめる。
   - 送受信スレッドの条件：SCHED_OTHER、controller_manager より下／上の FIFO、CPU 固定、受信スレッドだけ高い FIFO
   - CPU 負荷：なし／全 CPU にビジーループ
@@ -145,7 +145,7 @@ vcan 上の値は、ホストのスケジューリングの比較であり、実
 | モーター | 固定されていること。周囲に人や物がないこと |
 | CAN | `ip -details -statistics link show can0` で、`ERROR-ACTIVE`、TEC/REC 0/0、`restart-ms 0`。ほかに `can0` へ送信するプロセスがないこと |
 | 割り込みスレッド | `ps -eLo pid,tid,cls,rtprio,psr,comm \| grep irq/16` で、PCAN の割り込みスレッドの方式・優先度・CPU（`can0` を UP にした後） |
-| 版と設定 | ワークスペースと `src/bxi_hardware` のコミット、使う設定ファイル、送受信スレッドの優先度 |
+| 版と設定 | ワークスペースと `src/bxi_hardware` のコミット、使う設定ファイル、送受信スレッドの優先度と CPU（2026-09-30 から `thread_cpus: [9]`）。RT 版（段階3R・4R）では controller_manager の CPU（`cpu_affinity: 11`）と `LD_BIND_NOW=1` |
 | 計測 | `BXI_WORKER_TIMING_DIR` の出力先。試験前後の CAN 統計を記録すること |
 
 **0以外の指令の範囲**
@@ -154,7 +154,7 @@ vcan 上の値は、ホストのスケジューリングの比較であり、実
 
 | 項目 | 上限 | 根拠 |
 |---|---|---|
-| 指令の手段 | `ramp_command.py` / `sine_command.py` | 下記の中止条件が組み込まれている。トピックに直接指令を送らない |
+| 指令の手段 | `ramp_command.py` / `sine_command.py`。段階3R・4R（RT 軌道 controller、実機では未実施）では `hil_trajectory.py` | 下記の中止条件が組み込まれている（RT 版では controller の中止条件）。トピックに直接指令を送らない |
 | 位置 | `bxi_hardware.yaml` の `lower` / `upper`（±0.5 rad）の内側 | ドライバとスクリプトの両方でクランプ・確認する |
 | Kp | 20（スクリプトの `--max-kp` の既定値）。30 までは `--max-kp` を明示して上げる | 2026-09-25 に Kp 30 まで実施 |
 | Kd | 2 | 2026-09-25 に Kd 1〜2 で実施 |
@@ -358,22 +358,25 @@ ros2 run bxi_hardware sine_command_cpp --amplitude 0.3 --frequency 0.2 --cycles 
 
 ### RT 軌道 controller（`bxi_hardware/HilTrajectoryController`、HIL ではまだ使っていない）
 
-ramp と SIN 波の目標を、トピック経由のスクリプトではなく、controller_manager の `update()`（1 kHz）の中で毎周期計算する controller。計画はワークスペース側の `docs/plans/20260929_bxi_rt_trajectory_controller_plan.md`。段階3R・4R用に `controllers_1khz_rt.yaml` を用意したが、実機ではまだ使っていない。vcan の処理時間が仮基準50 µsを超える場合があり、手順4の評価を続けている。既存の `controllers_1khz.yaml` は変更していない。
+ramp と SIN 波の目標を、トピック経由のスクリプトではなく、controller_manager の `update()`（1 kHz）の中で毎周期計算する controller。計画はワークスペース側の `docs/plans/20260929_bxi_rt_trajectory_controller_plan.md`、vcan での結果は `docs/test-reports/2026-09-29-bxi-rt-trajectory-vcan-step4.md`（手順4、2026-09-30 に完了）。段階3R・4R用の `controllers_1khz_rt.yaml` は vcan で確かめたが、実機ではまだ使っていない。既存の `controllers_1khz.yaml` は変更していない。
+
+- 実行環境：`single_joint_hil.launch.py` は `ros2_control_node` に `LD_BIND_NOW=1` を渡す（遅延バインディングのままだと、開始の周期の `update()` で動的リンカがシンボルを解決し、35〜92 µs かかった）。`controllers_1khz_rt.yaml` は controller_manager の更新スレッドを CPU 11 に、`bxi_hardware_stream_1khz.yaml` は送受信スレッドを CPU 9 に固定する（`cpu_affinity`・`thread_cpus`。ワークスペース側の `docs/plans/20260930_bxi_cpu_affinity_plan.md`）。vcan での `update()` の最大は 31.1 µs。
 
 - 使うインターフェース：command は `<joint>/position`・`velocity`・`kp`・`kd`・`effort`、state は `<joint>/position`・`velocity`・`effort`（`joint1_command` と同じ command を使うので、同時には有効にできない）。
 - パラメータ：`joint`（既定 `joint1`）、`lower` / `upper`（±0.5 rad）、`max_kp`（20、30 まで）、`max_torque`（5 N·m）、`max_velocity`（2 rad/s）、`max_period`（5 ms）、`arm_timeout`（1 秒）、`record_tail`（0.5 秒）、`record_seconds`（120 秒）、`max_run_seconds`（60 秒）、`output_dir`（空なら環境変数 `BXI_WORKER_TIMING_DIR`）。
+- 試験専用のパラメータ：`test_fault.start_delay`・`stop_delay`・`finish_delay`（秒、既定0、30 まで）。サービスの処理が要求を扱う前にその時間だけ止まる（vcan で応答の遅れ・応答なしを再現するため）。0 でない値は、環境変数 `BXI_ALLOW_TEST_FAULTS=1` がないと設定でエラーになる。HIL のランナーは launch の前にこの変数を消す。実機では使わない。
 - サービス：`~/start`（`bxi_hardware/srv/StartHilTrajectory`。種類 hold / ramp / sine と数値。受け付けたかと要求番号を返す）、`~/finish`（保持中だけ。正常終了）、`~/stop`（いつでも。停止を優先）。
 - `~/keepalive`（`std_msgs/UInt32`、要求番号）：適用した要求と同じ番号で、受け付けの後に届いたものだけを数える。最初の1件で軌道を始め（それまでは力を抜いたまま）、1秒来なければ動かずに中止する。実行中と保持中は、最後の keepalive からリースの時間を超えると中止して力を抜く。
 - `~/status`（`bxi_hardware/msg/HilTrajectoryStatus`、約 50 Hz）：状態、適用した要求番号と停止の数、終わりの理由、経過時間、目標と位置、記録の状態と CSV のパス。受け付けと適用の区別はここで確かめる。
 - 中止の条件（その周期のうちに位置 = 現在位置、速度 0、Kp = Kd = 0、トルク 0 を書く）：Kp × |目標 − 位置| + |上乗せ| > `max_torque`、|目標速度| > `max_velocity`、位置・速度・トルクのどれかが有限でない、周期（単調時計の `period`）が 0 以下・`max_period` 超、リースの途切れ、開始の周期での範囲外（SIN 波の中心 ± 振幅）と実行時間の超過。
 - command への書き込みが1つでも失敗したら（`set_value()` がロックを取れない）、実行中・保持中はその周期のうちに中止（`write failed`）して、力を抜く値を書き直す。`write_failures` は書き込みに失敗した周期を1周期1回だけ数え、同じ周期の脱力値の書き込みが成功しても CSV の `write_ok` は 0 にする。脱力値の書き込みは毎周期試みる。今回の実行で一度も5項目をすべて書けていない間は、`~/status` の `release_write_pending` を true にする。成功するまで記録を完了せず、次の開始も受け付けない。
-- `release_write_pending` が続く間は、controller だけでは脱力を保証できない。`hil_trajectory.py` は `write_failures` の増加を検出すると `[中止]` と終了コード1で終わる。段階3R・4Rのランナーは、これを NG として launch を止め、HWIF の disable 応答を確認する。disable を確認できなければ電源装置の出力を切る。ランナーの実機での一連の確認は未実施。
+- `release_write_pending` が続く間は、controller だけでは脱力を保証できない。`hil_trajectory.py` は `write_failures` の増加を検出すると `[中止]` と終了コード1で終わる。段階3R・4Rのランナーは、これを NG として launch を止め、HWIF の disable 応答を確認する。disable を確認できなければ電源装置の出力を切る。ランナーのこの経路は vcan で確かめたが、実機ではまだ行っていない。
 - `~/start` と `~/finish` の受け付けの判断は、`update()` が毎周期必ず書く atomic の状態で行う（`~/status` の写しは try_lock なので古いことがある）。開始要求を取り出した周期から、記録を書き出し終えるまでは次の開始を受け付けない。
 - 経過時間は `period` の積算で数える（`update()` の `time` は ROS の時計で飛ぶことがあるので使わない）。
-- 毎周期の記録：開始要求を適用した周期から、力を抜いた周期の `record_tail` 後まで、あらかじめ確保した領域に書き、RT ではないタイマーが CSV（`hil_trajectory_<要求番号>_<時刻>.csv`）に書き出す。書き出すまで次の開始は受け付けない。書き出しに失敗したら記録を残したまま1秒ごとに再試行し（`~/status` の記録の状態は「失敗」）、その間も次の開始は受け付けない。CSV の最後の列 `write_ok` は、その周期の書き込みがすべて通ったか（1 / 0）。満杯になったら欠落した周期を数える（制御は続ける）。
+- 毎周期の記録：開始要求を適用した周期から、力を抜いた周期の `record_tail` 後まで、あらかじめ確保した領域に書き、RT ではないタイマーが CSV（`hil_trajectory_<要求番号>_<時刻>.csv`）に書き出す。書き出すまで次の開始は受け付けない。書き出しに失敗したら記録を残したまま1秒ごとに再試行し（`~/status` の記録の状態は「失敗」）、その間も次の開始は受け付けない。実行の途中で controller が無効化されると（launch の停止）、記録は終わりの理由「deactivated」で締まり、タイマーが書き出す前にプロセスが終わっても、controller のデストラクタで書き出す（controller_manager はハードウェアの disable の後に controller を破棄するので、disable は遅れない）。CSV の最後の列 `write_ok` は、その周期の書き込みがすべて通ったか（1 / 0）。満杯になったら欠落した周期を数える（制御は続ける）。
 - `update()` はメモリを確保せず（単体試験で確かめている）、止まる可能性のあるロックを取らない（try_lock と atomic だけ）。
 
-`hil_trajectory.py` は手順3の指令コマンドで、controller に開始を要求して要求番号付き keepalive を20 Hzで送り、正常終了・CSV 保存まで確認する。SIN 波では保存した controller CSV の振幅一定区間から追従誤差、振幅比、位相遅れ、停止時間を集計する。`~/start` の応答なし、`~/finish` / `~/stop` の異常、心拍切れ、書き込み失敗、Ctrl+C は終了コード1と `[中止]` で区別する。異常を検出したら、`~/stop` を呼ぶ前に keepalive を止める（`~/stop` が応答しなくても、リースの時間で力が抜ける）。停止の適用は保存した要求番号で確かめる。引数の例（controller を別途起動した vcan 用）:
+`hil_trajectory.py` は手順3の指令コマンドで、controller に開始を要求して要求番号付き keepalive を20 Hzで送り、正常終了・CSV 保存まで確認する。SIN 波では保存した controller CSV の振幅一定区間から追従誤差、振幅比、位相遅れ、停止時間を集計する。`~/start` の応答なし、`~/finish` / `~/stop` の異常、心拍切れ、書き込み失敗、Ctrl+C は終了コード1と `[中止]` で区別する。異常を検出したら、`~/stop` を呼ぶ前に keepalive を止める（`~/stop` が応答しなくても、リースの時間で力が抜ける）。停止の適用は保存した要求番号で確かめる。開始は、controller が待機中か、前の実行が正常に終わって（`finish` か `release`）記録を書き出した後にだけ行う。前の実行が中止で終わっていれば開始しない（launch からやり直す）。引数の例（controller を別途起動した vcan 用）:
 
 ```bash
 ros2 run bxi_hardware hil_trajectory.py --kp 10 --kd 2 --hold 1 hold
@@ -381,7 +384,12 @@ ros2 run bxi_hardware hil_trajectory.py --kp 10 --kd 2 --speed 0.3 --release ram
 ros2 run bxi_hardware hil_trajectory.py --kp 20 --kd 1 --amplitude 0.1 --frequency 0.5 --release sine
 ```
 
-実機では、ランナーが異常終了を受けて disable を確認する経路を接続し、vcan で検証してから使う。指令コマンド単体の正常終了はモーターの disable を示さない。
+段階3R・4Rのランナー（ワークスペース側の `tools/hil_stage3r.sh`・`hil_stage4r.sh`）は、指令コマンドの異常終了を NG として launch を止め、HWIF の disable の応答を確かめる。この経路は vcan で確かめた（ワークスペース側の `tools/verify_hil_runner_vcan.py`）。指令コマンド単体の正常終了はモーターの disable を示さない。
+
+vcan での確かめ方（開発コンテナの中、vcan0 を mtu 72 で作ってから）：
+
+- `python3 /ws/tools/verify_rt_trajectory_vcan.py --scenario <名前>`：launch・模擬モーター・`candump` を起動し、指令コマンドを動かして判定する。`normal`・`sequence` のほか、停止と故障の経路（`sigint`・`heartbeat`・`kill9`・`kill_holding`・`start_lost`・`start_delay`・`stop_delay`・`stall`・`stop_all_blocked`）。故障の経路は、上記の `test_fault.*` と、試験専用の `bxi_hardware/HilUpdateStallController`（別ライブラリ `bxi_hil_test_controllers`。`~/stall` の後の `update()` で `stall_ms` だけ止まり、controller_manager の更新の停止を再現する。`BXI_ALLOW_TEST_FAULTS=1` がないと設定でエラー）を使う。
+- `python3 /ws/tools/verify_hil_runner_vcan.py --stage stage3r|stage4r [--scenario normal|motion_no|disconnect|kill_command]`：ランナーのコンテナ側を、ホスト側の代わりをしながら動かす。ランナーには `BXI_HIL_VCAN_IFACE=vcan0` を渡し、CAN 設定の can0 を vcan に差し替えさせる（ホスト側の入口は設定しない）。
 
 ### SIN 波の結果（2026-09-25、Kp 20 / Kd 1、classic 200 Hz）
 
