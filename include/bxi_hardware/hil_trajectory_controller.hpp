@@ -169,6 +169,13 @@ private:
   double record_seconds_ = 120.0;
   double max_run_seconds_ = 60.0;
   std::string output_dir_;
+  // Test only (vcan fault paths): each service callback sleeps this long before it handles the
+  // request, so the request is neither applied nor answered meanwhile. The controller node's
+  // callbacks share one mutually exclusive group, so keepalives and ~/status wait as well.
+  // Non-zero values are refused unless BXI_ALLOW_TEST_FAULTS=1 (never set on the HIL runners).
+  double test_start_delay_s_ = 0.0;
+  double test_stop_delay_s_ = 0.0;
+  double test_finish_delay_s_ = 0.0;
 
   std::string validate(const srv::StartHilTrajectory::Request & r) const;
   void endRun(EndReason reason, int64_t now_ns);

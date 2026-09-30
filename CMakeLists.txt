@@ -70,6 +70,22 @@ ament_target_dependencies(bxi_hil_controllers
 target_link_libraries(bxi_hil_controllers ${BXI_HW_LIB} "${bxi_interfaces_cpp}")
 pluginlib_export_plugin_description_file(controller_interface bxi_hil_controllers.xml)
 
+# 試験専用の controller（vcan の故障経路：controller_manager の更新の停止）。本番の controller とは
+# 別のライブラリにする。BXI_ALLOW_TEST_FAULTS=1 のときだけ設定できる。
+add_library(bxi_hil_test_controllers SHARED src/hil_update_stall_controller.cpp)
+target_include_directories(bxi_hil_test_controllers PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+)
+ament_target_dependencies(bxi_hil_test_controllers
+  controller_interface
+  pluginlib
+  rclcpp
+  rclcpp_lifecycle
+  std_srvs
+)
+pluginlib_export_plugin_description_file(controller_interface bxi_hil_test_controllers.xml)
+
 # 実機の前提確認ツール（1軸）
 add_executable(bxi_probe tools/bxi_probe.cpp)
 target_link_libraries(bxi_probe ${BXI_HW_LIB})
@@ -118,6 +134,10 @@ if(BUILD_TESTING)
   ament_add_gtest(test_hil_trajectory_controller test/test_hil_trajectory_controller.cpp)
   target_link_libraries(test_hil_trajectory_controller bxi_hil_controllers)
   set_target_properties(test_hil_trajectory_controller PROPERTIES BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}")
+  ament_add_gtest(test_hil_update_stall_controller test/test_hil_update_stall_controller.cpp)
+  target_link_libraries(test_hil_update_stall_controller bxi_hil_test_controllers)
+  set_target_properties(test_hil_update_stall_controller PROPERTIES
+    BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}")
   ament_add_gtest(test_hil_trajectory test/test_hil_trajectory.cpp)
   target_link_libraries(test_hil_trajectory ${BXI_HW_LIB})
   target_compile_definitions(test_hil_trajectory PRIVATE
@@ -142,7 +162,7 @@ install(PROGRAMS hil/single_joint/ramp_command.py hil/single_joint/sine_command.
 install(TARGETS bxi_probe bxi_vcan_motor_emulator sine_command_cpp
   DESTINATION lib/${PROJECT_NAME})
 install(
-  TARGETS ${BXI_HW_LIB} bxi_hil_controllers
+  TARGETS ${BXI_HW_LIB} bxi_hil_controllers bxi_hil_test_controllers
   EXPORT export_${PROJECT_NAME}
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib

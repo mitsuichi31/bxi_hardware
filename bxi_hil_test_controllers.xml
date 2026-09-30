@@ -1,0 +1,10 @@
+<library path="bxi_hil_test_controllers">
+  <class name="bxi_hardware/HilUpdateStallController"
+         type="bxi_hardware::HilUpdateStallController"
+         base_class_type="controller_interface::ControllerInterface">
+    <description>
+      試験専用（vcan の故障経路）。~/stall の後の update() で stall_ms だけ止まり、controller_manager の
+      更新の停止を再現する。BXI_ALLOW_TEST_FAULTS=1 のときだけ設定できる。実機では使わない。
+    </description>
+  </class>
+</library>

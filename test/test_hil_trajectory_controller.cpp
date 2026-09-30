@@ -2,6 +2,7 @@
 // state interfaces, and update() is called with chosen periods. The steady clock used for the
 // lease and arming timeouts is driven by the test.
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
@@ -13,6 +14,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -878,6 +880,87 @@ TEST_F(NoOutputDir, RecordIsDiscardedAndTheNextStartAccepted)
   EXPECT_FALSE(controller_->writeCompletedRecord());  // nothing written
   EXPECT_TRUE(controller_->csvPath().empty());
   EXPECT_TRUE(controller_->requestStart(ramp()).accepted);
+}
+
+// The test-only service delays (vcan fault paths) must never be usable by accident.
+class TestFaultConfig : public ::testing::Test
+{
+public:
+  static void SetUpTestCase()
+  {
+    if (!rclcpp::ok()) {
+      rclcpp::init(0, nullptr);
+    }
+  }
+  static void TearDownTestCase() {rclcpp::shutdown();}
+  void TearDown() override {unsetenv("BXI_ALLOW_TEST_FAULTS");}
+
+  // init() and on_configure() with the given test_fault parameters.
+  static std::pair<std::unique_ptr<HilTrajectoryController>, controller_interface::CallbackReturn>
+  configure(const std::vector<rclcpp::Parameter> & faults)
+  {
+    auto controller = std::make_unique<HilTrajectoryController>();
+    std::vector<rclcpp::Parameter> overrides{rclcpp::Parameter("joint", "joint1"),
+      rclcpp::Parameter("record_seconds", 1.0)};
+    overrides.insert(overrides.end(), faults.begin(), faults.end());
+    rclcpp::NodeOptions options;
+    options.parameter_overrides(overrides);
+    controller_interface::ControllerInterfaceParams params;
+    params.controller_name = "hil_trajectory_fault_" + std::to_string(serial_++);
+    params.update_rate = 1000;
+    params.node_options = options;
+    EXPECT_EQ(controller->init(params), controller_interface::return_type::OK);
+    const auto result = controller->on_configure(rclcpp_lifecycle::State());
+    return {std::move(controller), result};
+  }
+
+private:
+  static inline int serial_ = 0;
+};
+
+TEST_F(TestFaultConfig, DelayIsRefusedWithoutTheEnvironmentSwitch)
+{
+  unsetenv("BXI_ALLOW_TEST_FAULTS");
+  EXPECT_EQ(configure({rclcpp::Parameter("test_fault.stop_delay", 0.2)}).second,
+    controller_interface::CallbackReturn::ERROR);
+  ASSERT_EQ(setenv("BXI_ALLOW_TEST_FAULTS", "yes", 1), 0);  // only "1" enables it
+  EXPECT_EQ(configure({rclcpp::Parameter("test_fault.start_delay", 0.2)}).second,
+    controller_interface::CallbackReturn::ERROR);
+  // Zero (the default) needs no switch.
+  unsetenv("BXI_ALLOW_TEST_FAULTS");
+  EXPECT_EQ(configure({}).second, controller_interface::CallbackReturn::SUCCESS);
+}
+
+TEST_F(TestFaultConfig, DelayOutOfRangeIsRefusedEvenWhenAllowed)
+{
+  ASSERT_EQ(setenv("BXI_ALLOW_TEST_FAULTS", "1", 1), 0);
+  EXPECT_EQ(configure({rclcpp::Parameter("test_fault.finish_delay", -0.1)}).second,
+    controller_interface::CallbackReturn::ERROR);
+  EXPECT_EQ(configure({rclcpp::Parameter("test_fault.stop_delay", 31.0)}).second,
+    controller_interface::CallbackReturn::ERROR);
+  EXPECT_EQ(configure({rclcpp::Parameter("test_fault.start_delay", kNaN)}).second,
+    controller_interface::CallbackReturn::ERROR);
+}
+
+TEST_F(TestFaultConfig, StopServiceAnswersOnlyAfterTheDelay)
+{
+  ASSERT_EQ(setenv("BXI_ALLOW_TEST_FAULTS", "1", 1), 0);
+  auto [controller, result] = configure({rclcpp::Parameter("test_fault.stop_delay", 0.3)});
+  ASSERT_EQ(result, controller_interface::CallbackReturn::SUCCESS);
+  rclcpp::executors::SingleThreadedExecutor executor;
+  executor.add_node(controller->get_node()->get_node_base_interface());
+  auto client_node = std::make_shared<rclcpp::Node>("stop_delay_client");
+  executor.add_node(client_node);
+  auto client = client_node->create_client<std_srvs::srv::Trigger>(
+    "/" + std::string(controller->get_node()->get_name()) + "/stop");
+  ASSERT_TRUE(client->wait_for_service(std::chrono::seconds(2)));
+  const auto sent = std::chrono::steady_clock::now();
+  auto future = client->async_send_request(std::make_shared<std_srvs::srv::Trigger::Request>());
+  ASSERT_EQ(executor.spin_until_future_complete(future, std::chrono::seconds(3)),
+    rclcpp::FutureReturnCode::SUCCESS);
+  const double waited = std::chrono::duration<double>(std::chrono::steady_clock::now() - sent).count();
+  EXPECT_GE(waited, 0.3);
+  EXPECT_TRUE(future.get()->success);
 }
 
 }  // namespace

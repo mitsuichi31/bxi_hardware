@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <thread>
 
 #include "pluginlib/class_list_macros.hpp"
 
@@ -28,6 +29,23 @@ constexpr double kMaxRampCycles = 5.0;
 constexpr double kMaxFriction = 1.0;
 constexpr double kMaxStribeckVelocity = 2.0;
 constexpr double kMinFrictionVelocity = 0.005;
+constexpr double kMaxTestDelayS = 30.0;
+
+// The test-only service delays are accepted only in a process started with this set.
+bool testFaultsAllowed()
+{
+  const char * value = std::getenv("BXI_ALLOW_TEST_FAULTS");
+  return value != nullptr && std::string(value) == "1";
+}
+
+// The log line tells a vcan test that the callback (and so the node's callbacks) is blocked.
+void sleepForTest(double seconds, const rclcpp::Logger & logger, const char * service)
+{
+  if (seconds > 0.0) {
+    RCLCPP_WARN(logger, "試験用の遅延：~/%s の処理を %.3f 秒止める", service, seconds);
+    std::this_thread::sleep_for(std::chrono::duration<double>(seconds));
+  }
+}
 constexpr double kMaxFrictionVelocity = 1.0;
 constexpr double kMaxKpLimit = 30.0;
 
@@ -80,6 +98,9 @@ controller_interface::CallbackReturn HilTrajectoryController::on_init()
   auto_declare<double>("record_seconds", 120.0);
   auto_declare<double>("max_run_seconds", 60.0);
   auto_declare<std::string>("output_dir", "");
+  auto_declare<double>("test_fault.start_delay", 0.0);
+  auto_declare<double>("test_fault.stop_delay", 0.0);
+  auto_declare<double>("test_fault.finish_delay", 0.0);
   return controller_interface::CallbackReturn::SUCCESS;
 }
 
@@ -114,6 +135,28 @@ controller_interface::CallbackReturn HilTrajectoryController::on_configure(
   record_seconds_ = node->get_parameter("record_seconds").as_double();
   max_run_seconds_ = node->get_parameter("max_run_seconds").as_double();
   output_dir_ = node->get_parameter("output_dir").as_string();
+  test_start_delay_s_ = node->get_parameter("test_fault.start_delay").as_double();
+  test_stop_delay_s_ = node->get_parameter("test_fault.stop_delay").as_double();
+  test_finish_delay_s_ = node->get_parameter("test_fault.finish_delay").as_double();
+  const double test_delays[] = {test_start_delay_s_, test_stop_delay_s_, test_finish_delay_s_};
+  bool test_faults = false;
+  for (const double delay : test_delays) {
+    if (!std::isfinite(delay) || delay < 0.0 || delay > kMaxTestDelayS) {
+      RCLCPP_ERROR(node->get_logger(), "test_fault の遅延は 0〜30 秒");
+      return controller_interface::CallbackReturn::ERROR;
+    }
+    test_faults = test_faults || delay > 0.0;
+  }
+  if (test_faults) {
+    if (!testFaultsAllowed()) {
+      RCLCPP_ERROR(node->get_logger(),
+        "test_fault は vcan の故障経路の試験専用で、BXI_ALLOW_TEST_FAULTS=1 のときだけ使える");
+      return controller_interface::CallbackReturn::ERROR;
+    }
+    RCLCPP_WARN(node->get_logger(),
+      "試験用のサービスの遅延が有効（start %.3f s、stop %.3f s、finish %.3f s）。実機では使わない",
+      test_start_delay_s_, test_stop_delay_s_, test_finish_delay_s_);
+  }
   if (output_dir_.empty()) {
     if (const char * dir = std::getenv("BXI_WORKER_TIMING_DIR")) {
       output_dir_ = dir;
@@ -135,6 +178,7 @@ controller_interface::CallbackReturn HilTrajectoryController::on_configure(
   start_service_ = node->create_service<srv::StartHilTrajectory>("~/start",
       [this](const std::shared_ptr<srv::StartHilTrajectory::Request> request,
       std::shared_ptr<srv::StartHilTrajectory::Response> response) {
+        sleepForTest(test_start_delay_s_, get_node()->get_logger(), "start");
         const auto result = requestStart(*request);
         response->accepted = result.accepted;
         response->request_id = result.id;
@@ -143,11 +187,13 @@ controller_interface::CallbackReturn HilTrajectoryController::on_configure(
   finish_service_ = node->create_service<std_srvs::srv::Trigger>("~/finish",
       [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
       std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
+        sleepForTest(test_finish_delay_s_, get_node()->get_logger(), "finish");
         response->success = requestFinish(&response->message);
       });
   stop_service_ = node->create_service<std_srvs::srv::Trigger>("~/stop",
       [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
       std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
+        sleepForTest(test_stop_delay_s_, get_node()->get_logger(), "stop");
         requestStop();
         response->success = true;
         response->message = "受け付けた（適用は ~/status の applied_stop_count で確かめる）";
