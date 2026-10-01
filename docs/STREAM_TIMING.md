@@ -35,4 +35,12 @@ metadataにはtrace_origin_steady_ns、send_loop_start_steady_ns、stream_stop_s
 
 completeは書き出しの完了だけを示し、制御正常や打ち切りなしを意味しない。行数、dropped_cycles・dropped_rx、実際のfault、fault_axis、stopped_externally、stop_reason、時計の起点、CSV書き出し時間を保存する。faultありはstop_reason=fault、それ以外はexternalまたはrequested_stop。
 
-合否時間はreportStream開始からcomplete公開までのreport_to_complete_ns（2秒以下）をログへ出す。complete内のcsv_write_elapsed_nsは診断値。書き出しスレッドのpolicy・priority・許可CPUと、enable前のRSS・VmLck、activation時間もログへ出す。制御周期や実機の安全基準は変更していない。撮影確認と収録範囲のランナー検査・新しい解析はworkspace側の後続作業で行う。
+合否時間はreportStream開始からcomplete公開までのreport_to_complete_ns（2秒以下）をログへ出す。complete内のcsv_write_elapsed_nsは診断値。書き出しスレッドのpolicy・priority・許可CPUと、enable前のRSS・VmLck、activation時間もログへ出す。制御周期や実機の安全基準は変更していない。
+
+## workspaceの停止後解析
+
+workspace側の `tools/hil_video_analyze.py RUN --iface can0 --out NEW_DIRECTORY` は、保存・停止後にv2実記録の完了印・行数・時計・操作範囲を確認し、controller・成功send・RXのsteady時系列、skip／失敗／置換、ageと応答再利用、受信空白、指令／応答の図とSIN fitを生成する。NumPy・Matplotlibの依存と使い方はworkspaceの段階3R・4R手順書、手順5の解析レポートを参照する。手順5は実装・検証完了、ユーザーレビュー待ち。
+
+収録範囲検査が使う最終予定slotの終端は実際のstream_stop_steady_nsより後になり得る。TX/RXの解析は実停止で打ち切り、controllerが後から書いた異常検出行は元の操作終端まで保持する。図はslot範囲終端と実停止を区別する。受信値は実効offset・方向を使って関節座標へ換算する。
+
+全8バイトの再エンコードと埋め草を含むcandump候補照合を行うが、候補再利用・複数候補があるため厳密な一対一遅延とはしない。合成記録・旧v2のflag欠落は拒否。CAN欠落は完全性partial、制御faultと書き出し・解析の成否は分ける。取得時と後処理時それぞれの版・ソースsnapshot・SHA256を保存する。
