@@ -39,7 +39,7 @@ completeは書き出しの完了だけを示し、制御正常や打ち切りな
 
 ## workspaceの停止後解析
 
-workspace側の `tools/hil_video_analyze.py RUN --iface can0 --out NEW_DIRECTORY` は、保存・停止後にv2実記録の完了印・行数・時計・操作範囲を確認し、controller・成功send・RXのsteady時系列、skip／失敗／置換、ageと応答再利用、受信空白、指令／応答の図とSIN fitを生成する。NumPy・Matplotlibの依存と使い方はworkspaceの段階3R・4R手順書、手順5の解析レポートを参照する。手順5は実装・検証完了、ユーザーレビュー待ち。
+workspace側の `tools/hil_video_analyze.py RUN --iface can0 --out NEW_DIRECTORY` は、保存・停止後にv2実記録の完了印・行数・時計・操作範囲を確認し、controller・成功send・RXのsteady時系列、skip／失敗／置換、ageと応答再利用、受信空白、指令／応答の図とSIN fitを生成する。NumPy・Matplotlibの依存と使い方はworkspaceの段階3R・4R手順書、手順5の解析レポートを参照する。手順5はユーザーの再レビューで承認済み。実機作業はworkspace側の手順6への申し送りを確認して準備する。
 
 収録範囲検査が使う最終予定slotの終端は実際のstream_stop_steady_nsより後になり得る。TX/RXの解析は実停止で打ち切り、controllerが後から書いた異常検出行は元の操作終端まで保持する。図はslot範囲終端と実停止を区別する。受信値は実効offset・方向を使って関節座標へ換算する。
 
