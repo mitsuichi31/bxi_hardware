@@ -47,7 +47,8 @@ public:
   double duration() const noexcept {return duration_;}
   // An upper bound of |target velocity| over the whole trajectory, including the envelope's
   // derivative while the amplitude ramps up and down:
-  //   |v| = |da/dt sin(wt) + a w cos(wt)| <= max|da/dt| + A w = A pi / (2 ramp) + A w,
+  //   |v| = |da/dt sin(wt) + a w cos(wt)| <= hypot(da/dt, a w)
+  //       <= A hypot(w, pi / (2 ramp)), by Cauchy-Schwarz,
   // or A w without a ramp. Never below the true maximum, however short the ramp (sampling the
   // ramps would miss the peak of one shorter than the sampling step).
   double velocityUpperBound() const noexcept;
