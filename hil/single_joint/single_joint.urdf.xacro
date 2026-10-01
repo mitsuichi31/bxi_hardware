@@ -3,6 +3,7 @@
 <robot name="bxi_single_joint" xmlns:xacro="http://www.ros.org/wiki/xacro">
   <xacro:arg name="config_file" default=""/>
   <xacro:arg name="spec_dir" default=""/>
+  <xacro:arg name="hardware_plugin" default="bxi_hardware/BxiSystemInterface"/>
 
   <link name="base_link"/>
   <link name="output_link"/>
@@ -16,7 +17,7 @@
 
   <ros2_control name="BxiSingleJoint" type="system">
     <hardware>
-      <plugin>bxi_hardware/BxiSystemInterface</plugin>
+      <plugin>$(arg hardware_plugin)</plugin>
       <param name="config_file">$(arg config_file)</param>
       <param name="spec_dir">$(arg spec_dir)</param>
     </hardware>

@@ -11,6 +11,8 @@
 
 #include <atomic>
 #include <cstdint>
+#include <string>
+#include <vector>
 
 #include "controller_interface/controller_interface.hpp"
 #include "rclcpp/rclcpp.hpp"
@@ -22,6 +24,7 @@ namespace bxi_hardware
 class HilUpdateStallController : public controller_interface::ControllerInterface
 {
 public:
+  ~HilUpdateStallController() override;
   controller_interface::CallbackReturn on_init() override;
   controller_interface::InterfaceConfiguration command_interface_configuration() const override;
   controller_interface::InterfaceConfiguration state_interface_configuration() const override;
@@ -36,6 +39,11 @@ public:
   uint32_t stalls() const {return stalls_.load(std::memory_order_acquire);}
 
 private:
+  std::string probe_path_;
+  std::vector<int64_t> probe_times_;
+  size_t probe_count_ = 0;
+  int probe_policy_ = -1, probe_priority_ = -1, probe_cpu_ = -1;
+  long probe_tid_ = -1;
   int64_t stall_ms_ = 50;
   std::atomic<bool> stall_requested_{false};
   std::atomic<uint32_t> stalls_{0};

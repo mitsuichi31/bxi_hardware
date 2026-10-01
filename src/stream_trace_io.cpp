@@ -238,7 +238,8 @@ StreamTraceWriteResult StreamTraceOutput::write(const StreamTrace & trace,
     ",dropped_cycles=" + std::to_string(result.dropped_cycles) +
     ",dropped_rx=" + std::to_string(result.dropped_rx) +
     ",tx_thread=" + describe(trace.tx_thread) + ",rx_thread=" + describe(trace.rx_thread) +
-    ",format_version=2,trace_origin_steady_ns=" + std::to_string(origin) +
+    ",format_version=2,trace_synthetic=" + (trace.synthetic ? "1" : "0") +
+    ",trace_origin_steady_ns=" + std::to_string(origin) +
     ",send_loop_start_steady_ns=" + std::to_string(trace.send_loop_start_steady_ns) +
     ",stream_stop_steady_ns=" + std::to_string(trace.stream_stop_steady_ns) +
     ",trace_cycles_capacity=" + std::to_string(trace.cycles.size()) +

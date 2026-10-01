@@ -152,6 +152,7 @@ struct StreamAxisMetadata
 // Filled while running and read after stop(). HWIF prepares storage before enable; start() moves it.
 struct StreamTrace
 {
+  bool synthetic = false;  // Test-only maximum-capacity output; never physical CAN observations.
   std::chrono::steady_clock::time_point origin{};
   size_t axes = 0;
   int64_t send_loop_start_steady_ns = -1;

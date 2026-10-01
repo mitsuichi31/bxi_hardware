@@ -1,0 +1,5 @@
+<library path="bxi_hil_trace_test">
+  <class name="bxi_hardware/HilTraceBenchmarkSystem" type="bxi_hardware::HilTraceBenchmarkSystem" base_class_type="hardware_interface::SystemInterface">
+    <description>vcan-only synthetic maximum-capacity trace output benchmark. Refused without BXI_ALLOW_TEST_FAULTS=1.</description>
+  </class>
+</library>

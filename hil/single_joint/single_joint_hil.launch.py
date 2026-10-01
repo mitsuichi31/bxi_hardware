@@ -30,11 +30,14 @@ def generate_launch_description():
             "xacro ", PathJoinSubstitution([hil_dir, "single_joint.urdf.xacro"]),
             " config_file:=", config_file,
             " spec_dir:=", spec_dir,
+            " hardware_plugin:=", LaunchConfiguration("hardware_plugin"),
         ]),
         value_type=str,
     )
 
     return LaunchDescription([
+        DeclareLaunchArgument("hardware_plugin", default_value="bxi_hardware/BxiSystemInterface",
+                              description="HWIF plugin; synthetic trace benchmark requires vcan and test opt-in"),
         DeclareLaunchArgument(
             "config_file",
             default_value=PathJoinSubstitution([hil_dir, "bxi_hardware.yaml"]),

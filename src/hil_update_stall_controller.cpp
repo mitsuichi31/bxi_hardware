@@ -4,11 +4,30 @@
 #include <cstdlib>
 #include <string>
 #include <thread>
+#include <fstream>
+#include <sched.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 #include "pluginlib/class_list_macros.hpp"
 
 namespace bxi_hardware
 {
+HilUpdateStallController::~HilUpdateStallController()
+{
+  // Controller manager has finished the update loop before destroying plugins.
+  // No file output in update() or lifecycle callbacks on the update thread.
+  if (!probe_path_.empty()) {
+    std::ofstream out(probe_path_);
+    out << "#policy=" << probe_policy_ << ",priority=" << probe_priority_ << ",cpu=" << probe_cpu_
+        << ",tid=" << probe_tid_ << ",rows=" << std::min(probe_count_, probe_times_.size())
+        << ",dropped=" << (probe_count_ > probe_times_.size() ? probe_count_ - probe_times_.size() : 0)
+        << "\nsteady_ns\n";
+    for (size_t i = 0; i < std::min(probe_count_, probe_times_.size()); ++i) {out << probe_times_[i] << '\n';}
+    out.close();
+    if (!out) {RCLCPP_ERROR(get_node()->get_logger(), "update probe write failed");}
+  }
+}
 
 controller_interface::CallbackReturn HilUpdateStallController::on_init()
 {
@@ -43,6 +62,10 @@ controller_interface::CallbackReturn HilUpdateStallController::on_configure(
     RCLCPP_ERROR(node->get_logger(), "stall_ms は 1〜10000");
     return controller_interface::CallbackReturn::ERROR;
   }
+  if (const char * directory = std::getenv("BXI_WORKER_TIMING_DIR")) {
+    probe_path_ = std::string(directory) + "/controller_update_probe.csv";
+    probe_times_.resize(120000);
+  }
   stall_service_ = node->create_service<std_srvs::srv::Trigger>("~/stall",
       [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
       std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
@@ -59,6 +82,18 @@ controller_interface::CallbackReturn HilUpdateStallController::on_configure(
 controller_interface::return_type HilUpdateStallController::update(
   const rclcpp::Time &, const rclcpp::Duration &)
 {
+  if (!probe_times_.empty()) {
+    if (probe_count_ == 0) {
+      sched_param scheduling{}; ::sched_getparam(0, &scheduling);
+      probe_policy_ = ::sched_getscheduler(0); probe_priority_ = scheduling.sched_priority;
+      probe_cpu_ = ::sched_getcpu(); probe_tid_ = ::syscall(SYS_gettid);
+    }
+    if (probe_count_ < probe_times_.size()) {
+      probe_times_[probe_count_] = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+    ++probe_count_;
+  }
   // Deliberately blocks the real-time loop: this is the fault being tested.
   if (stall_requested_.exchange(false, std::memory_order_acq_rel)) {
     std::this_thread::sleep_for(std::chrono::milliseconds(stall_ms_));

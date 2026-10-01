@@ -71,8 +71,9 @@ class StreamTraceOutput
 public:
   StreamTraceOutput(const std::string & directory, const std::string & bus,
     std::shared_ptr<TraceFileOps> ops = std::make_shared<TraceFileOps>());
+  virtual ~StreamTraceOutput() = default;
   const std::string & stem() const {return stem_;}
-  StreamTraceWriteResult write(const BxiBusStreamer & streamer,
+  virtual StreamTraceWriteResult write(const BxiBusStreamer & streamer,
     std::chrono::steady_clock::time_point report_start);
   // Same writer for maximum-capacity benchmarks and fault-injection tests after stop/join.
   StreamTraceWriteResult write(const StreamTrace & trace, const StreamConfig & config,
