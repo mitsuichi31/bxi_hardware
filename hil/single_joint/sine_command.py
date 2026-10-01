@@ -18,8 +18,8 @@ Fs を省略すると一定値 Fc の上乗せになる。実測の速度では�
 
 実行前に止める:
   - center ± amplitude が --lower / --upper（bxi_hardware.yaml の範囲）をはみ出す
-  - 目標速度の上界が --max-velocity を超える（振幅一定の区間の amplitude × 2πf に、振幅を
-    立ち上げ・立ち下げる間の包絡線の微分の最大を足した値。Trajectory.velocity_bound()）
+  - 目標速度の上界が --max-velocity を超える（振幅一定の区間と
+    包絡線の微分の両成分を含む解析的上界。Trajectory.velocity_bound()）
 実行中に中止し、Kp=0 の指令（その場で力を抜く）を送って終わる:
   - Kp × |目標 − 位置| + |上乗せトルク| が --max-torque [N·m] を超えた
   - /joint_states が 0.2 秒以上届かない
@@ -147,14 +147,14 @@ class Trajectory:
         """軌道全体の目標速度の絶対値の上界 [rad/s]（真の最大より小さくならない）。
 
         目標速度は包絡線の微分を含む（v = da/dt × sin + a × ω × cos）ので、振幅 × ω だけでは
-        立ち上げ・立ち下げの間の値を見落とす。|v| ≤ max|da/dt| + A × ω = A × π / (2 × 立ち上げの時間)
-        + A × ω（立ち上げがなければ A × ω）。立ち上げの区間を刻んで調べる方法は、刻みより短い
+        立ち上げ・立ち下げの間の値を見落とす。Cauchy-Schwarz により |v| ≤ hypot(da/dt, a × ω)
+        ≤ A × hypot(ω, π / (2 × 立ち上げの時間))（立ち上げがなければ A × ω）。立ち上げの区間を刻んで調べる方法は、刻みより短い
         立ち上げの山を見落とすので使わない。C++ の bxi_hardware::hil::SineTrajectory::velocityUpperBound
         と同じ式。
         """
         if self.ramp <= 0.0:
             return self.amplitude * self.omega
-        return self.amplitude * self.omega + self.amplitude * 0.5 * math.pi / self.ramp
+        return self.amplitude * math.hypot(self.omega, 0.5 * math.pi / self.ramp)
 
     def at(self, t):
         """(目標位置, 目標速度)"""

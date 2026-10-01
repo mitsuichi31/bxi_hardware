@@ -64,7 +64,9 @@ double SineTrajectory::velocityUpperBound() const noexcept
   if (ramp_ <= 0.0) {
     return amplitude_ * omega_;  // the amplitude never changes
   }
-  return amplitude_ * omega_ + amplitude_ * 0.5 * kPi / ramp_;
+  // Cauchy-Schwarz: |da*sin + a*omega*cos| <= hypot(da, a*omega).
+  // Bound each component over the entire envelope, including arbitrarily short ramps.
+  return amplitude_ * std::hypot(omega_, 0.5 * kPi / ramp_);
 }
 
 double frictionTorque(

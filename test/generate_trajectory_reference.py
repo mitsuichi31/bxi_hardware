@@ -23,6 +23,7 @@ from ramp_command import ramp_setpoint  # noqa: E402
 from sine_command import Trajectory, friction_torque  # noqa: E402
 
 SINES = [
+    (0.0, 1.5707963267948966, 0.1, 1.0, 2.0),  # 90 degrees, faster profile
     (0.05, 0.2, 0.5, 3.0, 1.0),
     (0.0452, 0.1, 0.5, 5.0, 1.0),     # HIL stage 4, first condition
     (-0.1, 0.3, 0.2, 5.0, 1.0),

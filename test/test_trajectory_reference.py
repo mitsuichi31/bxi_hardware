@@ -30,7 +30,7 @@ def test_velocity_bound_includes_the_envelope_derivative():
     assert peak > 78000.0
     assert tiny.velocity_bound() >= peak
     stage4 = Trajectory(0.0452, 0.1, 0.5, 5.0, 1.0)
-    assert stage4.velocity_bound() == pytest.approx(0.1 * math.pi * 1.25, abs=1e-12)
+    assert stage4.velocity_bound() == pytest.approx(0.1 * math.hypot(math.pi, math.pi / 4), abs=1e-12)
     # Without a ramp the amplitude never changes.
     assert Trajectory(0.0, 0.1, 0.5, 2.0, 0.0).velocity_bound() == pytest.approx(0.1 * math.pi)
 

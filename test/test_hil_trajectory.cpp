@@ -91,7 +91,7 @@ TEST(HilTrajectory, MatchesThePythonReferenceTable)
   }
   // Every kind is present, so a truncated table cannot pass silently.
   EXPECT_GE(counts[0], 600U);
-  EXPECT_EQ(counts[1], 6U);
+  EXPECT_EQ(counts[1], 7U);
   EXPECT_GE(counts[2], 400U);
   EXPECT_EQ(counts[3], 45U);
 }
@@ -122,14 +122,15 @@ TEST(HilTrajectory, VelocityBoundIncludesTheEnvelopeDerivative)
   EXPECT_GT(peak, 78000.0);
   EXPECT_GE(tiny_ramp.velocityUpperBound(), peak);
   EXPECT_GT(tiny_ramp.velocityUpperBound(), 2.0);
-  // HIL stage 4's first condition: 0.1 pi + 0.1 pi / 4, far below 2 rad/s.
+  // HIL stage 4's first condition: hypot(0.1 pi, 0.1 pi / 4), below 2 rad/s.
   const SineTrajectory stage4(0.0452, 0.1, 0.5, 5.0, 1.0);
-  EXPECT_NEAR(stage4.velocityUpperBound(), 0.1 * M_PI * 1.25, 1e-12);
+  EXPECT_NEAR(stage4.velocityUpperBound(), 0.1 * std::hypot(M_PI, M_PI / 4), 1e-12);
 }
 
 TEST(HilTrajectory, VelocityBoundIsNeverBelowTheSampledMaximum)
 {
   const double sines[][5] = {
+    {0.0, 1.5707963267948966, 0.1, 1.0, 2.0},
     {0.05, 0.2, 0.5, 3.0, 1.0}, {0.0452, 0.1, 0.5, 5.0, 1.0}, {-0.1, 0.3, 0.2, 5.0, 1.0},
     {0.0, 0.45, 0.6, 1.0, 0.01}, {0.0, 0.1, 2.0, 0.0, 0.5}, {0.0, 0.1, 0.5, 2.0, 0.0},
     {0.0, 0.5, 5.0, 3.0, 0.5}, {0.0, 0.3, 1.0, 0.0, 5.0},
