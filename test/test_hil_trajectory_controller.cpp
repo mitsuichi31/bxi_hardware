@@ -1031,5 +1031,15 @@ TEST_F(WideSineControllerTest, RejectsExcessAmplitudeSpeedAndDuration)
   EXPECT_FALSE(controller_->requestStart(sine(1.5707963267948966, 0.05, 5, 1)).accepted);
 }
 
+TEST_F(WideSineControllerTest, RefusesDisplacedStartBeforeApplyingGains)
+{
+  position_ = 0.06;
+  startAndArm(sine(1.5707963267948966, 0.05, 1.0, 1.0));
+  step();
+  EXPECT_NE(controller_->snapshot().state, State::kRunning);
+  EXPECT_TRUE(outputsReleased());
+  EXPECT_EQ(controller_->snapshot().end_reason, EndReason::kStartRange);
+}
+
 }  // namespace
 }  // namespace bxi_hardware

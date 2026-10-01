@@ -432,7 +432,8 @@ controller_interface::return_type HilTrajectoryController::update(
             break;
         }
         if (run_.kind == Kind::kSine &&
-          ((fixed_sine_center_ ? sine_center_ : position) - run_.amplitude < lower_ ||
+          ((fixed_sine_center_ && std::abs(position - sine_center_) > 0.05) ||
+          (fixed_sine_center_ ? sine_center_ : position) - run_.amplitude < lower_ ||
           (fixed_sine_center_ ? sine_center_ : position) + run_.amplitude > upper_))
         {
           endRun(EndReason::kStartRange, now);

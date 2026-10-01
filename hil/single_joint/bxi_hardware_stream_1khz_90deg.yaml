@@ -1,5 +1,5 @@
 # Explicit opt-in: ±90-degree trial; safety bounds ±1.65 rad.
-# 1軸の実機試験（ベンチ）用：送受信分離・CAN FD（BRSなし）・1 kHz。controllers_1khz.yaml と組み合わせる。
+# 1軸の実機試験（ベンチ）用：送受信分離・CAN FD（BRSなし）・1 kHz。controllers_1khz_rt_90deg.yaml と組み合わせる。
 # 実機では段階6の前提（独立電源遮断の記録、bus-off 方針、ベンダー回答など）を満たすまで使わない。
 # 計画：docs/plans/20260928_bxi_worker_stream_broadcast_plan.md（ワークスペース側）
 # 事前にホストで can0 を FD（1 Mbps / 5 Mbps、fd on）で up しておくこと。BRSなしはフレーム側で選ぶ。
@@ -44,7 +44,7 @@ joints:
     can_id: 1
     motor_dir: 1
     motor_type: MOTOR_70
-    # ベンチ試験用の狭い範囲 [rad]（出力軸、ユーザーゼロ点基準）
+    # ±90°専用の停止用余裕を含む範囲（±1.65 rad、約±94.54°） [rad]（出力軸、ユーザーゼロ点基準）
     lower: -1.65
     upper: 1.65
     # position だけを指令し、kp / kd を指令しなかったときに使う値。位置だけの指令で力が出ないように0に
