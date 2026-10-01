@@ -25,6 +25,10 @@ export BXI_STREAM_TRACE_CYCLES=620000
 
 metadataにはtrace_origin_steady_ns、send_loop_start_steady_ns、stream_stop_steady_ns、容量・確保量・確保時間、実効offset・上下限・codec limits、ブロック数・埋め草8バイトを保存する。多軸の座標情報にはcan_idごとの接尾辞を付ける。無効なsend時刻は空欄。send_loop未開始やstop未実施は-1。外部停止を送信ループ先頭で検知した周期は行を作らないため、最終stopped行を必須にしない。
 
+`trace_synthetic=0` は実際の送受信記録、`1` は書き出し負荷試験の合成データ。workspaceのv2収録検査はこのキーを必須とし、合成データは明示的に許可したvcan負荷試験だけで評価対象外として扱う。キーがなかった旧v2記録は、新しい検査ではNGになる。過去のrawを補完・書き換えず、当時の検査結果と区別する。
+
+`BUILD_TESTING=ON`（colconの既定）のビルドでは、試験用 `HilTraceBenchmarkSystem` pluginも通常のinstall先へ入る。launchの既定は本番pluginのまま。試験pluginは明示的な `BXI_ALLOW_TEST_FAULTS=1` と単一の仮想vcan構成を要求し、実機構成をenable前に拒否する。合成データを実際のCAN周期や操作範囲の評価に使わない。
+
 ## 完了印と停止
 
 各CSVはexclusive create、flush・closeの成功を検査する。`.complete.tmp` を同様に書き、linkで `.complete` を上書きなしに公開する。過去ファイルや競合は拒否し、途中ファイルを診断用に残す。公開後のtmp削除失敗は警告となるが、公開済みのcompleteは有効。fsyncによる電源断への永続化は保証しない。
