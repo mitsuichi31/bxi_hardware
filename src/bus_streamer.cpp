@@ -1,4 +1,5 @@
 #include "bxi_hardware/bus_streamer.hpp"
+#include "bxi_hardware/stream_trace_io.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -169,6 +170,10 @@ bool BxiBusStreamer::validate()
     error_ = "incomplete stream setup";
     return false;
   }
+  if (config_.trace_extended && (!config_.broadcast || drivers_.size() != 1)) {
+    error_ = "expanded trace requires 1-axis broadcast";
+    return false;
+  }
   // Two missing or late replies in a row must not stop a healthy bus.
   const auto valid_priority = [](int priority) {return priority >= 0 && priority <= 98;};
   if (!valid_priority(config_.send_priority) || !valid_priority(config_.receive_priority) ||
@@ -229,7 +234,7 @@ bool BxiBusStreamer::validate()
   return true;
 }
 
-bool BxiBusStreamer::start()
+bool BxiBusStreamer::start(std::unique_ptr<StreamTrace> prepared)
 {
   if (rx_thread_.joinable() || tx_thread_.joinable()) {
     error_ = "already started";
@@ -257,15 +262,33 @@ bool BxiBusStreamer::start()
   tx_stats_.replies.assign(n, 0);
   tx_stats_.cycles_without_new_reply.assign(n, 0);
   tx_stats_.max_age_ms.assign(n, 0.0);
-  trace_ = StreamTrace{};
-  trace_.axes = n;
-  trace_.origin = clock_type::now();
-  if (config_.trace_cycles > 0) {
-    trace_.cycles.resize(config_.trace_cycles);
-    trace_.age_ns.resize(config_.trace_cycles * n);
-    trace_.fresh.resize(config_.trace_cycles * n);
-    trace_.rx.resize(2 * config_.trace_cycles * n);
+  try {
+    if (!prepared) {
+      prepared = prepareStreamTrace(config_.trace_cycles, n);
+    }
+    if (prepared->axes != n || prepared->cycles.size() != config_.trace_cycles ||
+      prepared->age_ns.size() != config_.trace_cycles * n ||
+      prepared->fresh.size() != config_.trace_cycles * n ||
+      prepared->rx.size() != 2 * config_.trace_cycles * n ||
+      prepared->cycle_count != 0 || prepared->rx_count != 0 ||
+      prepared->axis_metadata.size() != n)
+    {
+      error_ = "prepared trace shape mismatch";
+      return false;
+    }
+    trace_ = std::move(*prepared);
+    for (size_t i = 0; i < n; ++i) {
+      const auto * driver = drivers_[i];
+      const auto range = driver->effectiveAngleRange();
+      trace_.axis_metadata[i] = {driver->canId(), driver->motorDirection(),
+        driver->effectiveAngleOffset(), range.first, range.second, driver->limits()};
+    }
+  } catch (const std::exception & e) {
+    error_ = std::string("trace preparation: ") + e.what();
+    return false;
   }
+  // Allocation and effective-coordinate snapshot are complete before the receive clock begins.
+  trace_.origin = clock_type::now();
 
   rx_state_ = kStarting;
   tx_state_ = kStarting;
@@ -336,6 +359,9 @@ void BxiBusStreamer::stop()
   if (rx_thread_.joinable()) {
     rx_thread_.join();
   }
+  if (trace_.stream_stop_steady_ns < 0) {
+    trace_.stream_stop_steady_ns = toNanoseconds(clock_type::now().time_since_epoch());
+  }
 }
 
 StreamStats BxiBusStreamer::stats() const
@@ -391,6 +417,9 @@ void BxiBusStreamer::receiveLoop()
           row.rx_kernel_realtime_ns = frame.rx_kernel_realtime_ns;
           row.rx_userspace_realtime_ns = frame.rx_userspace_realtime_ns;
           row.rx_hardware_raw_ns = frame.rx_hardware_raw_ns;
+          row.motor_position = decoded->position;
+          row.motor_velocity = decoded->velocity;
+          row.motor_torque = decoded->torque;
         }
         ++trace_.rx_count;
       }
@@ -458,6 +487,7 @@ void BxiBusStreamer::sendLoop()
   bool sent_previous_cycle = false;
 
   const auto start = clock_type::now();
+  trace_.send_loop_start_steady_ns = toNanoseconds(start.time_since_epoch());
   for (uint64_t k = 0; tx_running_; ++k) {
     const auto target = start + k * period;
     std::this_thread::sleep_until(target);
@@ -585,6 +615,11 @@ void BxiBusStreamer::sendLoop()
         break;
       }
     }
+    if (row != nullptr && config_.broadcast && n == 1) {
+      row->command = commands[0];
+      row->command_valid = true;
+      row->command_stale = command_stale;
+    }
     for (size_t i = 0; i < n && !faulted; ++i) {
       const auto & c = commands[i];
       const auto block =
@@ -595,6 +630,10 @@ void BxiBusStreamer::sendLoop()
         break;
       }
       blocks[i] = {can_ids_[i], *block};
+      if (row != nullptr && config_.broadcast && n == 1) {
+        row->command_block = *block;
+        row->encoded_valid = true;
+      }
     }
     if (faulted) {
       set_outcome(StreamCycleOutcome::kStopped);
@@ -616,7 +655,19 @@ void BxiBusStreamer::sendLoop()
       } else {
         send_time = clock_type::now();
         const auto frame = buildBroadcastFrame(blocks, block_count_, padding_block_);
-        if (!frame.has_value() || !tx_bus_->send(*frame)) {
+        bool success = false;
+        if (frame.has_value()) {
+          if (row != nullptr && n == 1) {
+            row->send_attempted = true;
+            row->send_before_steady_ns = toNanoseconds(clock_type::now().time_since_epoch());
+          }
+          success = tx_bus_->send(*frame);
+          if (row != nullptr && n == 1) {
+            row->send_after_steady_ns = toNanoseconds(clock_type::now().time_since_epoch());
+            row->send_success = success;
+          }
+        }
+        if (!success) {
           for (auto * driver : drivers_) {
             driver->latchCommunicationFault();
           }

@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -83,6 +84,7 @@ struct StreamConfig
   // Cycles to record in the preallocated trace (0 = no trace). Replies get twice as many rows
   // per axis.
   size_t trace_cycles = 0;
+  bool trace_extended = false;
   // SCHED_FIFO priority (1-98) of each thread; 0 selects SCHED_OTHER even if the thread calling
   // start() runs under SCHED_FIFO. Each thread applies its own setting as it starts, and start()
   // fails if that is refused.
@@ -114,6 +116,15 @@ struct StreamCycleRecord
   int64_t command_age_ns = -1;
   uint8_t frames = 0;
   StreamCycleOutcome outcome = StreamCycleOutcome::kSent;
+  StreamCommand command{};  // Post-stale replacement, before encoder saturation/conversion.
+  std::array<uint8_t, 8> command_block{};
+  int64_t send_before_steady_ns = -1;
+  int64_t send_after_steady_ns = -1;
+  bool command_valid = false;
+  bool encoded_valid = false;
+  bool send_attempted = false;
+  bool send_success = false;
+  bool command_stale = false;
 };
 
 struct StreamRxRecord
@@ -123,13 +134,31 @@ struct StreamRxRecord
   int64_t rx_kernel_realtime_ns = 0;
   int64_t rx_userspace_realtime_ns = 0;
   int64_t rx_hardware_raw_ns = 0;
+  double motor_position = 0.0;
+  double motor_velocity = 0.0;
+  double motor_torque = 0.0;
 };
 
-// Filled only while running and read only after stop(). All storage is allocated in start().
+struct StreamAxisMetadata
+{
+  int can_id = 0;
+  int motor_dir = 1;
+  double offset_rad_effective = 0.0;
+  double lower_rad_effective = 0.0;
+  double upper_rad_effective = 0.0;
+  protocol::MitLimits limits{};
+};
+
+// Filled while running and read after stop(). HWIF prepares storage before enable; start() moves it.
 struct StreamTrace
 {
   std::chrono::steady_clock::time_point origin{};
   size_t axes = 0;
+  int64_t send_loop_start_steady_ns = -1;
+  int64_t stream_stop_steady_ns = -1;
+  int64_t allocation_ns = 0;
+  size_t payload_bytes = 0;
+  std::vector<StreamAxisMetadata> axis_metadata;
   std::vector<StreamCycleRecord> cycles;
   size_t cycle_count = 0;  // may exceed cycles.size(); the excess is dropped
   // cycles.size() x axes, row-major. Age at the start of the cycle; -1 before the first send.
@@ -184,7 +213,8 @@ public:
 
   // Starts the receive thread, waits until it is receiving, then starts the send thread.
   // Returns false, with no thread left running, on an invalid setup or a receive-start timeout.
-  bool start();
+  // HWIF must supply storage prepared before any enable. Legacy standalone callers may omit it.
+  bool start(std::unique_ptr<StreamTrace> prepared = nullptr);
   // True once every axis has a reply received after the first streamed send; false on timeout
   // or fault.
   bool waitForFirstFeedback(std::chrono::nanoseconds timeout);
@@ -202,6 +232,8 @@ public:
   const StreamTrace & trace() const {return trace_;}
   const StreamConfig & config() const {return config_;}
   const std::vector<int> & canIds() const {return can_ids_;}
+  size_t broadcastBlockCount() const {return block_count_;}
+  const std::array<uint8_t, 8> & paddingBlock() const {return padding_block_;}
 
   // The 0x7FF frame for blocks indexed by motor ID - 1. nullopt if the length is not a valid
   // CAN FD length or a block position is out of range.

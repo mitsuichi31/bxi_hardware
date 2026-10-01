@@ -6,6 +6,7 @@
 #include <cstring>
 #include <functional>
 #include <map>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -20,6 +21,7 @@
 #include <gtest/gtest.h>
 
 #include "bxi_hardware/bus_streamer.hpp"
+#include "bxi_hardware/stream_trace_io.hpp"
 
 namespace bxi_hardware
 {
@@ -959,6 +961,9 @@ TEST(BusStreamer, SlowHookDoesNotSendAnExpiredCommand)
   EXPECT_GE(expired->hook_ns, 4'500'000);
   EXPECT_EQ(expired->frames, 0U);
   EXPECT_EQ(expired->send_lateness_ns, -1);
+  EXPECT_FALSE(expired->command_valid); EXPECT_FALSE(expired->encoded_valid); // Unicast has no TX detail.
+  EXPECT_FALSE(expired->send_attempted);
+  EXPECT_EQ(expired->send_before_steady_ns, -1);
 }
 
 TEST(BusStreamer, StopRequestedDuringTheHookSendsNothing)
@@ -1262,6 +1267,148 @@ TEST(BusStreamer, StopJoinsWithin10msAfterAFailedFirstFeedbackWait)
   EXPECT_FALSE(streamer->waitForFirstFeedback(c.max_feedback_age + c.period));
   EXPECT_LT(stopDurationMs(*streamer), 10.0);
   streamer->stop();  // idempotent
+}
+
+TEST(BusStreamer, PreparedTraceMovesStorageAndSnapshotsEffectiveCoordinates)
+{
+  Rig rig({1});
+  rig.drivers[0]->setAngleOffset(-6.283185307179586);
+  rig.drivers[0]->setAngleRange(-0.2, 0.2);
+  const StreamCommand command{0.5, -0.1, 20.0, 1.0, 0.02};
+  const auto encoded = rig.drivers[0]->encodeControlBlock(command.position, command.velocity,
+    command.kp, command.kd, command.effort);
+  ASSERT_TRUE(encoded.has_value());
+  auto c = config(1ms, true); c.trace_cycles = 200; c.max_feedback_age = 50ms;
+  auto streamer = rig.makeStreamer(c, [command](const auto &, auto & commands) {
+      commands[0] = command; return true;
+    });
+  auto prepared = prepareStreamTrace(200, 1);
+  const auto * storage = prepared->cycles.data();
+  std::this_thread::sleep_for(5ms);
+  const auto before_start = clock_type::now();
+  ASSERT_TRUE(streamer->start(std::move(prepared)));
+  ASSERT_TRUE(streamer->waitForFirstFeedback(20ms));
+  std::this_thread::sleep_for(20ms); streamer->stop();
+  const auto & trace = streamer->trace();
+  EXPECT_EQ(trace.cycles.data(), storage);
+  EXPECT_GE(trace.origin, before_start);
+  EXPECT_GE(trace.send_loop_start_steady_ns, trace.origin.time_since_epoch().count());
+  EXPECT_GT(trace.stream_stop_steady_ns, trace.send_loop_start_steady_ns);
+  ASSERT_EQ(trace.axis_metadata.size(), 1U);
+  EXPECT_DOUBLE_EQ(trace.axis_metadata[0].offset_rad_effective, -6.283185307179586);
+  EXPECT_DOUBLE_EQ(trace.axis_metadata[0].lower_rad_effective, -0.2);
+  EXPECT_DOUBLE_EQ(trace.axis_metadata[0].upper_rad_effective, 0.2);
+  size_t sent = 0;
+  for (size_t i = 0; i < trace.cycle_count; ++i) {
+    const auto & r = trace.cycles[i];
+    if (!r.send_attempted) {continue;}
+    ++sent;
+    EXPECT_TRUE(r.command_valid); EXPECT_TRUE(r.encoded_valid); EXPECT_TRUE(r.send_success);
+    EXPECT_DOUBLE_EQ(r.command.position, 0.5);  // Before the encoder clamps it to 0.2.
+    EXPECT_EQ(r.command_block, *encoded);
+    EXPECT_GE(r.send_before_steady_ns, trace.send_loop_start_steady_ns);
+    EXPECT_GE(r.send_after_steady_ns, r.send_before_steady_ns);
+  }
+  EXPECT_GT(sent, 0U);
+  const auto decoded = decodeMotorReply(feedbackFrame(1), 1, rig.drivers[0]->limits());
+  ASSERT_TRUE(decoded.has_value()); ASSERT_GT(trace.rx_count, 0U);
+  for (size_t i = 0; i < trace.rx_count; ++i) {
+    EXPECT_DOUBLE_EQ(trace.rx[i].motor_position, decoded->position);
+    EXPECT_DOUBLE_EQ(trace.rx[i].motor_velocity, decoded->velocity);
+    EXPECT_DOUBLE_EQ(trace.rx[i].motor_torque, decoded->torque);
+  }
+}
+
+TEST(BusStreamer, InvalidPreparedShapeDoesNotStartThreadsOrSend)
+{
+  Rig rig({1});
+  auto c = config(1ms, true); c.trace_cycles = 10;
+  auto streamer = rig.makeStreamer(c);
+  const auto before = rig.link.sent().size();
+  EXPECT_FALSE(streamer->start(prepareStreamTrace(11, 1)));
+  EXPECT_EQ(rig.link.sent().size(), before);
+  EXPECT_EQ(streamer->error(), "prepared trace shape mismatch");
+}
+
+TEST(BusStreamer, FailedSendHasOneAttemptWithBothTimestamps)
+{
+  Rig rig({1});
+  auto c = config(1ms, true); c.trace_cycles = 20;
+  rig.link.send_ok = false;
+  auto streamer = rig.makeStreamer(c, gainHook());
+  ASSERT_TRUE(streamer->start());
+  ASSERT_TRUE(rig.waitForStop(100ms).has_value()); streamer->stop();
+  const auto & trace = streamer->trace();
+  size_t failed = 0;
+  for (size_t i = 0; i < trace.cycle_count; ++i) {
+    const auto & r = trace.cycles[i];
+    if (!r.send_attempted) {continue;}
+    ++failed;
+    EXPECT_TRUE(r.command_valid); EXPECT_TRUE(r.encoded_valid); EXPECT_FALSE(r.send_success);
+    EXPECT_EQ(r.outcome, StreamCycleOutcome::kStopped);
+    EXPECT_GE(r.send_after_steady_ns, r.send_before_steady_ns);
+  }
+  EXPECT_EQ(failed, 1U);
+  EXPECT_EQ(streamer->stats().fault, StreamFault::kSendFailed);
+}
+
+TEST(BusStreamer, SingleAxisCommandStaleRecordsReplacementAndBlock)
+{
+  Rig rig({1});
+  std::atomic<int64_t> stamp{clock_type::now().time_since_epoch().count() - 100000000};
+  auto c = config(1ms, true); c.trace_cycles = 20;
+  c.command_written_ns = &stamp; c.max_command_age = 5ms;
+  auto streamer = rig.makeStreamer(c, gainHook());
+  ASSERT_TRUE(streamer->start());
+  ASSERT_TRUE(rig.waitForStop(100ms).has_value()); streamer->stop();
+  ASSERT_EQ(streamer->stats().fault, StreamFault::kCommandStale);
+  const auto & trace = streamer->trace(); ASSERT_EQ(trace.cycle_count, 1U);
+  const auto & r = trace.cycles[0];
+  EXPECT_TRUE(r.command_stale); EXPECT_TRUE(r.command_valid); EXPECT_TRUE(r.encoded_valid);
+  EXPECT_TRUE(r.send_attempted); EXPECT_TRUE(r.send_success);
+  EXPECT_DOUBLE_EQ(r.command.kp, 0.0); EXPECT_DOUBLE_EQ(r.command.kd, 0.0);
+  EXPECT_DOUBLE_EQ(r.command.effort, 0.0);
+  EXPECT_EQ(rawKpKd(r.command_block), std::make_pair(0U, 0U));
+  EXPECT_EQ(r.outcome, StreamCycleOutcome::kStopped);
+}
+
+TEST(BusStreamer, EncodeFailureRecordsCommandButNoBlockOrSend)
+{
+  Rig rig({1});
+  auto c = config(1ms, true); c.trace_cycles = 20;
+  auto streamer = rig.makeStreamer(c, [](const auto &, auto & commands) {
+      commands[0].position = std::numeric_limits<double>::quiet_NaN(); return true;
+    });
+  ASSERT_TRUE(streamer->start());
+  ASSERT_TRUE(rig.waitForStop(100ms).has_value()); streamer->stop();
+  ASSERT_EQ(streamer->stats().fault, StreamFault::kEncodeFailed);
+  const auto & trace = streamer->trace(); ASSERT_GT(trace.cycle_count, 0U);
+  const auto & r = trace.cycles[trace.cycle_count - 1];
+  EXPECT_TRUE(r.command_valid); EXPECT_FALSE(r.encoded_valid); EXPECT_FALSE(r.send_attempted);
+  EXPECT_EQ(r.send_before_steady_ns, -1); EXPECT_EQ(r.send_after_steady_ns, -1);
+}
+
+TEST(BusStreamer, BroadcastExpiredCommandKeepsValuesWithoutSendTimestamps)
+{
+  Rig rig({1});
+  auto c = config(1ms, true); c.trace_cycles = 200; c.max_feedback_age = 50ms;
+  int calls = 0;
+  auto streamer = rig.makeStreamer(c, [&calls](const auto &, auto & commands) {
+      commands[0] = {0.1, 0.2, 20.0, 1.0, 0.0};
+      if (++calls == 1) {std::this_thread::sleep_for(5ms);}
+      return true;
+    });
+  ASSERT_TRUE(streamer->start());
+  std::this_thread::sleep_for(20ms); streamer->stop();
+  const auto & trace = streamer->trace();
+  const auto end = trace.cycles.begin() + std::min(trace.cycle_count, trace.cycles.size());
+  const auto row = std::find_if(trace.cycles.begin(), end, [](const auto & r) {
+      return r.outcome == StreamCycleOutcome::kExpiredAfterHook;
+    });
+  ASSERT_NE(row, end);
+  EXPECT_TRUE(row->command_valid); EXPECT_TRUE(row->encoded_valid); EXPECT_FALSE(row->send_attempted);
+  EXPECT_DOUBLE_EQ(row->command.position, 0.1);
+  EXPECT_EQ(row->send_before_steady_ns, -1); EXPECT_EQ(row->send_after_steady_ns, -1);
 }
 
 }  // namespace

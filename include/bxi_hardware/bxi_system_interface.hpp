@@ -20,6 +20,7 @@
 
 #include "bxi_hardware/actuator/bxi_actuator.hpp"
 #include "bxi_hardware/bus_streamer.hpp"
+#include "bxi_hardware/stream_trace_io.hpp"
 #include "bxi_hardware/can/socketcan_bus.hpp"
 
 namespace bxi_hardware
@@ -66,6 +67,12 @@ public:
 
 protected:
   virtual std::shared_ptr<CanBus> makeBus(CanFrameFormat format);
+  // Preparation seams: run for all buses before the first CAN enable.
+  virtual std::unique_ptr<StreamTrace> prepareTimingTrace(size_t cycles, size_t axes)
+  {return prepareStreamTrace(cycles, axes);}
+  virtual std::unique_ptr<StreamTraceOutput> prepareTimingOutput(
+    const std::string & directory, const std::string & bus)
+  {return std::make_unique<StreamTraceOutput>(directory, bus);}
   // Test seam: called during on_activate() after every streamed bus has answered and the workers
   // run, just before the final safe-stop check.
   virtual void onStreamFeedbackConfirmed() {}
@@ -143,7 +150,8 @@ private:
   void streamMonitorLoop(std::string bus_name, std::vector<size_t> indices);
   void stopStream(const std::string & bus_name);
   void reportStream(const std::string & bus_name);
-  void writeStreamTiming(const std::string & bus_name, const BxiBusStreamer & streamer);
+  void writeStreamTiming(const std::string & bus_name, const BxiBusStreamer & streamer,
+    std::chrono::steady_clock::time_point report_start);
   void disableAxes(const std::string & bus_name, const std::vector<size_t> & indices,
     const char * reason);
   bool loadSpec(const std::string & motor_type);
@@ -187,6 +195,10 @@ private:
   std::map<std::string, std::vector<size_t>> live_joints_;
   std::map<std::string, std::unique_ptr<WorkerTimingTrace>> worker_timing_;
   std::string worker_timing_dir_;
+  std::map<std::string, std::unique_ptr<StreamTrace>> prepared_stream_traces_;
+  std::map<std::string, std::unique_ptr<StreamTraceOutput>> stream_trace_outputs_;
+  size_t stream_trace_cycles_ = 20000;
+  bool stream_trace_extended_ = false;
   std::atomic<bool> running_{false};
   std::atomic<bool> safe_stopped_{false};
 };

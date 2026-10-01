@@ -17,6 +17,7 @@
 #include <sys/resource.h>
 
 #include <gtest/gtest.h>
+#include <yaml-cpp/yaml.h>
 
 #include "bxi_hardware/bxi_system_interface.hpp"
 
@@ -660,7 +661,8 @@ TEST(StreamedSystemAt1kHz, TimingDirectoryReceivesStreamCsvs)
     const auto name = entry.path().filename().string();
     if (name.rfind("bxi_stream_", 0) == 0) {
       const bool is_cycles = name.size() > 11 && name.substr(name.size() - 11) == "_cycles.csv";
-      (is_cycles ? cycle_files : rx_files).push_back(entry.path());
+      if (is_cycles) {cycle_files.push_back(entry.path());}
+      else if (name.size() > 7 && name.substr(name.size() - 7) == "_rx.csv") {rx_files.push_back(entry.path());}
     }
   }
   ASSERT_EQ(cycle_files.size(), 1U);
@@ -675,14 +677,18 @@ TEST(StreamedSystemAt1kHz, TimingDirectoryReceivesStreamCsvs)
     "max_command_age_ns=5000000,broadcast=1,can_ids=1;2;3,", 0), 0U) << metadata;
   EXPECT_NE(metadata.find("tx_thread=SCHED_"), std::string::npos) << metadata;
   EXPECT_EQ(header, "cycle,outcome,wake_lateness_ns,hook_ns,send_lateness_ns,frames,"
-    "age_ns_1,fresh_1,age_ns_2,fresh_2,age_ns_3,fresh_3,command_age_ns");
+    "age_ns_1,fresh_1,age_ns_2,fresh_2,age_ns_3,fresh_3,command_age_ns,tx_detail_supported,command_valid,"
+    "command_source,command_position_rad,command_velocity_rad_s,command_kp,command_kd,command_effort_nm,"
+    "encoded_valid,command_block_hex,send_attempted,send_success,send_before_steady_ns,send_after_steady_ns");
   int cycle_rows = 0;
   int sent_rows = 0;
   int checked_rows = 0;  // command_age_ns >= 0: at least one write() before the cycle
   for (std::string line; std::getline(cycles, line); ) {
     ++cycle_rows;
     sent_rows += line.find(",sent,") != std::string::npos ? 1 : 0;
-    const auto command_age = std::stoll(line.substr(line.rfind(',') + 1));
+    size_t begin = 0;
+    for (int column = 0; column < 12; ++column) {begin = line.find(',', begin) + 1;}
+    const auto command_age = std::stoll(line.substr(begin));
     if (command_age >= 0) {
       ++checked_rows;
       EXPECT_LE(command_age, 5'000'000) << line;
@@ -696,7 +702,7 @@ TEST(StreamedSystemAt1kHz, TimingDirectoryReceivesStreamCsvs)
   std::getline(rx, metadata);
   std::getline(rx, header);
   EXPECT_EQ(header, "can_id,received_ns,rx_kernel_realtime_ns,rx_userspace_realtime_ns,"
-    "rx_hardware_raw_ns");
+    "rx_hardware_raw_ns,received_steady_ns,motor_position_rad,motor_velocity_rad_s,motor_torque_nm");
   int rx_rows = 0;
   int kernel_stamped = 0;
   for (std::string line; std::getline(rx, line); ) {
@@ -708,6 +714,9 @@ TEST(StreamedSystemAt1kHz, TimingDirectoryReceivesStreamCsvs)
   }
   EXPECT_GE(rx_rows, 3 * 150);
   EXPECT_EQ(kernel_stamped, rx_rows);
+  auto stem = cycle_files[0].string(); stem.resize(stem.size() - 11);
+  EXPECT_TRUE(std::filesystem::exists(stem + ".complete"));
+  EXPECT_FALSE(std::filesystem::exists(stem + ".complete.tmp"));
 }
 
 // On a safe-stop the monitor must send the disables before it logs and writes the CSVs, so that
@@ -931,6 +940,59 @@ TEST(StreamedSystemTwoBuses, SlowStopOfOneBusDoesNotStallTheOther)
   }
   EXPECT_GE(motors_a.disables(1), 1);
   EXPECT_GE(motors_b.disables(1), 1);
+}
+
+TEST(StreamedSystemAt1kHz, ExpandedTraceCoversPreparationWaitAndEffectiveOffset)
+{
+  const char * iface = std::getenv("BXI_VCAN_IFACE");
+  if (!iface) {GTEST_SKIP() << "BXI_VCAN_IFACE is not configured";}
+  const auto dir = std::filesystem::path(::testing::TempDir()) / "bxi_extended_trace";
+  std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+  ASSERT_EQ(setenv("BXI_WORKER_TIMING_DIR", dir.c_str(), 1), 0);
+  ASSERT_EQ(setenv("BXI_STREAM_TRACE_CYCLES", "620000", 1), 0);
+  struct ResetEnv {
+    ~ResetEnv() {unsetenv("BXI_WORKER_TIMING_DIR"); unsetenv("BXI_STREAM_TRACE_CYCLES");}
+  } reset;
+  MotorEmulator motors(iface, {1}); ASSERT_TRUE(motors.opened());
+  auto text = streamConfig(iface, 1000, 50.0, true, 1);
+  const auto transport = text.find("stream_feedback_max_age_ms");
+  text.insert(transport, "stream_command_max_age_ms: 50, ");
+  // No motion/gains; exercise the activation offset_thre correction on simulated feedback.
+  auto joint = text.find("lower:");
+  const auto end = text.find('}', joint);
+  text.replace(joint, end - joint, "lower: -7.0, upper: 7.0, offset_angle: 0.1, offset_thre: -1.0");
+  BxiSystemInterface system;
+  ASSERT_EQ(system.on_init(hardwareInfo(text, jointNames(1))), hardware_interface::CallbackReturn::SUCCESS);
+  const auto begin = clock_type::now();
+  ASSERT_EQ(system.on_activate(rclcpp_lifecycle::State()), hardware_interface::CallbackReturn::SUCCESS);
+  {
+    Writer writer(system, 1ms);
+    std::this_thread::sleep_for(21000ms); // Preparation/operator wait exceeds the old 20k capacity.
+    EXPECT_EQ(readOnce(system), hardware_interface::return_type::OK);
+    writer.stop();
+  }
+  ASSERT_EQ(system.on_deactivate(rclcpp_lifecycle::State()), hardware_interface::CallbackReturn::SUCCESS);
+  std::filesystem::path complete_path;
+  for (const auto & entry : std::filesystem::directory_iterator(dir)) {
+    if (entry.path().extension() == ".complete") {complete_path = entry.path();}
+  }
+  ASSERT_FALSE(complete_path.empty());
+  const auto complete = YAML::LoadFile(complete_path.string());
+  EXPECT_EQ(complete["fault"].as<std::string>(), streamFaultName(StreamFault::kNone));
+  EXPECT_EQ(complete["dropped_cycles"].as<size_t>(), 0U);
+  EXPECT_EQ(complete["dropped_rx"].as<size_t>(), 0U);
+  EXPECT_GT(complete["cycle_rows"].as<size_t>(), 20000U);
+  const auto csv = dir / complete["cycles_file"].as<std::string>();
+  std::ifstream input(csv);
+  std::string metadata; std::getline(input, metadata);
+  const std::string key = "offset_rad_effective=";
+  const auto offset = metadata.find(key); ASSERT_NE(offset, std::string::npos);
+  EXPECT_NEAR(std::stod(metadata.substr(offset + key.size())), 0.1 - 2 * M_PI, 1e-12);
+  EXPECT_NE(metadata.find("joint_lower_rad_effective=-7"), std::string::npos);
+  EXPECT_NE(metadata.find("joint_upper_rad_effective=7"), std::string::npos);
+  EXPECT_NE(metadata.find("trace_cycles_capacity=620000"), std::string::npos);
+  RecordProperty("elapsed_ms", std::to_string(
+      std::chrono::duration_cast<std::chrono::milliseconds>(clock_type::now() - begin).count()));
 }
 
 }  // namespace

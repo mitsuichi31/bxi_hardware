@@ -29,6 +29,7 @@ add_library(${BXI_HW_LIB} SHARED
   src/socketcan_bus.cpp
   src/bxi_actuator.cpp
   src/bus_streamer.cpp
+  src/stream_trace_io.cpp
   src/bxi_system_interface.cpp
   src/hil_trajectory.cpp
 )
@@ -109,6 +110,9 @@ if(BUILD_TESTING)
   ament_add_gtest(test_bxi_actuator test/test_bxi_actuator.cpp)
   target_link_libraries(test_bxi_actuator ${BXI_HW_LIB})
   set_target_properties(test_bxi_actuator PROPERTIES BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}")
+  ament_add_gtest(test_stream_trace_io test/test_stream_trace_io.cpp)
+  target_link_libraries(test_stream_trace_io ${BXI_HW_LIB} yaml-cpp)
+  set_target_properties(test_stream_trace_io PROPERTIES BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}")
   ament_add_gtest(test_bus_streamer test/test_bus_streamer.cpp)
   target_link_libraries(test_bus_streamer ${BXI_HW_LIB})
   set_target_properties(test_bus_streamer PROPERTIES BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}")

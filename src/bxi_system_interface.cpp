@@ -454,6 +454,7 @@ std::shared_ptr<CanBus> BxiSystemInterface::makeBus(CanFrameFormat format)
 hardware_interface::CallbackReturn BxiSystemInterface::on_activate(
   const rclcpp_lifecycle::State & /*previous_state*/)
 {
+  const auto activation_start = std::chrono::steady_clock::now();
   auto is_active = [&](const std::string & b) {
     return std::find(active_buses_.begin(), active_buses_.end(), b) != active_buses_.end();
   };
@@ -468,8 +469,14 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_activate(
     }
   }
 
+  // Configs without can_transport use the existing sequential defaults.
+  for (const auto & entry : bus_joints) {bus_transport_.try_emplace(entry.first);}
   safe_stopped_ = false;
   if (bus_joints.empty()) {
+    if (std::getenv("BXI_STREAM_TRACE_CYCLES") != nullptr) {
+      RCLCPP_ERROR(logger(), "BXI_STREAM_TRACE_CYCLES requires an active 1-axis broadcast bus");
+      return hardware_interface::CallbackReturn::ERROR;
+    }
     // 全関節disabledのprofileは、実機I/Oを行わない明示的な構成として許可する。
     RCLCPP_WARN(logger(),
                 "有効な関節がありません（bxi_hardware.yaml の enabled を確認）。"
@@ -492,6 +499,70 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_activate(
       RCLCPP_ERROR(logger(), "worker timing directory is missing or not writable: %s",
         worker_timing_dir_.c_str());
       return fail_activation();
+    }
+
+    stream_trace_extended_ = std::getenv("BXI_STREAM_TRACE_CYCLES") != nullptr;
+    stream_trace_cycles_ = parseStreamTraceCycles(std::getenv("BXI_STREAM_TRACE_CYCLES"));
+    if (stream_trace_extended_) {
+      if (worker_timing_dir_.empty() || bus_joints.size() != 1) {
+        throw std::invalid_argument("expanded trace requires timing directory and one bus");
+      }
+      const auto & first = *bus_joints.begin();
+      const auto & transport = bus_transport_.at(first.first);
+      if (first.second.size() != 1 || !transport.separate || !transport.broadcast) {
+        throw std::invalid_argument("expanded trace requires 1-axis separate broadcast");
+      }
+    }
+    // Validate the aggregate before allocating; no bus may enable during this whole pass.
+    size_t total_trace_bytes = 0;
+    for (const auto & [bus_name, indices] : bus_joints) {
+      if (!worker_timing_dir_.empty() && bus_transport_.at(bus_name).separate) {
+        const auto bytes = streamTracePayloadBytes(stream_trace_cycles_, indices.size());
+        if (bytes > kStreamTraceMemoryLimit - total_trace_bytes) {
+          throw std::length_error("all stream traces exceed 256 MiB");
+        }
+        total_trace_bytes += bytes;
+      }
+    }
+    size_t actual_trace_bytes = 0;
+    for (const auto & [bus_name, indices] : bus_joints) {
+      if (worker_timing_dir_.empty()) {
+        if (bus_transport_.at(bus_name).separate) {
+          prepared_stream_traces_.emplace(bus_name, prepareTimingTrace(0, indices.size()));
+        }
+        continue;
+      }
+      if (bus_transport_.at(bus_name).separate) {
+        auto trace = prepareTimingTrace(stream_trace_cycles_, indices.size());
+        if (!trace || trace->payload_bytes > kStreamTraceMemoryLimit - actual_trace_bytes) {
+          throw std::length_error("all actual stream traces exceed 256 MiB");
+        }
+        actual_trace_bytes += trace->payload_bytes;
+        RCLCPP_INFO(logger(), "[%s] trace prepared before enable: cycles=%zu rx=%zu bytes=%zu "
+          "allocation_ns=%lld sizeof_cycle=%zu sizeof_rx=%zu", bus_name.c_str(),
+          trace->cycles.size(), trace->rx.size(), trace->payload_bytes,
+          static_cast<long long>(trace->allocation_ns), sizeof(StreamCycleRecord), sizeof(StreamRxRecord));
+        prepared_stream_traces_.emplace(bus_name, std::move(trace));
+        auto output = prepareTimingOutput(worker_timing_dir_, bus_name);
+        if (!output) {throw std::runtime_error("missing trace output");}
+        RCLCPP_INFO(logger(), "[%s] trace output prepared before enable: %s", bus_name.c_str(), output->stem().c_str());
+        stream_trace_outputs_.emplace(bus_name, std::move(output));
+      } else {
+        auto trace = std::make_unique<WorkerTimingTrace>();
+        trace->cycles.resize(20000);
+        trace->transactions.resize(20000 * indices.size());
+        trace->period_ns = static_cast<int64_t>(1e9 / can_hz_);
+        worker_timing_.emplace(bus_name, std::move(trace));
+      }
+    }
+
+    if (!worker_timing_dir_.empty()) {
+      std::ifstream status("/proc/self/status");
+      for (std::string line; std::getline(status, line); ) {
+        if (line.rfind("VmRSS:", 0) == 0 || line.rfind("VmLck:", 0) == 0) {
+          RCLCPP_INFO(logger(), "trace memory before enable: %s", line.c_str());
+        }
+      }
     }
 
     for (auto & [bus_name, indices] : bus_joints) {
@@ -597,16 +668,7 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_activate(
         }
         continue;
       }
-      WorkerTimingTrace * timing = nullptr;
-      if (!worker_timing_dir_.empty()) {
-        constexpr size_t kTimingCycleCapacity = 20000;
-        auto trace = std::make_unique<WorkerTimingTrace>();
-        trace->cycles.resize(kTimingCycleCapacity);
-        trace->transactions.resize(kTimingCycleCapacity * live.size());
-        trace->period_ns = static_cast<int64_t>(1e9 / can_hz_);
-        timing = trace.get();
-        worker_timing_.emplace(bus_name, std::move(trace));
-      }
+      WorkerTimingTrace * timing = worker_timing_.count(bus_name) ? worker_timing_.at(bus_name).get() : nullptr;
       workers_.emplace_back(&BxiSystemInterface::workerLoop, this, bus_name, live, timing);
     }
     // A streamed bus is active only after every motor has answered a streamed command.
@@ -641,7 +703,9 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_activate(
     RCLCPP_ERROR(logger(), "起動中に例外: %s", e.what());
     return fail_activation();
   }
-  RCLCPP_INFO(logger(), "on_activate 完了: %zu バスで worker 起動", workers_.size());
+  RCLCPP_INFO(logger(), "on_activate 完了: %zu バスで worker 起動 (activation_ns=%lld)", workers_.size(),
+    static_cast<long long>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now() - activation_start).count()));
   return hardware_interface::CallbackReturn::SUCCESS;
 }
 
@@ -695,6 +759,8 @@ void BxiSystemInterface::releaseResources()
     reportStream(bus_name);
   }
   streamers_.clear();
+  prepared_stream_traces_.clear();
+  stream_trace_outputs_.clear();
   reported_streams_.clear();
   for (auto & [name, bus] : rx_buses_) {
     bus->close();
@@ -825,8 +891,8 @@ bool BxiSystemInterface::startStream(
   config.receive_priority = transport.receive_thread_priority;
   config.cpus = transport.thread_cpus;
   if (!worker_timing_dir_.empty()) {
-    constexpr size_t kStreamTraceCycles = 20000;
-    config.trace_cycles = kStreamTraceCycles;
+    config.trace_cycles = stream_trace_cycles_;
+    config.trace_extended = stream_trace_extended_;
   }
   std::vector<uint32_t> reply_ids;
   std::vector<BxiActuatorDriver *> drivers;
@@ -872,7 +938,13 @@ bool BxiSystemInterface::startStream(
       return streamCycle(bus_name, indices, feedback, commands);
     },
     &safe_stopped_);
-  if (!streamer->start()) {
+  // Even tracing-off uses a prepared empty trace, keeping allocation out of start().
+  if (!prepared_stream_traces_.count(bus_name)) {
+    RCLCPP_ERROR(logger(), "[%s] missing pre-enable trace storage", bus_name.c_str());
+    return false;
+  }
+  auto prepared = std::move(prepared_stream_traces_.at(bus_name));
+  if (!streamer->start(std::move(prepared))) {
     RCLCPP_ERROR(logger(), "[%s] 送受信分離を開始できません: %s", bus_name.c_str(),
       streamer->error().c_str());
     return false;
@@ -974,6 +1046,7 @@ void BxiSystemInterface::stopStream(const std::string & bus_name)
 
 void BxiSystemInterface::reportStream(const std::string & bus_name)
 {
+  const auto report_start = std::chrono::steady_clock::now();
   const BxiBusStreamer * streamer = nullptr;
   {
     // The monitor and releaseResources() can both report a bus; claim it once, then log and
@@ -1008,94 +1081,43 @@ void BxiSystemInterface::reportStream(const std::string & bus_name)
     stats.fault_axis, stats.stopped_externally ? "yes" : "no", stats.max_command_age_ms,
     stats.command_stale_zero_gain_frames, stats.command_stale_expected_frames, per_axis.c_str());
   if (!worker_timing_dir_.empty()) {
-    writeStreamTiming(bus_name, *streamer);
+    writeStreamTiming(bus_name, *streamer, report_start);
   }
 }
 
 void BxiSystemInterface::writeStreamTiming(
-  const std::string & bus_name, const BxiBusStreamer & streamer)
+  const std::string & bus_name, const BxiBusStreamer & streamer,
+  std::chrono::steady_clock::time_point report_start)
 {
-  // Called after the stream threads have joined, outside any control cycle.
-  const auto & trace = streamer.trace();
-  const auto & config = streamer.config();
-  const auto & ids = streamer.canIds();
-  const auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
-    std::chrono::system_clock::now().time_since_epoch()).count();
-  std::string safe_bus_name = bus_name;
-  for (char & ch : safe_bus_name) {
-    if (!((ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'Z') ||
-      (ch >= 'a' && ch <= 'z') || ch == '_' || ch == '-'))
-    {
-      ch = '_';
+  // After stop/join and disable, including the monitor's safe-stop path.
+  try {
+    sched_param param{};
+    cpu_set_t cpus;
+    CPU_ZERO(&cpus);
+    if (::sched_getparam(0, &param) != 0 || ::sched_getaffinity(0, sizeof(cpus), &cpus) != 0) {
+      throw std::runtime_error("cannot inspect trace writer scheduling");
     }
-  }
-  const auto stem = (std::filesystem::path(worker_timing_dir_) /
-    ("bxi_stream_" + safe_bus_name + "_" + std::to_string(timestamp))).string();
-  std::string id_list;
-  for (const int id : ids) {
-    id_list += (id_list.empty() ? "" : ";") + std::to_string(id);
-  }
-  const size_t cycle_rows = std::min(trace.cycle_count, trace.cycles.size());
-  const size_t rx_rows = std::min(trace.rx_count, trace.rx.size());
-  // Commas separate the metadata fields, so the thread descriptions use '|' for their cpu list.
-  auto describe = [](std::string text) {
-      std::replace(text.begin(), text.end(), ',', '|');
-      std::replace(text.begin(), text.end(), ' ', '_');
-      return text;
-    };
-  const std::string metadata = "#period_ns=" + std::to_string(config.period.count()) +
-    ",max_feedback_age_ns=" + std::to_string(config.max_feedback_age.count()) +
-    ",max_command_age_ns=" + std::to_string(config.max_command_age.count()) +
-    ",broadcast=" + (config.broadcast ? "1" : "0") + ",can_ids=" + id_list +
-    ",dropped_cycles=" + std::to_string(trace.cycle_count - cycle_rows) +
-    ",dropped_rx=" + std::to_string(trace.rx_count - rx_rows) +
-    ",tx_thread=" + describe(trace.tx_thread) + ",rx_thread=" + describe(trace.rx_thread);
-
-  const auto cycle_path = stem + "_cycles.csv";
-  std::ofstream cycle_file(cycle_path);
-  if (!cycle_file) {
-    RCLCPP_ERROR(logger(), "stream timing CSV を開けません: %s", cycle_path.c_str());
-    return;
-  }
-  cycle_file << metadata << '\n' << "cycle,outcome,wake_lateness_ns,hook_ns,send_lateness_ns,frames";
-  for (const int id : ids) {
-    cycle_file << ",age_ns_" << id << ",fresh_" << id;
-  }
-  // Last, so that older readers keep their column positions.
-  cycle_file << ",command_age_ns\n";
-  for (size_t r = 0; r < cycle_rows; ++r) {
-    const auto & row = trace.cycles[r];
-    cycle_file << row.cycle << ',' << streamCycleOutcomeName(row.outcome) << ',' <<
-      row.wake_lateness_ns << ',' << row.hook_ns << ',' << row.send_lateness_ns << ',' <<
-      static_cast<int>(row.frames);
-    for (size_t a = 0; a < trace.axes; ++a) {
-      cycle_file << ',' << trace.age_ns[r * trace.axes + a] << ',' <<
-        static_cast<int>(trace.fresh[r * trace.axes + a]);
+    std::string cpu_list;
+    for (int i = 0; i < CPU_SETSIZE; ++i) {
+      if (CPU_ISSET(i, &cpus)) {cpu_list += (cpu_list.empty() ? "" : ";") + std::to_string(i);}
     }
-    cycle_file << ',' << row.command_age_ns << '\n';
+    RCLCPP_INFO(logger(), "[%s] trace writer: policy=%d priority=%d cpus=%s", bus_name.c_str(),
+      ::sched_getscheduler(0), param.sched_priority, cpu_list.c_str());
+    const auto & output = stream_trace_outputs_.at(bus_name);
+    const auto result = output->write(streamer, report_start);
+    RCLCPP_INFO(logger(), "[%s] stream timing: %zu cycles, %zu replies, dropped %zu/%zu; %s",
+      bus_name.c_str(), result.cycle_rows, result.rx_rows, result.dropped_cycles, result.dropped_rx,
+      output->stem().c_str());
+    RCLCPP_INFO(logger(), "[%s] trace complete: report_to_complete_ns=%lld csv_write_elapsed_ns=%lld",
+      bus_name.c_str(), static_cast<long long>(result.report_to_complete_ns),
+      static_cast<long long>(result.csv_write_elapsed_ns));
+    if (result.report_to_complete_ns > 2000000000LL) {
+      RCLCPP_ERROR(logger(), "[%s] stream timing exceeds 2 second criterion", bus_name.c_str());
+    }
+    if (result.tmp_cleanup_failed) {RCLCPP_WARN(logger(), "[%s] complete tmp cleanup failed", bus_name.c_str());}
+  } catch (const std::exception & e) {
+    RCLCPP_ERROR(logger(), "[%s] stream timing CSV 書込失敗: %s", bus_name.c_str(), e.what());
   }
-
-  const auto rx_path = stem + "_rx.csv";
-  std::ofstream rx_file(rx_path);
-  if (!rx_file) {
-    RCLCPP_ERROR(logger(), "stream timing CSV を開けません: %s", rx_path.c_str());
-    return;
-  }
-  rx_file << metadata << '\n' <<
-    "can_id,received_ns,rx_kernel_realtime_ns,rx_userspace_realtime_ns,rx_hardware_raw_ns\n";
-  for (size_t r = 0; r < rx_rows; ++r) {
-    const auto & row = trace.rx[r];
-    rx_file << ids[row.axis] << ',' << row.received_ns << ',' << row.rx_kernel_realtime_ns <<
-      ',' << row.rx_userspace_realtime_ns << ',' << row.rx_hardware_raw_ns << '\n';
-  }
-  cycle_file.flush();
-  rx_file.flush();
-  if (!cycle_file || !rx_file) {
-    RCLCPP_ERROR(logger(), "stream timing CSV 書込失敗: %s", stem.c_str());
-  }
-  RCLCPP_INFO(logger(), "[%s] stream timing: %zu cycles, %zu replies, dropped %zu/%zu; %s",
-    bus_name.c_str(), cycle_rows, rx_rows, trace.cycle_count - cycle_rows,
-    trace.rx_count - rx_rows, stem.c_str());
 }
 
 void BxiSystemInterface::disableAxes(

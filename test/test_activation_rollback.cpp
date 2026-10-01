@@ -379,5 +379,85 @@ TEST(SystemSafety, DualTemperatureFaultDuringOperationStopsBothBuses)
   EXPECT_EQ(system.created_buses[1]->sentCount(), second_bus_count);
 }
 
+struct ScopedEnv
+{
+  std::string key;
+  std::optional<std::string> old;
+  ScopedEnv(const char * name, const char * value) : key(name)
+  {
+    if (const auto * p = std::getenv(name)) {old = p;}
+    if (value) {setenv(name, value, 1);} else {unsetenv(name);}
+  }
+  ~ScopedEnv() {if (old) {setenv(key.c_str(), old->c_str(), 1);} else {unsetenv(key.c_str());}}
+};
+
+class PreparationSystem : public TestSystemInterface
+{
+public:
+  int traces = 0, outputs = 0;
+  bool fail_allocation = false, fail_link_probe = false;
+protected:
+  std::unique_ptr<StreamTrace> prepareTimingTrace(size_t cycles, size_t axes) override
+  {
+    EXPECT_TRUE(created_buses.empty());
+    if (++traces == 2 && fail_allocation) {throw std::bad_alloc();}
+    return prepareStreamTrace(cycles, axes);
+  }
+  std::unique_ptr<StreamTraceOutput> prepareTimingOutput(
+    const std::string & directory, const std::string & bus) override
+  {
+    EXPECT_TRUE(created_buses.empty());
+    if (++outputs == 2 && fail_link_probe) {throw std::runtime_error("injected link probe failure");}
+    return std::make_unique<StreamTraceOutput>(directory, bus);
+  }
+  std::shared_ptr<CanBus> makeBus(CanFrameFormat) override
+  {
+    EXPECT_EQ(traces, 2); EXPECT_EQ(outputs, 2);
+    throw std::runtime_error("stop test after all preparation, before first CAN open");
+  }
+};
+
+TEST(ActivationPreparation, AllBusesPrepareBeforeAnyEnableAndFailuresSendNothing)
+{
+  std::ifstream input(std::string(BXI_TEST_SOURCE_DIR) + "/test/config/activation_two_buses.yaml");
+  const std::string config = std::string(std::istreambuf_iterator<char>(input), {}) +
+    "\ncan_transport:\n  bus_a: {rx_mode: separate, stream_feedback_max_age_ms: 15}\n"
+    "  bus_b: {rx_mode: separate, stream_feedback_max_age_ms: 15}\n";
+  ScopedEnv dir("BXI_WORKER_TIMING_DIR", ::testing::TempDir().c_str());
+  ScopedEnv count("BXI_STREAM_TRACE_CYCLES", nullptr);
+  for (int mode = 0; mode < 3; ++mode) {
+    PreparationSystem system;
+    system.fail_allocation = mode == 1; system.fail_link_probe = mode == 2;
+    ASSERT_EQ(system.on_init(hardwareInfoAt(writeConfig("prepare_all.yaml", config))),
+      hardware_interface::CallbackReturn::SUCCESS);
+    EXPECT_EQ(system.on_activate(rclcpp_lifecycle::State()), hardware_interface::CallbackReturn::ERROR);
+    EXPECT_EQ(system.traces, 2);
+    EXPECT_EQ(system.outputs, mode == 1 ? 1 : 2);
+    EXPECT_TRUE(system.created_buses.empty());
+  }
+}
+
+TEST(ActivationPreparation, ExpandedTraceRejectsUnsupportedSetupBeforeEnable)
+{
+  ScopedEnv dir("BXI_WORKER_TIMING_DIR", ::testing::TempDir().c_str());
+  for (const char * value : {"20000", "620001", "620000"}) {
+    ScopedEnv count("BXI_STREAM_TRACE_CYCLES", value);
+    TestSystemInterface system;
+    ASSERT_EQ(system.on_init(hardwareInfo("activation_two_buses.yaml")),
+      hardware_interface::CallbackReturn::SUCCESS);
+    EXPECT_EQ(system.on_activate(rclcpp_lifecycle::State()), hardware_interface::CallbackReturn::ERROR);
+    EXPECT_TRUE(system.created_buses.empty());
+  }
+  ScopedEnv count("BXI_STREAM_TRACE_CYCLES", "620000");
+  ScopedEnv no_dir("BXI_WORKER_TIMING_DIR", nullptr);
+  TestSystemInterface system;
+  ASSERT_EQ(system.on_init(hardwareInfoAt(writeConfig("prepare_no_dir.yaml", transportConfig(
+      "{rx_mode: separate, tx_frame: broadcast, stream_feedback_max_age_ms: 3}", "fd", 1000,
+      "{enabled: false, can_bus: can0, can_id: 2, motor_dir: 1, motor_type: MOTOR_70, lower: -1.0, upper: 1.0}")))),
+    hardware_interface::CallbackReturn::SUCCESS);
+  EXPECT_EQ(system.on_activate(rclcpp_lifecycle::State()), hardware_interface::CallbackReturn::ERROR);
+  EXPECT_TRUE(system.created_buses.empty());
+}
+
 }  // namespace
 }  // namespace bxi_hardware

@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <utility>
 
 #include "bxi_hardware/actuator/actuator_driver.hpp"
 #include "bxi_hardware/can/can_bus.hpp"
@@ -82,6 +83,10 @@ public:
   // Latches safe-stop after a streamed communication fault and sends a best-effort disable.
   void latchCommunicationFault() {latchSafeStop();}
   int canId() const {return can_id_;}
+  // Snapshot after setAngleOffset/setAngleRange, before streaming starts.
+  double effectiveAngleOffset() const {return offset_angle_;}
+  std::pair<double, double> effectiveAngleRange() const {return {lower_, upper_};}
+  int motorDirection() const {return motor_dir_;}
   protocol::MitLimits limits() const;
 
   ActuatorState state() const {return state_;}
