@@ -459,5 +459,35 @@ TEST(ActivationPreparation, ExpandedTraceRejectsUnsupportedSetupBeforeEnable)
   EXPECT_TRUE(system.created_buses.empty());
 }
 
+TEST(ActivationRollback, DestructionWithoutDeactivateJoinsWorkersAndDisables)
+{
+  std::shared_ptr<EmulatedBus> bus;
+  {
+    TestSystemInterface system;
+    system.reply_ids = {1, 2};
+    ASSERT_EQ(system.on_init(hardwareInfo("valid.yaml")), hardware_interface::CallbackReturn::SUCCESS);
+    ASSERT_EQ(system.on_activate(rclcpp_lifecycle::State()), hardware_interface::CallbackReturn::SUCCESS);
+    ASSERT_EQ(system.created_buses.size(), 1U);
+    bus = system.created_buses[0];
+    // No on_deactivate: mimic destruction after a hardware error transition.
+  }
+  ASSERT_TRUE(bus);
+  EXPECT_TRUE(bus->hasDisable(1)); EXPECT_FALSE(bus->isOpen());
+}
+
+TEST(ActivationRollback, ShutdownWithoutDeactivateCleansUpIdempotently)
+{
+  TestSystemInterface system;
+  system.reply_ids = {1, 2};
+  ASSERT_EQ(system.on_init(hardwareInfo("valid.yaml")), hardware_interface::CallbackReturn::SUCCESS);
+  ASSERT_EQ(system.on_activate(rclcpp_lifecycle::State()), hardware_interface::CallbackReturn::SUCCESS);
+  const auto bus = system.created_buses[0];
+  EXPECT_EQ(system.on_shutdown(rclcpp_lifecycle::State()), hardware_interface::CallbackReturn::SUCCESS);
+  EXPECT_TRUE(bus->hasDisable(1)); EXPECT_FALSE(bus->isOpen());
+  const auto count = bus->sentCount();
+  EXPECT_EQ(system.on_shutdown(rclcpp_lifecycle::State()), hardware_interface::CallbackReturn::SUCCESS);
+  EXPECT_EQ(bus->sentCount(), count);
+}
+
 }  // namespace
 }  // namespace bxi_hardware

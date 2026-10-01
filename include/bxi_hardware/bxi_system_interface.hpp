@@ -49,6 +49,8 @@ struct JointRuntime
 class BxiSystemInterface : public hardware_interface::SystemInterface
 {
 public:
+  ~BxiSystemInterface() override;
+  hardware_interface::CallbackReturn on_shutdown(const rclcpp_lifecycle::State & previous_state) override;
   hardware_interface::CallbackReturn on_init(
     const hardware_interface::HardwareInfo & info) override;
 

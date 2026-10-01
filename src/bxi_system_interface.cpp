@@ -411,6 +411,20 @@ bool BxiSystemInterface::loadSpec(const std::string & motor_type)
   return true;
 }
 
+// A write/read fault may transition hardware out of ACTIVE without calling on_deactivate.
+// Finished monitor threads remain joinable until cleanup; destroying them would terminate.
+BxiSystemInterface::~BxiSystemInterface()
+{
+  releaseResources();
+}
+
+hardware_interface::CallbackReturn BxiSystemInterface::on_shutdown(
+  const rclcpp_lifecycle::State & /*previous_state*/)
+{
+  releaseResources();
+  return hardware_interface::CallbackReturn::SUCCESS;
+}
+
 // ---------------------------------------------------------------------------
 // interface export
 // ---------------------------------------------------------------------------
