@@ -215,7 +215,7 @@ class TrajectoryClient(Node):
         self.monitor_failures = True
         print(f"今の位置 {self.status.position:+.4f} rad", flush=True)
         if request.kind == StartHilTrajectory.Request.SINE:
-            print(f"中心 {self.status.position:+.4f} rad", flush=True)
+            print(f"中心（通常設定では開始位置。固定中心設定はcontrollerの設定値）: 開始位置 {self.status.position:+.4f} rad", flush=True)
         response = self.call(self.start_client, request, 2.0, "~/start")
         if not response.accepted or response.request_id == 0:
             raise Abort("~/start が拒否した: " + response.message)

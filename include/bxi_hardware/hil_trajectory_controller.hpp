@@ -166,6 +166,9 @@ private:
   double max_kp_ = 20.0;
   double max_torque_ = 5.0;
   double max_velocity_ = 2.0;
+  double max_amplitude_ = 0.5;
+  bool fixed_sine_center_ = false;
+  double sine_center_ = 0.0;
   double max_period_s_ = 0.005;
   double arm_timeout_s_ = 1.0;
   double record_tail_s_ = 0.5;

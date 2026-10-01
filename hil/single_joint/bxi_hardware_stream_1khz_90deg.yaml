@@ -1,0 +1,53 @@
+# Explicit opt-in: ±90-degree trial; safety bounds ±1.65 rad.
+# 1軸の実機試験（ベンチ）用：送受信分離・CAN FD（BRSなし）・1 kHz。controllers_1khz.yaml と組み合わせる。
+# 実機では段階6の前提（独立電源遮断の記録、bus-off 方針、ベンダー回答など）を満たすまで使わない。
+# 計画：docs/plans/20260928_bxi_worker_stream_broadcast_plan.md（ワークスペース側）
+# 事前にホストで can0 を FD（1 Mbps / 5 Mbps、fd on）で up しておくこと。BRSなしはフレーム側で選ぶ。
+active_can_buses: [can0]
+can_frame_format:
+  can0: fd
+can_transport:
+  can0:
+    rx_mode: separate
+    # ID 1 だけのバスなので、ブロードキャストは 8 B（ID 1 のブロックのみ）。
+    tx_frame: broadcast
+    # 周期の3倍。制御要件が決まったら見直す。
+    stream_feedback_max_age_ms: 3.0
+    # 最後の write() からこの時間を過ぎたら、その周期に Kp=Kd=0 を送って安全停止する（controller_manager の
+    # 更新が止まったとき。応答が届き続けると stream_feedback_max_age_ms では止まらないため）。既定と同じ値を明記する。
+    stream_command_max_age_ms: 5.0
+    # 送受信スレッドの SCHED_FIFO 優先度（暫定値）。2026-09-29 の vcan 比較
+    # （docs/test-reports/2026-09-29-bxi-stream-scheduling-vcan.md）で、controller_manager（FIFO 50）より
+    # 下のこの条件は CPU 負荷ありでも安全停止せず良好だった。SCHED_OTHER は CPU 負荷で安全停止した。
+    # vcan には PCAN の割り込みスレッドがない。実機では can0 を UP にした状態で割り込みスレッドの優先度を
+    # 確認し（ps -eLo pid,tid,cls,rtprio,psr,comm | grep irq/16）、この値と controller_manager より上の値
+    # （60/61）を比べてから確定する。
+    send_thread_priority: 45
+    receive_thread_priority: 46
+    # 送受信スレッドを P コアの CPU 9 に固定する（2026-09-30、案B）。controller_manager（CPU 11）とは別の
+    # 物理コアにし、有線 LAN の割り込みが載る CPU 4〜6 と CPU 0 を避ける。PCAN の割り込み（実機で CPU 18）は
+    # 動かさない。検討：docs/plans/20260930_bxi_cpu_affinity_plan.md（ワークスペース側）
+    thread_cpus: [9]
+defaults:
+  # 逐次で行う enable・初期フィードバック・disable の応答待ちに使う（送受信分離の運転中は使わない）。
+  # 2026-09-29 の HIL 段階1で、enable 直後の初期フィードバックへの応答が、モーターの文字出力
+  # （STATE : 02 MOTOR / Enter Motor Mode、約 3.4 ms）の後に回されて 2.92 ms かかり、3 ms では
+  # 起動に失敗した。余裕を見て 10 ms にする。1 kHz の停止判定は stream_feedback_max_age_ms で行う。
+  control_timeout_ms: 10
+  maximum_consecutive_timeouts: 3
+  can_hz: 1000
+  temperature_sensor_fault_below_c: -20.0
+joints:
+  joint1:
+    enabled: true
+    can_bus: can0
+    can_id: 1
+    motor_dir: 1
+    motor_type: MOTOR_70
+    # ベンチ試験用の狭い範囲 [rad]（出力軸、ユーザーゼロ点基準）
+    lower: -1.65
+    upper: 1.65
+    # position だけを指令し、kp / kd を指令しなかったときに使う値。位置だけの指令で力が出ないように0に
+    # する。0以外のゲインは指令スクリプトで明示し、hil/README.md の「0以外の指令の範囲」を守る。
+    default_kp: 0.0
+    default_kd: 0.0

@@ -87,6 +87,8 @@ public:
   static void SetUpTestCase() {rclcpp::init(0, nullptr);}
   static void TearDownTestCase() {rclcpp::shutdown();}
 
+  virtual std::vector<rclcpp::Parameter> extraParameters() {return {};}
+
   void SetUp() override
   {
     out_dir_ = std::filesystem::path(::testing::TempDir()) /
@@ -95,11 +97,13 @@ public:
     std::filesystem::create_directories(out_dir_);
     controller_ = std::make_unique<TestController>();
     rclcpp::NodeOptions options;
-    options.parameter_overrides({
+    auto overrides = extraParameters();
+    overrides.insert(overrides.end(), {
         rclcpp::Parameter("joint", "joint1"),
         rclcpp::Parameter("output_dir", output_dir_override_.value_or(out_dir_.string())),
         rclcpp::Parameter("record_seconds", record_seconds_),
       });
+    options.parameter_overrides(overrides);
     controller_interface::ControllerInterfaceParams params;
     params.controller_name = "hil_trajectory";
     params.update_rate = 1000;
@@ -981,6 +985,50 @@ TEST_F(TestFaultConfig, StopServiceAnswersOnlyAfterTheDelay)
   const double waited = std::chrono::duration<double>(std::chrono::steady_clock::now() - sent).count();
   EXPECT_GE(waited, 0.3);
   EXPECT_TRUE(future.get()->success);
+}
+
+class WideSineControllerTest : public HilTrajectoryControllerTest
+{
+public:
+  std::vector<rclcpp::Parameter> extraParameters() override
+  {
+    return {rclcpp::Parameter("lower", -1.65), rclcpp::Parameter("upper", 1.65),
+      rclcpp::Parameter("max_amplitude", 1.5707963267948966),
+      rclcpp::Parameter("max_velocity", 1.0), rclcpp::Parameter("max_run_seconds", 65.0),
+      rclcpp::Parameter("fixed_sine_center", true), rclcpp::Parameter("sine_center", 0.0)};
+  }
+};
+
+TEST_F(WideSineControllerTest, ZeroCenteredNinetyDegreesAndRelease)
+{
+  const auto request = sine(1.5707963267948966, 0.05, 1.0, 1.0);
+  const auto id = startAndArm(request);
+  const hil::SineTrajectory expected(0.0, request.amplitude, 0.05, 1.0, 1.0);
+  double elapsed = 0.0;
+  double minimum = 10.0, maximum = -10.0;
+  for (int k = 0; k < 62500; ++k) {
+    if (k % 50 == 0) {controller_->onKeepalive(id);}
+    step();
+    if (controller_->snapshot().state == State::kRunning) {
+      const auto target = expected.at(elapsed);
+      ASSERT_NEAR(cmd_values_[0], target.position, 1e-10);
+      ASSERT_NEAR(cmd_values_[1], target.velocity, 1e-10);
+      minimum = std::min(minimum, cmd_values_[0]);
+      maximum = std::max(maximum, cmd_values_[0]);
+      position_ = cmd_values_[0];  // tracking model; torque protection remains enabled
+      elapsed += kDt;
+    }
+  }
+  EXPECT_NEAR(minimum, -1.5707963267948966, 1e-7);
+  EXPECT_NEAR(maximum, 1.5707963267948966, 1e-7);
+  EXPECT_TRUE(outputsReleased());
+}
+
+TEST_F(WideSineControllerTest, RejectsExcessAmplitudeSpeedAndDuration)
+{
+  EXPECT_FALSE(controller_->requestStart(sine(1.58, 0.05, 1, 1)).accepted);
+  EXPECT_FALSE(controller_->requestStart(sine(1.5707963267948966, 0.5, 1, 1)).accepted);
+  EXPECT_FALSE(controller_->requestStart(sine(1.5707963267948966, 0.05, 5, 1)).accepted);
 }
 
 }  // namespace

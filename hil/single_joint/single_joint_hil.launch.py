@@ -31,11 +31,15 @@ def generate_launch_description():
             " config_file:=", config_file,
             " spec_dir:=", spec_dir,
             " hardware_plugin:=", LaunchConfiguration("hardware_plugin"),
+            " joint_lower:=", LaunchConfiguration("joint_lower"),
+            " joint_upper:=", LaunchConfiguration("joint_upper"),
         ]),
         value_type=str,
     )
 
     return LaunchDescription([
+        DeclareLaunchArgument("joint_lower", default_value="-0.5"),
+        DeclareLaunchArgument("joint_upper", default_value="0.5"),
         DeclareLaunchArgument("hardware_plugin", default_value="bxi_hardware/BxiSystemInterface",
                               description="HWIF plugin; synthetic trace benchmark requires vcan and test opt-in"),
         DeclareLaunchArgument(

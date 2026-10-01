@@ -21,7 +21,7 @@ constexpr double kMinLeaseS = 0.1;
 constexpr double kMaxLeaseS = 2.0;
 constexpr double kMaxKd = 2.0;
 constexpr double kMaxHoldS = 10.0;
-constexpr double kMaxAmplitude = 0.5;
+constexpr double kMaxAmplitude = 1.5707963267948966;
 constexpr double kMaxFrequency = 5.0;
 constexpr double kMaxCycles = 20.0;
 constexpr double kMinRampCycles = 0.5;
@@ -104,6 +104,9 @@ controller_interface::CallbackReturn HilTrajectoryController::on_init()
   auto_declare<double>("max_kp", 20.0);
   auto_declare<double>("max_torque", 5.0);
   auto_declare<double>("max_velocity", 2.0);
+  auto_declare<double>("max_amplitude", 0.5);
+  auto_declare<bool>("fixed_sine_center", false);
+  auto_declare<double>("sine_center", 0.0);
   auto_declare<double>("max_period", 0.005);
   auto_declare<double>("arm_timeout", 1.0);
   auto_declare<double>("record_tail", 0.5);
@@ -141,6 +144,9 @@ controller_interface::CallbackReturn HilTrajectoryController::on_configure(
   max_kp_ = node->get_parameter("max_kp").as_double();
   max_torque_ = node->get_parameter("max_torque").as_double();
   max_velocity_ = node->get_parameter("max_velocity").as_double();
+  max_amplitude_ = node->get_parameter("max_amplitude").as_double();
+  fixed_sine_center_ = node->get_parameter("fixed_sine_center").as_bool();
+  sine_center_ = node->get_parameter("sine_center").as_double();
   max_period_s_ = node->get_parameter("max_period").as_double();
   arm_timeout_s_ = node->get_parameter("arm_timeout").as_double();
   record_tail_s_ = node->get_parameter("record_tail").as_double();
@@ -177,7 +183,10 @@ controller_interface::CallbackReturn HilTrajectoryController::on_configure(
   const auto finite_positive = [](double v) {return std::isfinite(v) && v > 0.0;};
   if (joint_.empty() || !std::isfinite(lower_) || !std::isfinite(upper_) || lower_ >= upper_ ||
     !finite_positive(max_kp_) || max_kp_ > kMaxKpLimit || !finite_positive(max_torque_) ||
-    !finite_positive(max_velocity_) || !finite_positive(max_period_s_) ||
+    !finite_positive(max_velocity_) || !finite_positive(max_amplitude_) ||
+    max_amplitude_ > kMaxAmplitude || !std::isfinite(sine_center_) ||
+    (fixed_sine_center_ && (sine_center_ < lower_ || sine_center_ > upper_)) ||
+    !finite_positive(max_period_s_) ||
     !finite_positive(arm_timeout_s_) || !std::isfinite(record_tail_s_) || record_tail_s_ < 0.0 ||
     !finite_positive(record_seconds_) || !finite_positive(max_run_seconds_))
   {
@@ -415,7 +424,7 @@ controller_interface::return_type HilTrajectoryController::update(
             run_duration_ = ramp_->rampTime() + run_.hold;
             break;
           case Kind::kSine:
-            sine_.emplace(position, run_.amplitude, run_.frequency, run_.cycles, run_.ramp_cycles);
+            sine_.emplace(fixed_sine_center_ ? sine_center_ : position, run_.amplitude, run_.frequency, run_.cycles, run_.ramp_cycles);
             run_duration_ = sine_->duration() + run_.hold;
             break;
           case Kind::kHold:
@@ -423,7 +432,8 @@ controller_interface::return_type HilTrajectoryController::update(
             break;
         }
         if (run_.kind == Kind::kSine &&
-          (position - run_.amplitude < lower_ || position + run_.amplitude > upper_))
+          ((fixed_sine_center_ ? sine_center_ : position) - run_.amplitude < lower_ ||
+          (fixed_sine_center_ ? sine_center_ : position) + run_.amplitude > upper_))
         {
           endRun(EndReason::kStartRange, now);
         } else if (run_duration_ > max_run_seconds_) {
@@ -631,8 +641,8 @@ std::string HilTrajectoryController::validate(const srv::StartHilTrajectory::Req
       return "速さは 0 より大きく max_velocity 以下";
     }
   } else if (r.kind == srv::StartHilTrajectory::Request::SINE) {
-    if (!(r.amplitude > 0.0 && r.amplitude <= kMaxAmplitude)) {
-      return "振幅は 0 より大きく 0.5 rad 以下";
+    if (!(r.amplitude > 0.0 && r.amplitude <= max_amplitude_)) {
+      return "振幅は 0 より大きく max_amplitude 以下";
     }
     if (!(r.frequency > 0.0 && r.frequency <= kMaxFrequency)) {
       return "周波数は 0 より大きく 5 Hz 以下";
@@ -780,7 +790,8 @@ bool HilTrajectoryController::writeCompletedRecord()
     if (file) {
       const auto & r = record_run_;
       file << std::setprecision(17) << "#run_id=" << r.id << ",kind=" << static_cast<int>(r.kind) <<
-        ",target=" << r.target << ",speed=" << r.speed << ",amplitude=" << r.amplitude <<
+        ",fixed_sine_center=" << (fixed_sine_center_ ? 1 : 0) <<
+        ",sine_center=" << sine_center_ << ",target=" << r.target << ",speed=" << r.speed << ",amplitude=" << r.amplitude <<
         ",frequency=" << r.frequency << ",cycles=" << r.cycles << ",ramp_cycles=" <<
         r.ramp_cycles << ",friction_kinetic=" << r.friction_kinetic << ",friction_static=" <<
         r.friction_static << ",friction_velocity=" << r.friction_velocity <<

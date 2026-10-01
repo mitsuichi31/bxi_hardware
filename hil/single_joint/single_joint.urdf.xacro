@@ -1,6 +1,8 @@
 <?xml version="1.0"?>
 <!-- 1軸の実機試験（ベンチ）用。モーター1台を can_id 1 で BxiSystemInterface から操作する。 -->
 <robot name="bxi_single_joint" xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <xacro:arg name="joint_lower" default="-0.5"/>
+  <xacro:arg name="joint_upper" default="0.5"/>
   <xacro:arg name="config_file" default=""/>
   <xacro:arg name="spec_dir" default=""/>
   <xacro:arg name="hardware_plugin" default="bxi_hardware/BxiSystemInterface"/>
@@ -12,7 +14,7 @@
     <child link="output_link"/>
     <axis xyz="0 0 1"/>
     <!-- 実際の範囲は bxi_hardware.yaml の lower / upper でクランプする -->
-    <limit lower="-0.5" upper="0.5" effort="50.0" velocity="10.0"/>
+    <limit lower="$(arg joint_lower)" upper="$(arg joint_upper)" effort="50.0" velocity="10.0"/>
   </joint>
 
   <ros2_control name="BxiSingleJoint" type="system">
