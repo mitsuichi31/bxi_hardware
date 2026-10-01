@@ -138,6 +138,14 @@ TEST(StreamTracePreparation, ValidatesSettingsAndCheckedSizes)
   EXPECT_EQ(trace->send_loop_start_steady_ns, -1);
 }
 
+TEST(StreamTraceOutput, PreservesHyphenForRunnerFileDiscovery)
+{
+  TempDir dir;
+  StreamTraceOutput output(dir.path, "vcan-a");
+  const auto filename = std::filesystem::path(output.stem()).filename().string();
+  EXPECT_EQ(filename.find("bxi_stream_vcan-a_"), 0U);
+}
+
 TEST(StreamTraceOutput, RoundTripValuesValidityFaultAndAbsoluteClock)
 {
   TempDir dir;

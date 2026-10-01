@@ -166,7 +166,7 @@ StreamTraceOutput::StreamTraceOutput(const std::string & directory, const std::s
   std::string safe = bus;
   for (char & ch : safe) {
     if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
-      (ch >= '0' && ch <= '9') || ch == '_')) {ch = '_';}
+      (ch >= '0' && ch <= '9') || ch == '_' || ch == '-')) {ch = '_';}
   }
   const auto timestamp = std::chrono::duration_cast<std::chrono::nanoseconds>(
     std::chrono::system_clock::now().time_since_epoch()).count();
