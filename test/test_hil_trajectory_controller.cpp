@@ -999,6 +999,58 @@ public:
   }
 };
 
+class FasterWideSineControllerTest : public WideSineControllerTest
+{
+public:
+  std::vector<rclcpp::Parameter> extraParameters() override
+  {
+    auto parameters = WideSineControllerTest::extraParameters();
+    for (auto & parameter : parameters) {
+      if (parameter.get_name() == "max_velocity") {
+        parameter = rclcpp::Parameter("max_velocity", 1.5);
+      }
+    }
+    return parameters;
+  }
+};
+
+TEST_F(FasterWideSineControllerTest, PointFifteenRespectsTargetVelocityAndReleases)
+{
+  const auto request = sine(1.5707963267948966, 0.15, 1.0, 2.0);
+  const auto id = startAndArm(request);
+  const hil::SineTrajectory expected(0.0, request.amplitude, 0.15, 1.0, 2.0);
+  EXPECT_LT(expected.velocityUpperBound(), 1.5);
+  double elapsed = 0.0, minimum = 10.0, maximum = -10.0;
+  for (int k = 0; k < 36000; ++k) {
+    if (k % 50 == 0) {controller_->onKeepalive(id);}
+    step();
+    if (controller_->snapshot().state == State::kRunning) {
+      const auto target = expected.at(elapsed);
+      ASSERT_NEAR(cmd_values_[0], target.position, 1e-10);
+      ASSERT_NEAR(cmd_values_[1], target.velocity, 1e-10);
+      ASSERT_LE(std::abs(cmd_values_[1]), 1.5);
+      minimum = std::min(minimum, cmd_values_[0]);
+      maximum = std::max(maximum, cmd_values_[0]);
+      position_ = cmd_values_[0];
+      elapsed += kDt;
+    }
+  }
+  EXPECT_NEAR(minimum, -1.5707963267948966, 1e-7);
+  EXPECT_NEAR(maximum, 1.5707963267948966, 1e-7);
+  EXPECT_TRUE(outputsReleased());
+}
+
+TEST_F(FasterWideSineControllerTest, RejectsShortRampAndHigherFrequency)
+{
+  EXPECT_FALSE(controller_->requestStart(sine(1.5707963267948966, 0.15, 1, 1)).accepted);
+  EXPECT_FALSE(controller_->requestStart(sine(1.5707963267948966, 0.16, 1, 2)).accepted);
+}
+
+TEST_F(WideSineControllerTest, PointFifteenRemainsRejectedByTheOldTargetLimit)
+{
+  EXPECT_FALSE(controller_->requestStart(sine(1.5707963267948966, 0.15, 1, 2)).accepted);
+}
+
 TEST_F(WideSineControllerTest, FasterNinetyDegreesRespectsVelocityAndReleases)
 {
   const auto request = sine(1.5707963267948966, 0.1, 1.0, 2.0);
