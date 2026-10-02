@@ -1,0 +1,34 @@
+# Explicit opt-in: zero-centered ±90 degrees, 0.5 Hz; target velocity 5.0 rad/s, actual velocity postcheck 6.0 rad/s.
+# RT 軌道 controller の vcan / 段階3R・4R用。実機の使用は手順4の検証後に判断する。
+controller_manager:
+  ros__parameters:
+    update_rate: 1000
+    thread_priority: 50
+    lock_memory: true
+    # 更新スレッドを P コアの CPU 11 に固定する（2026-09-30、案B）。固定しないと E コアで動く周期があり、
+    # vcan で update() の最大が約 50 µs になった。送受信スレッド（CPU 9）とは別の物理コア。
+    # 検討：docs/plans/20260930_bxi_cpu_affinity_plan.md（ワークスペース側）
+    cpu_affinity: 11
+
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+
+    hil_trajectory:
+      type: bxi_hardware/HilTrajectoryController
+
+hil_trajectory:
+  ros__parameters:
+    joint: joint1
+    lower: -1.65
+    upper: 1.65
+    max_kp: 20.0
+    max_torque: 5.0
+    max_velocity: 5.0
+    max_amplitude: 1.5707963267948966
+    fixed_sine_center: true
+    sine_center: 0.0
+    max_period: 0.005
+    arm_timeout: 1.0
+    record_tail: 0.5
+    record_seconds: 120.0
+    max_run_seconds: 65.0
