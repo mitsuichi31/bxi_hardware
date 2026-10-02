@@ -5,7 +5,7 @@
 //   ros2 run bxi_hardware bxi_vcan_motor_emulator --iface vcan0 --ids 1 --delay-us 300
 //
 // --follow 1 では、ブロードキャストの指令のうち Kp > 0 のものを受けると、応答の位置を指令の位置へ
-// 一次遅れ（時定数 50 ms）で近づけ、速度も返す（Kp = 0 ならその場に止まる）。HIL ランナーの判定
+// 一次遅れ（既定の時定数 50 ms、--follow-time-constant-ms で明示指定可）で近づけ、速度も返す（Kp = 0 ならその場に止まる）。HIL ランナーの判定
 // （移動量や往復）を vcan で通すための簡単な追従で、力学は模擬しない。
 //
 // 個別ID宛ての8 Bフレーム（enable/disable/MIT指令）にはすぐに応答し、ID 0x7FF のブロードキャスト
@@ -48,6 +48,7 @@ struct Options
   int delay_us = 300;
   int replies_per_command = 1;
   bool follow = false;
+  double follow_time_constant_ms = 50.0;
 };
 
 // Emulated joint state for --follow (under the shared mutex).
@@ -58,13 +59,11 @@ struct Joint
   clock_type::time_point updated{};
 };
 
-constexpr double kFollowTimeConstantS = 0.05;
-
 void usage()
 {
   std::printf(
     "usage: bxi_vcan_motor_emulator [--iface vcan0] [--ids 1,2,3] [--delay-us 300]"
-    " [--replies-per-command 1] [--follow 0|1]\n"
+    " [--replies-per-command 1] [--follow 0|1] [--follow-time-constant-ms 50]\n"
     "  vcan interfaces only. Stop with Ctrl+C; counts are printed on exit.\n");
 }
 
@@ -85,6 +84,15 @@ bool parse(int argc, char ** argv, Options & o)
       o.delay_us = std::atoi(value.c_str());
     } else if (key == "--replies-per-command") {
       o.replies_per_command = std::atoi(value.c_str());
+    } else if (key == "--follow-time-constant-ms") {
+      char * end = nullptr;
+      o.follow_time_constant_ms = std::strtod(value.c_str(), &end);
+      if (end == value.c_str() || *end != '\0' ||
+        !std::isfinite(o.follow_time_constant_ms) || o.follow_time_constant_ms <= 0.0 ||
+        o.follow_time_constant_ms > 1000.0)
+      {
+        return false;
+      }
     } else if (key == "--follow") {
       if (value != "0" && value != "1") {
         return false;
@@ -123,7 +131,7 @@ CanFrame feedbackFrame(int motor_id, const Joint * joint = nullptr)
 }
 
 // --follow: move toward the commanded position of one broadcast block when Kp > 0.
-void follow(Joint & joint, const uint8_t * block, clock_type::time_point now)
+void follow(Joint & joint, const uint8_t * block, clock_type::time_point now, double time_constant_s)
 {
   const protocol::MitLimits limits;
   const uint32_t p_raw = (static_cast<uint32_t>(block[0]) << 8) | block[1];
@@ -136,7 +144,7 @@ void follow(Joint & joint, const uint8_t * block, clock_type::time_point now)
     return;
   }
   const double target = protocol::uintToFloat(p_raw, limits.p_min, limits.p_max, 16);
-  const double step = (target - joint.position) * (1.0 - std::exp(-dt / kFollowTimeConstantS));
+  const double step = (target - joint.position) * (1.0 - std::exp(-dt / time_constant_s));
   joint.position += step;
   joint.velocity = step / dt;
 }
@@ -200,9 +208,9 @@ int main(int argc, char ** argv)
       }
     });
 
-  std::printf("bxi_vcan_motor_emulator: %s ids=%zu delay=%dus replies/command=%d follow=%d\n",
+  std::printf("bxi_vcan_motor_emulator: %s ids=%zu delay=%dus replies/command=%d follow=%d follow_time_constant_ms=%.6g\n",
     options.iface.c_str(), options.ids.size(), options.delay_us, options.replies_per_command,
-    options.follow ? 1 : 0);
+    options.follow ? 1 : 0, options.follow_time_constant_ms);
   CanFrame frame;
   while (!g_stop) {
     if (!rx_bus.recv(frame, 5) || frame.extended) {
@@ -223,7 +231,8 @@ int main(int argc, char ** argv)
           continue;
         }
         if (options.follow) {
-          follow(joints[block + 1], &frame.data[static_cast<size_t>(block) * 8], now);
+          follow(joints[block + 1], &frame.data[static_cast<size_t>(block) * 8], now,
+            options.follow_time_constant_ms / 1000.0);
         }
         for (int r = 0; r < options.replies_per_command; ++r) {
           pending.emplace(now + std::chrono::microseconds(options.delay_us), block + 1);
