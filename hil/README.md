@@ -6,6 +6,21 @@
 
 **手順だけを知りたいときは [`SINGLE_JOINT_GUIDE.md`](SINGLE_JOINT_GUIDE.md)（1軸の動作確認ガイド）を読む。** この README には、設定の詳しい説明、測定の結果、経緯も含めている。
 
+### モータID付きで±90°・0.5 Hzの結果を残す
+
+ホストの端末で、検査スクリプト `scripts/inspect_bxi_motor.py --motor-id` と同じシリアル番号・管理ラベルを指定する。
+
+```bash
+cd /home/user/devel/minibexkai_ros2_ws
+tools/hil_stage4r.sh --motor-id SN-0001 --sine-90deg --sine-frequency 0.5 --trace-cycles 620000
+```
+
+`SN-0001` を対象モータのIDに置き換える。IDは英数字・`.`・`_`・`-` の1〜64文字（先頭の`.`と`..`は不可）。このIDは記録用で、CAN IDの設定は変更しない。本手順の通信対象は引き続きCAN ID 1。動作試験側では対象モータのCAN IDを確認しないため、検査結果のCAN IDが1であることを確かめてから進む。
+
+記録先は実行ごとの `log/hil_stage4r_<日時>/`（最新は `log/hil_current/`）。`motor_id.txt`、`env.txt`、`capture_options.txt`、`checklist.md`、最終の `summary.txt` にIDを残し、同じディレクトリに既存のCSV・rosbag・CANログ・停止結果を保存する。IDの省略時は従来どおり。`hil_preflight.sh` の成功後、新しい記録先を確認してIDを書き込む。それ以降の追加確認で中止してもIDは残るが、`hil_preflight.sh` でNGとなった場合は `motor_id.txt` はまだ作成されない。
+
+中心0 rad、振幅±π/2、前後ramp各4秒・定常2秒・保持1秒後release。重力負荷のかからない取り付けと、±1.65 rad全域で接触・ストッパー・配線の巻き込みがないことを実物で確認する。検査が正常終了し、CAN ID 1・MENU状態を確認できた場合は電源ONのまま進み、動作試験の事前確認で再確認する。検査NG・状態不明の場合や交換・配線作業時は電源出力を切る。その他の姿勢・電源操作は実行時の確認に従う。
+
 ## 0. 準備（ホスト）
 
 ```bash
