@@ -74,6 +74,8 @@ def analyze(directory):
                                                    for c in samples if int(c["rx_published_ns"]) > 0])}
         # A receive after send is a temporal envelope only: replies carry no command sequence.
         next_read_misses = next_read_eligible = 0
+        # Sort once per axis; re-sorting per cycle made 1 kHz runs of ~50k cycles effectively hang.
+        sorted_times = [[p[0] for p in sorted(receive_by_axis.get(i, []))] for i in can_ids]
         for c in cycles:
             if c.get("send_kind") != "2" or c["send_success"] != "1":
                 continue
@@ -85,7 +87,7 @@ def analyze(directory):
             deadline = int(following["read_start_ns"])
             if deadline <= 0:
                 continue
-            for times in ([p[0] for p in sorted(receive_by_axis.get(i, []))] for i in can_ids):
+            for times in sorted_times:
                 next_read_eligible += 1
                 index = bisect.bisect_left(times, int(c["send_before_steady_ns"]))
                 next_read_misses += index == len(times) or times[index] >= deadline
