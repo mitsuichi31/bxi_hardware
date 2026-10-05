@@ -191,7 +191,8 @@ bool SocketCanBus::send(const CanFrame & frame)
     size = CANFD_MTU;
   }
 
-  const ssize_t n = ::write(fd_, &cf, size);
+  const ssize_t n = nonblocking_send_ ? ::send(fd_, &cf, size, MSG_DONTWAIT) :
+    ::write(fd_, &cf, size);
   if (n != static_cast<ssize_t>(size)) {
     static rclcpp::Clock clock(RCL_STEADY_TIME);
     RCLCPP_WARN_THROTTLE(logger(), clock, 1000,

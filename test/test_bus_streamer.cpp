@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cmath>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -17,6 +18,7 @@
 
 #include <pthread.h>
 #include <sys/resource.h>
+#include <unistd.h>
 
 #include <gtest/gtest.h>
 
@@ -25,6 +27,11 @@
 
 namespace bxi_hardware
 {
+struct AtomicSnapshotTestAccess
+{
+  template<class T> static void pauseWriter(AtomicSnapshot<T> & value)
+  {value.version_.store(value.version_.load() + 1);}
+};
 namespace
 {
 
@@ -213,7 +220,8 @@ public:
   }
 
   std::unique_ptr<BxiBusStreamer> makeStreamer(
-    StreamConfig config, BxiBusStreamer::CycleHook hook = nullptr)
+    StreamConfig config, BxiBusStreamer::CycleHook hook = nullptr,
+    std::unique_ptr<WriteStreamStorage> storage = nullptr)
   {
     if (!hook) {
       hook = [this](const std::vector<StreamFeedback> &, std::vector<StreamCommand> &) {
@@ -225,7 +233,7 @@ public:
     for (auto & driver : drivers) {
       raw.push_back(driver.get());
     }
-    return std::make_unique<BxiBusStreamer>(&tx, &rx, raw, config, hook, &stop_all);
+    return std::make_unique<BxiBusStreamer>(&tx, &rx, raw, config, hook, &stop_all, std::move(storage));
   }
 
   // Waits until the stream has stopped itself, returning when that was observed.
@@ -1409,6 +1417,270 @@ TEST(BusStreamer, BroadcastExpiredCommandKeepsValuesWithoutSendTimestamps)
   EXPECT_TRUE(row->command_valid); EXPECT_TRUE(row->encoded_valid); EXPECT_FALSE(row->send_attempted);
   EXPECT_DOUBLE_EQ(row->command.position, 0.1);
   EXPECT_EQ(row->send_before_steady_ns, -1); EXPECT_EQ(row->send_after_steady_ns, -1);
+}
+
+StreamConfig writeConfig()
+{
+  StreamConfig c;
+  c.write_triggered = true; c.direct_feedback = true;
+  c.period = 10ms; c.write_grace = 5ms;
+  c.max_feedback_age = 30ms; c.max_command_age = 50ms;
+  c.first_write_timeout = 50ms; c.trace_cycles = 200;
+  c.broadcast = true;
+  return c;
+}
+void publishBatch(BxiBusStreamer & streamer, size_t axes, uint64_t sequence, double kp = 10)
+{
+  std::vector<PublishedCommand> batch(axes);
+  for (auto & value : batch) {
+    value.sequence = sequence;
+    value.published_ns = clock_type::now().time_since_epoch().count();
+    value.command = {0.1, 0, kp, 1, 0};
+  }
+  ASSERT_TRUE(streamer.publishCommands(batch.data()));
+}
+TEST(BusStreamerWrite, ThreeMotorsPublishDirectFeedbackBeforeTheNextTx)
+{
+  Rig rig({1, 2, 3});
+  rig.link.setDelays({100us});
+  auto streamer = rig.makeStreamer(writeConfig());
+  ASSERT_TRUE(streamer->start());
+  ASSERT_TRUE(streamer->waitForFirstFeedback(100ms));
+  // TX's next bootstrap is at 10 ms. RX is visible independently of that cycle.
+  for (size_t axis = 0; axis < 3; ++axis) {
+    PublishedFeedback feedback;
+    ASSERT_TRUE(streamer->readFeedback(axis, feedback));
+    EXPECT_TRUE(feedback.feedback.valid);
+    EXPECT_GT(feedback.sequence, 0U);
+  }
+  streamer->armWrites();
+  publishBatch(*streamer, 3, 1);
+  std::this_thread::sleep_for(8ms);
+  streamer->stop();
+  EXPECT_EQ(streamer->stats().fault, StreamFault::kNone);
+  EXPECT_EQ(streamer->stats().resends, 0U);
+  EXPECT_EQ(rig.hook_calls, 0);
+}
+TEST(BusStreamerWrite, StalledWritesResendWithoutRefreshingCommandAge)
+{
+  Rig rig({1, 2, 3});
+  rig.link.setDelays({100us});
+  auto streamer = rig.makeStreamer(writeConfig());
+  ASSERT_TRUE(streamer->start());
+  ASSERT_TRUE(streamer->waitForFirstFeedback(100ms));
+  streamer->armWrites();
+  publishBatch(*streamer, 3, 1);
+  ASSERT_TRUE(rig.waitForStop(500ms).has_value());
+  streamer->stop();
+  const auto stats = streamer->stats();
+  EXPECT_EQ(stats.fault, StreamFault::kCommandStale);
+  EXPECT_GT(stats.resends, 0U);
+  EXPECT_EQ(stats.command_stale_zero_gain_frames, 1U);
+  EXPECT_GE(stats.max_command_age_ms, 50.0);
+}
+TEST(BusStreamerWrite, PausedCommandWriterDoesNotReuseOldCommandsAsNew)
+{
+  Rig rig({1});
+  auto storage = std::make_unique<WriteStreamStorage>(1);
+  auto * raw = storage.get();
+  auto c = writeConfig(); c.trace_cycles = 1000;
+  auto streamer = rig.makeStreamer(c, nullptr, std::move(storage));
+  ASSERT_TRUE(streamer->start());
+  ASSERT_TRUE(streamer->waitForFirstFeedback(100ms));
+  streamer->armWrites();
+  publishBatch(*streamer, 1, 1);
+  std::this_thread::sleep_for(8ms);
+  // Keep genuine RX feedback coming, to isolate command acquisition from reply freshness.
+  std::atomic<bool> injecting{true};
+  std::thread injector([&] {
+    while (injecting) {
+      rig.link.inject(feedbackFrame(1));
+      std::this_thread::sleep_for(1ms);
+    }
+  });
+  AtomicSnapshotTestAccess::pauseWriter(raw->commands);
+  streamer->notify();
+  const auto stopped = rig.waitForStop(500ms);
+  streamer->stop();
+  injecting = false; injector.join();
+  ASSERT_TRUE(stopped.has_value());
+  EXPECT_EQ(streamer->stats().fault, StreamFault::kCommandSnapshotUnavailable);
+  EXPECT_GT(streamer->stats().command_snapshot_failures, 0U);
+  EXPECT_EQ(streamer->stats().resends, 0U);
+  EXPECT_EQ(streamer->stats().command_stale_zero_gain_frames, 1U);
+}
+
+TEST(BusStreamerWrite, BroadcastFailureLatchesAllMotors)
+{
+  Rig rig({1, 2, 3});
+  rig.link.reject = [](const CanFrame & frame) {return frame.id == 0x7FF;};
+  auto streamer = rig.makeStreamer(writeConfig());
+  ASSERT_TRUE(streamer->start());
+  ASSERT_TRUE(rig.waitForStop(500ms).has_value());
+  streamer->stop();
+  EXPECT_EQ(streamer->stats().fault, StreamFault::kSendFailed);
+  for (const auto & driver : rig.drivers) {EXPECT_EQ(driver->state(), ActuatorState::kSafeStopped);}
+}
+
+TEST(BusStreamerWrite, FirstWriteTimeoutHasASeparateReason)
+{
+  Rig rig({1});
+  auto streamer = rig.makeStreamer(writeConfig());
+  ASSERT_TRUE(streamer->start());
+  ASSERT_TRUE(streamer->waitForFirstFeedback(100ms));
+  streamer->armWrites();
+  ASSERT_TRUE(rig.waitForStop(500ms).has_value());
+  streamer->stop();
+  EXPECT_EQ(streamer->stats().fault, StreamFault::kStartupTimeout);
+}
+
+TEST(BusStreamerWrite, NotificationFailureCannotLeaveTheTxAsleep)
+{
+  Rig rig({1});
+  auto storage = std::make_unique<WriteStreamStorage>(1);
+  auto * raw = storage.get();
+  auto streamer = rig.makeStreamer(writeConfig(), nullptr, std::move(storage));
+  ASSERT_TRUE(streamer->start());
+  ASSERT_TRUE(streamer->waitForFirstFeedback(100ms));
+  streamer->armWrites();
+  int descriptors[2]; ASSERT_EQ(::pipe(descriptors), 0);
+  // Keep the descriptor number immutable, but make writing it fail with EBADF.
+  const int replaced = ::dup2(descriptors[0], raw->event_fd);
+  ::close(descriptors[0]); ::close(descriptors[1]);
+  ASSERT_EQ(replaced, raw->event_fd);
+  PublishedCommand packet; packet.sequence = 1;
+  packet.published_ns = clock_type::now().time_since_epoch().count();
+  EXPECT_FALSE(streamer->publishCommands(&packet));
+  const auto stopped = rig.waitForStop(500ms);
+  streamer->stop();
+  ASSERT_TRUE(stopped.has_value());
+  EXPECT_EQ(streamer->stats().fault, StreamFault::kNotificationFailed);
+}
+
+TEST(BusStreamerWrite, ForbiddenPaddedMotorReplyIsLatched)
+{
+  Rig rig({1});
+  auto c = writeConfig(); c.padded_broadcast_blocks = 3; c.forbidden_reply_ids = {2, 3};
+  auto streamer = rig.makeStreamer(c);
+  ASSERT_TRUE(streamer->start());
+  ASSERT_TRUE(rig.waitForStop(500ms).has_value());
+  streamer->stop();
+  EXPECT_EQ(streamer->stats().fault, StreamFault::kForbiddenReply);
+  EXPECT_GT(streamer->stats().forbidden_replies, 0U);
+}
+
+TEST(BusStreamerWrite, UnicastFailureRecordsThePartialBatch)
+{
+  Rig rig({1, 2, 3});
+  rig.link.reject = [](const CanFrame & frame) {return frame.id == 2;};
+  auto c = writeConfig(); c.broadcast = false;
+  auto streamer = rig.makeStreamer(c);
+  ASSERT_TRUE(streamer->start());
+  ASSERT_TRUE(rig.waitForStop(500ms).has_value());
+  streamer->stop();
+  EXPECT_EQ(streamer->stats().fault, StreamFault::kSendFailed);
+  EXPECT_EQ(streamer->stats().partial_cycles, 1U);
+  EXPECT_EQ(streamer->stats().frames_sent, 1U);
+  ASSERT_GT(streamer->trace().cycle_count, 0U);
+  EXPECT_EQ(streamer->trace().cycles[0].outcome, StreamCycleOutcome::kPartial);
+  EXPECT_TRUE(streamer->trace().cycles[0].send_attempted);
+  EXPECT_FALSE(streamer->trace().cycles[0].send_success);
+}
+
+TEST(BusStreamerWrite, NewWriteAfterFirstUnicastFrameDoesNotSplitTheBatch)
+{
+  Rig rig({1, 2, 3});
+  std::atomic<bool> inject{false};
+  auto c = writeConfig(); c.broadcast = false;
+  auto streamer = rig.makeStreamer(c);
+  rig.link.after_send = [&] {
+    const auto frame = rig.link.sent().back();
+    if (frame.id == 1 && !isZeroGainUnicast(frame, 1) && inject.exchange(false)) {
+      publishBatch(*streamer, 3, 2, 20);
+    }
+  };
+  ASSERT_TRUE(streamer->start());
+  ASSERT_TRUE(streamer->waitForFirstFeedback(100ms));
+  streamer->armWrites(); inject = true;
+  publishBatch(*streamer, 3, 1, 10);
+  std::this_thread::sleep_for(25ms);
+  streamer->stop();
+  EXPECT_FALSE(inject.load());
+  EXPECT_EQ(streamer->stats().partial_cycles, 0U);
+  for (uint64_t sequence : {1U, 2U}) {
+    const auto & rows = streamer->trace().cycles;
+    const auto found = std::find_if(rows.begin(), rows.end(), [sequence](const auto & row) {
+      return row.send_kind == 2 && row.command_sequence == sequence;
+    });
+    ASSERT_NE(found, rows.end());
+    EXPECT_EQ(found->frames, 3U);
+    EXPECT_EQ(found->outcome, StreamCycleOutcome::kSent);
+  }
+}
+TEST(BusStreamerWrite, MissingRepliesFaultEvenWhenWritesContinue)
+{
+  Rig rig({1});
+  auto streamer = rig.makeStreamer(writeConfig());
+  ASSERT_TRUE(streamer->start());
+  ASSERT_TRUE(streamer->waitForFirstFeedback(100ms));
+  streamer->armWrites();
+  rig.link.setRespond(false);
+  for (uint64_t seq = 1; seq < 50 && !rig.stop_all; ++seq) {
+    publishBatch(*streamer, 1, seq);
+    std::this_thread::sleep_for(2ms);
+  }
+  ASSERT_TRUE(rig.waitForStop(500ms).has_value());
+  streamer->stop();
+  EXPECT_EQ(streamer->stats().fault, StreamFault::kFeedbackStale);
+}
+TEST(BusStreamerWrite, OvertemperatureCannotBeClearedByANormalReply)
+{
+  for (bool write_triggered : {true, false}) {
+  Rig rig({1});
+  auto c = writeConfig(); c.write_triggered = write_triggered;
+  if (!write_triggered) {c.max_command_age = 0ns;}
+  auto streamer = rig.makeStreamer(c);
+  ASSERT_TRUE(streamer->start());
+  ASSERT_TRUE(streamer->waitForFirstFeedback(100ms));
+  auto frame = feedbackFrame(1);
+  frame.data[6] = 0xff; frame.data[7] = 0xff;
+  rig.link.inject(frame);
+  rig.link.inject(feedbackFrame(1));
+  ASSERT_TRUE(rig.waitForStop(500ms).has_value());
+  streamer->stop();
+  EXPECT_EQ(streamer->stats().fault, StreamFault::kTemperature);
+  EXPECT_EQ(streamer->stats().temperature_fault_axis, 0);
+  EXPECT_DOUBLE_EQ(streamer->stats().temperature_fault_c, 150.0);
+  EXPECT_GT(streamer->stats().temperature_fault_received_ns, 0);
+  }
+}
+TEST(BusStreamerWrite, BothSensorFailureDetailsSurviveRecoveryFrame)
+{
+  Rig rig({1});
+  auto streamer = rig.makeStreamer(writeConfig());
+  ASSERT_TRUE(streamer->start());
+  ASSERT_TRUE(streamer->waitForFirstFeedback(100ms));
+  auto frame = feedbackFrame(1); frame.data[6] = frame.data[7] = 0;
+  rig.link.inject(frame); rig.link.inject(feedbackFrame(1));
+  ASSERT_TRUE(rig.waitForStop(500ms).has_value());
+  streamer->stop();
+  EXPECT_EQ(streamer->stats().fault, StreamFault::kTemperature);
+  EXPECT_EQ(streamer->stats().temperature_fault_axis, 0);
+  EXPECT_TRUE(std::isnan(streamer->stats().temperature_fault_c));
+  EXPECT_GT(streamer->stats().temperature_fault_received_ns, 0);
+}
+TEST(BusStreamerWrite, StopWakesAnIdleTxWithoutAwaitingItsWatchdog)
+{
+  Rig rig({1});
+  auto c = writeConfig(); c.period = 100ms; c.write_grace = 50ms;
+  c.max_feedback_age = 300ms; c.max_command_age = 500ms;
+  auto streamer = rig.makeStreamer(c);
+  ASSERT_TRUE(streamer->start());
+  ASSERT_TRUE(streamer->waitForFirstFeedback(100ms));
+  const auto elapsed = stopDurationMs(*streamer);
+  EXPECT_LT(elapsed, 50.0);
+  PublishedCommand packet;
+  EXPECT_FALSE(streamer->publishCommands(&packet));
 }
 
 }  // namespace

@@ -33,6 +33,16 @@ struct BxiSpec
 std::optional<protocol::MitFeedback> decodeMotorReply(
   const CanFrame & frame, int can_id, const protocol::MitLimits & limits);
 
+struct FeedbackTransform
+{
+  int direction = 1;
+  double offset = 0.0;
+  double sensor_fault_below = -20.0;
+};
+// Pure conversion, shared by sequential and RX-owned streamed paths.
+ActuatorFeedback convertFeedback(const protocol::MitFeedback & decoded,
+  const FeedbackTransform & transform);
+
 enum class ActuatorState
 {
   kDisabled,
@@ -81,12 +91,15 @@ public:
   // Converts a decoded reply to joint units and updates the temperature-sensor fault flags.
   ActuatorFeedback applyFeedback(const protocol::MitFeedback & decoded);
   // Latches safe-stop after a streamed communication fault and sends a best-effort disable.
-  void latchCommunicationFault() {latchSafeStop();}
+  void latchCommunicationFault(bool report_disable_failure = true)
+  {latchSafeStop(report_disable_failure);}
   int canId() const {return can_id_;}
   // Snapshot after setAngleOffset/setAngleRange, before streaming starts.
   double effectiveAngleOffset() const {return offset_angle_;}
   std::pair<double, double> effectiveAngleRange() const {return {lower_, upper_};}
   int motorDirection() const {return motor_dir_;}
+  FeedbackTransform feedbackTransform() const
+  {return {motor_dir_, offset_angle_, temperature_sensor_fault_below_c_};}
   protocol::MitLimits limits() const;
 
   ActuatorState state() const {return state_;}
@@ -97,8 +110,8 @@ public:
 private:
   ActuatorFeedback sendSpecial(protocol::SpecialCommand command, bool enables_motor);
   ActuatorFeedback transact(const CanFrame & request);
-  void latchSafeStop();
-  void trySendDisable();
+  void latchSafeStop(bool report_disable_failure = true);
+  void trySendDisable(bool report_failure = true);
   void updateTemperature(const protocol::MitFeedback & decoded, ActuatorFeedback & result);
 
   CanBus * bus_;

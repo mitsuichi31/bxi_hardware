@@ -459,6 +459,30 @@ TEST(ActivationPreparation, ExpandedTraceRejectsUnsupportedSetupBeforeEnable)
   EXPECT_TRUE(system.created_buses.empty());
 }
 
+TEST(ActivationPreparation, WriteTrace620kFitsBeforeAnyCanOpen)
+{
+  ScopedEnv dir("BXI_WORKER_TIMING_DIR", ::testing::TempDir().c_str());
+  ScopedEnv count("BXI_STREAM_TRACE_CYCLES", "620000");
+  class BudgetSystem : public TestSystemInterface {
+  public:
+    bool reached_can_open = false;
+  protected:
+    std::shared_ptr<CanBus> makeBus(CanFrameFormat) override {
+      reached_can_open = true;
+      throw std::runtime_error("test stops after preparation, before opening CAN");
+    }
+  } system;
+  const auto config = transportConfig(
+    "{rx_mode: separate, tx_frame: broadcast, stream_feedback_max_age_ms: 3, "
+    "tx_trigger: write, stream_write_grace_ms: 0.5}", "fd", 1000,
+    "{enabled: false, can_bus: can0, can_id: 2, motor_dir: 1, motor_type: MOTOR_70, lower: -1.0, upper: 1.0}");
+  ASSERT_EQ(system.on_init(hardwareInfoAt(writeConfig("write_aggregate.yaml", config))),
+    hardware_interface::CallbackReturn::SUCCESS);
+  EXPECT_EQ(system.on_activate(rclcpp_lifecycle::State()), hardware_interface::CallbackReturn::ERROR);
+  EXPECT_TRUE(system.reached_can_open);
+  EXPECT_TRUE(system.created_buses.empty());
+}
+
 TEST(ActivationRollback, DestructionWithoutDeactivateJoinsWorkersAndDisables)
 {
   std::shared_ptr<EmulatedBus> bus;

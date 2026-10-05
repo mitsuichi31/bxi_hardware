@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cerrno>
 #include <cstring>
+#include <cmath>
 #include <filesystem>
 #include <limits>
 #include <fcntl.h>
@@ -238,9 +239,14 @@ StreamTraceWriteResult StreamTraceOutput::write(const StreamTrace & trace,
     ",dropped_cycles=" + std::to_string(result.dropped_cycles) +
     ",dropped_rx=" + std::to_string(result.dropped_rx) +
     ",tx_thread=" + describe(trace.tx_thread) + ",rx_thread=" + describe(trace.rx_thread) +
-    ",format_version=2,trace_synthetic=" + (trace.synthetic ? "1" : "0") +
+    ",format_version=" + std::string(config.write_triggered || config.direct_feedback || config.control_trace ? "3" : "2") +
+    ",tx_trigger=" + (config.write_triggered ? "write" : "periodic") +
+    ",direct_feedback=" + (config.direct_feedback ? "1" : "0") +
+    ",write_grace_ns=" + std::to_string(config.write_grace.count()) +
+    ",trace_synthetic=" + (trace.synthetic ? "1" : "0") +
     ",trace_origin_steady_ns=" + std::to_string(origin) +
     ",send_loop_start_steady_ns=" + std::to_string(trace.send_loop_start_steady_ns) +
+    ",writes_armed_steady_ns=" + std::to_string(trace.writes_armed_steady_ns) +
     ",stream_stop_steady_ns=" + std::to_string(trace.stream_stop_steady_ns) +
     ",trace_cycles_capacity=" + std::to_string(trace.cycles.size()) +
     ",trace_rx_capacity=" + std::to_string(trace.rx.size()) +
@@ -272,7 +278,11 @@ StreamTraceWriteResult StreamTraceOutput::write(const StreamTrace & trace,
   }
   writer_.text(",command_age_ns,tx_detail_supported,command_valid,command_source,command_position_rad,"
     "command_velocity_rad_s,command_kp,command_kd,command_effort_nm,encoded_valid,command_block_hex,"
-    "send_attempted,send_success,send_before_steady_ns,send_after_steady_ns\n");
+    "send_attempted,send_success,send_before_steady_ns,send_after_steady_ns");
+  if (config.write_triggered || config.direct_feedback || config.control_trace) {
+    writer_.text(",command_sequence,command_published_ns,wake_steady_ns,resend_due_ns,hold_ns,send_kind,snapshot_failed");
+  }
+  writer_.text("\n");
   for (size_t i = 0; i < result.cycle_rows; ++i) {
     const auto & r = trace.cycles[i];
     writer_.field(r.cycle); writer_.text(streamCycleOutcomeName(r.outcome)); writer_.text(",");
@@ -291,17 +301,25 @@ StreamTraceWriteResult StreamTraceOutput::write(const StreamTrace & trace,
     } else {writer_.text(",,,,,");}
     writer_.field(detail && r.encoded_valid ? 1 : 0);
     if (detail && r.encoded_valid) {writer_.text(hexBlock(r.command_block));}
-    writer_.text(","); writer_.field(detail && r.send_attempted ? 1 : 0);
-    if (detail && r.send_attempted) {
+    const bool send_timing = detail || config.write_triggered || config.control_trace;
+    writer_.text(","); writer_.field(send_timing && r.send_attempted ? 1 : 0);
+    if (send_timing && r.send_attempted) {
       writer_.field(r.send_success ? 1 : 0); writer_.field(r.send_before_steady_ns);
       writer_.number(r.send_after_steady_ns);
     } else {writer_.text(",,");}
+    if (config.write_triggered || config.direct_feedback || config.control_trace) {
+      writer_.text(","); writer_.field(r.command_sequence); writer_.field(r.command_published_ns);
+      writer_.field(r.wake_steady_ns); writer_.field(r.resend_due_ns); writer_.field(r.hold_ns);
+      writer_.field(r.send_kind); writer_.number(r.snapshot_failed ? 1 : 0);
+    }
     writer_.text("\n");
   }
   writer_.close();
   writer_.open(stem_ + "_rx.csv"); writer_.text(metadata);
   writer_.text("can_id,received_ns,rx_kernel_realtime_ns,rx_userspace_realtime_ns,rx_hardware_raw_ns,"
-    "received_steady_ns,motor_position_rad,motor_velocity_rad_s,motor_torque_nm\n");
+    "received_steady_ns,motor_position_rad,motor_velocity_rad_s,motor_torque_nm");
+  if (config.direct_feedback || config.write_triggered || config.control_trace) {writer_.text(",rx_sequence,published_steady_ns");}
+  writer_.text("\n");
   for (size_t i = 0; i < result.rx_rows; ++i) {
     const auto & r = trace.rx[i];
     if (r.axis >= trace.axes) {throw std::runtime_error("invalid RX axis");}
@@ -309,15 +327,37 @@ StreamTraceWriteResult StreamTraceOutput::write(const StreamTrace & trace,
     writer_.field(r.rx_kernel_realtime_ns); writer_.field(r.rx_userspace_realtime_ns);
     writer_.field(r.rx_hardware_raw_ns); writer_.field(origin + r.received_ns);
     writer_.field(r.motor_position); writer_.field(r.motor_velocity); writer_.number(r.motor_torque);
+    if (config.direct_feedback || config.write_triggered || config.control_trace) {
+      writer_.text(","); writer_.field(r.sequence); writer_.number(r.published_ns);
+    }
     writer_.text("\n");
   }
   writer_.close();
   result.csv_write_elapsed_ns = ns(Clock::now() - csv_start);
   const auto basename = std::filesystem::path(stem_).filename().string();
   writer_.open(stem_ + ".complete.tmp");
-  writer_.text("{\"format_version\":2,\"cycles_file\":\"" + basename + "_cycles.csv\",\"rx_file\":\"" +
+  writer_.text("{\"format_version\":" + std::string(config.write_triggered || config.direct_feedback || config.control_trace ? "3" : "2") +
+    ",\"resends\":" + std::to_string(stats.resends) +
+    ",\"feedback_stale_at_stop\":" + (stats.feedback_stale_at_stop ? "true" : "false") +
+    ",\"received_fault_at_stop\":\"" + streamFaultName(stats.received_fault_at_stop) + "\"" +
+    ",\"minimum_interval_holds\":" + std::to_string(stats.minimum_interval_holds) +
+    ",\"writes_after_resend\":" + std::to_string(stats.writes_after_resend) +
+    ",\"resend_command_holds\":" + std::to_string(stats.resend_command_holds) +
+    ",\"new_command_holds\":" + std::to_string(stats.new_command_holds) +
+    ",\"bootstrap_command_holds\":" + std::to_string(stats.bootstrap_command_holds) +
+    ",\"command_snapshot_failures\":" + std::to_string(stats.command_snapshot_failures) +
+    ",\"max_hold_ns\":" + std::to_string(stats.max_hold_ns) +
+    ",\"cycles_file\":\"" + basename + "_cycles.csv\",\"rx_file\":\"" +
     basename + "_rx.csv\",\"cycle_rows\":");
   writer_.number(result.cycle_rows); writer_.text(",\"rx_rows\":"); writer_.number(result.rx_rows);
+  writer_.text(",\"temperature_fault_axis\":"); writer_.number(stats.temperature_fault_axis);
+  writer_.text(",\"temperature_fault_c\":");
+  if (stats.temperature_fault_axis >= 0 && std::isfinite(stats.temperature_fault_c)) {
+    writer_.number(stats.temperature_fault_c);
+  } else {writer_.text("null");}
+  writer_.text(",\"temperature_fault_received_ns\":"); writer_.number(stats.temperature_fault_received_ns);
+  writer_.text(",\"temperature_sensors_failed\":");
+  writer_.text(stats.temperature_fault_axis >= 0 && !std::isfinite(stats.temperature_fault_c) ? "true" : "false");
   writer_.text(",\"dropped_cycles\":"); writer_.number(result.dropped_cycles);
   writer_.text(",\"dropped_rx\":"); writer_.number(result.dropped_rx);
   writer_.text(",\"fault\":\""); writer_.text(streamFaultName(stats.fault));

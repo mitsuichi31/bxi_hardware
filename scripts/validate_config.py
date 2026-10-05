@@ -65,11 +65,15 @@ def validate_transport(config: dict, active_buses: set[str], used_ids: set[tuple
         isolated = "hil_isolated_id1_broadcast_blocks" in transport
         max_age = transport.get("stream_feedback_max_age_ms")
         command_max_age = transport.get("stream_command_max_age_ms")
+        write_trigger = transport.get("tx_trigger", "periodic") == "write"
+        direct = transport.get("direct_feedback", False)
+        grace = transport.get("stream_write_grace_ms")
         thread_setting = any(key in transport for key in (
             "send_thread_priority", "receive_thread_priority", "thread_cpus"))
         if not separate:
             if (broadcast or max_age is not None or command_max_age is not None or isolated
-                    or thread_setting):
+                    or thread_setting or write_trigger or direct or grace is not None
+                    or "stream_first_write_timeout_ms" in transport):
                 errors.append(f"can_transport.{bus}: broadcast, stream_feedback_max_age_ms, "
                               "stream_command_max_age_ms, hil_isolated_id1_broadcast_blocks and "
                               "thread settings require rx_mode: separate")
@@ -81,6 +85,18 @@ def validate_transport(config: dict, active_buses: set[str], used_ids: set[tuple
                 not math.isfinite(command_max_age) or command_max_age < 2 * period_ms):
             errors.append(f"can_transport.{bus}.stream_command_max_age_ms must be at least two "
                           f"periods ({2 * period_ms:.3f} ms)")
+        if write_trigger:
+            first_write_timeout = transport.get("stream_first_write_timeout_ms", 20)
+            if not math.isfinite(first_write_timeout) or not 0 < first_write_timeout <= 1000:
+                errors.append(f"can_transport.{bus}: first-write timeout must be finite in (0,1000] ms")
+            effective_command_age = command_max_age if command_max_age is not None else max(5, 2 * period_ms)
+            if (grace is None or not math.isfinite(grace) or grace <= 0
+                    or max_age is None or period_ms + grace >= max_age
+                    or period_ms + grace >= effective_command_age):
+                errors.append(f"can_transport.{bus}: write trigger needs explicit positive grace "
+                              "and freshness margin")
+        elif grace is not None or "stream_first_write_timeout_ms" in transport:
+            errors.append(f"can_transport.{bus}: write grace / first-write timeout require tx_trigger: write")
         ids = sorted(can_id for joint_bus, can_id in used_ids if joint_bus == bus)
         bus_format = formats.get(bus, "classic")
         if isolated:

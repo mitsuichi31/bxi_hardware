@@ -27,6 +27,8 @@ public:
   // Classic buses send at most 8 bytes; FD buses send any valid CAN FD length up to 64 bytes.
   bool send(const CanFrame & frame) override;
   bool recv(CanFrame & out, int timeout_ms) override;
+  // Only change before streaming starts or after TX has joined.
+  void setNonblockingSend(bool enabled) {nonblocking_send_ = enabled;}
   void flushRx() override;
   // Configure before open(). Normal runs keep the original read() path.
   void setRxTimestamping(bool enabled) {
@@ -47,6 +49,7 @@ public:
 private:
   CanFrameFormat format_;
   int fd_ = -1;
+  bool nonblocking_send_ = false;
   std::string ifname_;
   std::mutex io_mutex_;
   enum class RxTimestampMode { kOff, kSoftware, kHardware };

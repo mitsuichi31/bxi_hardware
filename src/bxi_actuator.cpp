@@ -111,18 +111,33 @@ ActuatorFeedback BxiActuatorDriver::transact(const CanFrame & request)
   return result;
 }
 
-ActuatorFeedback BxiActuatorDriver::applyFeedback(const protocol::MitFeedback & decoded)
+ActuatorFeedback convertFeedback(const protocol::MitFeedback & decoded,
+  const FeedbackTransform & transform)
 {
   ActuatorFeedback result;
-  result.position = (decoded.position - offset_angle_) * motor_dir_;
-  result.velocity = decoded.velocity * motor_dir_;
-  result.effort = decoded.torque * motor_dir_;
-  updateTemperature(decoded, result);
+  result.position = (decoded.position - transform.offset) * transform.direction;
+  result.velocity = decoded.velocity * transform.direction;
+  result.effort = decoded.torque * transform.direction;
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const double mos = decoded.mos_temperature < transform.sensor_fault_below ?
+    nan : decoded.mos_temperature;
+  const double motor = decoded.motor_temperature < transform.sensor_fault_below ?
+    nan : decoded.motor_temperature;
+  result.temperature = std::isnan(mos) ? motor :
+    (std::isnan(motor) ? mos : std::max(mos, motor));
+  result.motor_temperature = motor;
   result.valid = true;
   return result;
 }
 
-void BxiActuatorDriver::latchSafeStop()
+ActuatorFeedback BxiActuatorDriver::applyFeedback(const protocol::MitFeedback & decoded)
+{
+  auto result = convertFeedback(decoded, feedbackTransform());
+  updateTemperature(decoded, result);  // Preserve sequential sensor-transition diagnostics.
+  return result;
+}
+
+void BxiActuatorDriver::latchSafeStop(bool report_disable_failure)
 {
   if (state_ == ActuatorState::kSafeStopped) {
     return;
@@ -130,16 +145,16 @@ void BxiActuatorDriver::latchSafeStop()
   state_ = ActuatorState::kSafeStopped;
   // A lost reply does not prove the request was lost. Try to clear the motor's latched command
   // without waiting for an acknowledgement, which may be the part of the link that has failed.
-  trySendDisable();
+  trySendDisable(report_disable_failure);
 }
 
-void BxiActuatorDriver::trySendDisable()
+void BxiActuatorDriver::trySendDisable(bool report_failure)
 {
   CanFrame disable_frame;
   disable_frame.id = static_cast<uint32_t>(can_id_);
   disable_frame.extended = false;
   disable_frame.setData(protocol::encodeSpecialCommand(protocol::SpecialCommand::kDisable));
-  if (!bus_->send(disable_frame)) {
+  if (!bus_->send(disable_frame) && report_failure) {
     RCLCPP_ERROR(logger(), "motor id=%d disable frame could not be sent", can_id_);
   }
 }

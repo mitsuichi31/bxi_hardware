@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "bxi_hardware/actuator/bxi_actuator.hpp"
+#include "bxi_hardware/atomic_snapshot.hpp"
 #include "bxi_hardware/can/can_bus.hpp"
 
 namespace bxi_hardware
@@ -28,6 +29,41 @@ struct StreamCommand
   double kp = 0.0;
   double kd = 0.0;
   double effort = 0.0;
+  uint64_t sequence = 0;
+  int64_t published_ns = 0;
+};
+
+struct PublishedCommand
+{
+  StreamCommand command;
+  uint64_t sequence = 0;
+  int64_t published_ns = 0;
+};
+struct PublishedFeedback
+{
+  ActuatorFeedback feedback;
+  uint64_t sequence = 0;
+  int64_t received_ns = 0;
+  int64_t published_ns = 0;
+};
+// Prepared before enable; immutable lifetime until read/write have stopped and threads joined.
+struct WriteStreamStorage
+{
+  explicit WriteStreamStorage(size_t axes);
+  ~WriteStreamStorage();
+  WriteStreamStorage(const WriteStreamStorage &) = delete;
+  WriteStreamStorage & operator=(const WriteStreamStorage &) = delete;
+  AtomicSnapshot<PublishedCommand> commands;
+  std::vector<std::unique_ptr<AtomicSnapshot<PublishedFeedback>>> feedback;
+  std::unique_ptr<std::atomic<int64_t>[]> received_ns;
+  std::unique_ptr<std::atomic<bool>[]> control_unavailable;
+  std::vector<uint64_t> tx_seen_feedback;
+  std::vector<PublishedCommand> tx_cache, tx_scratch;
+  std::vector<PublishedFeedback> rx_cache, tx_feedback;
+  std::vector<FeedbackTransform> transforms;
+  std::vector<StreamCommand> tx_commands;
+  std::vector<std::pair<int, std::array<uint8_t, 8>>> tx_blocks;
+  int event_fd = -1, timer_fd = -1;
 };
 
 struct StreamFeedback
@@ -38,6 +74,8 @@ struct StreamFeedback
   bool updated = false;
   // Since the latest reply, or since the first streamed send before any reply.
   double age_ms = 0.0;
+  uint64_t sequence = 0;
+  int64_t received_ns = 0;
 };
 
 enum class StreamFault
@@ -49,12 +87,21 @@ enum class StreamFault
   kForbiddenReply,
   kOwnerRequested,
   kCommandStale,
+  kCommandSnapshotUnavailable,
+  kStartupTimeout,
+  kTemperature,
+  kNotificationFailed,
 };
 
 const char * streamFaultName(StreamFault fault);
 
 struct StreamConfig
 {
+  bool control_trace = false;
+  bool write_triggered = false;
+  bool direct_feedback = false;  // periodic TX + direct RX is supported for comparisons.
+  std::chrono::nanoseconds write_grace{0};
+  std::chrono::nanoseconds first_write_timeout{std::chrono::milliseconds(20)};
   std::chrono::nanoseconds period{std::chrono::milliseconds(1)};
   // Safe-stop when a reply is older than this at the start of a cycle.
   std::chrono::nanoseconds max_feedback_age{std::chrono::milliseconds(3)};
@@ -79,6 +126,8 @@ struct StreamConfig
   std::vector<int> forbidden_reply_ids;
   // The receive thread checks its stop flag at least this often.
   int rx_poll_ms = 2;
+  // All prepared write-stream event FDs; immutable until every TX/RX has joined.
+  std::vector<int> stop_wake_fds;
   // Each thread must report that it started (scheduling applied) within this time.
   std::chrono::milliseconds rx_ready_timeout{100};
   // Cycles to record in the preallocated trace (0 = no trace). Replies get twice as many rows
@@ -106,25 +155,28 @@ enum class StreamCycleOutcome : uint8_t
 
 const char * streamCycleOutcomeName(StreamCycleOutcome outcome);
 
+// Trace values only: sequence/publication are recorded once in the enclosing row.
+struct TraceCommand
+{
+  double position = 0.0, velocity = 0.0, kp = 0.0, kd = 0.0, effort = 0.0;
+};
 struct StreamCycleRecord
 {
   uint64_t cycle = 0;
-  int64_t wake_lateness_ns = 0;  // wake-up after the scheduled slot start
-  int64_t hook_ns = 0;           // time in the owner hook, including its lock waits
-  int64_t send_lateness_ns = -1;  // first frame after the slot start; -1 if nothing was sent
-  // Age of the owner's latest command at the start of the cycle; -1 when not checked.
+  int64_t wake_lateness_ns = 0, hook_ns = 0, send_lateness_ns = -1;
   int64_t command_age_ns = -1;
+  TraceCommand command{};
+  std::array<uint8_t, 8> command_block{};
+  int64_t send_before_steady_ns = -1, send_after_steady_ns = -1;
+  uint64_t command_sequence = 0;
+  int64_t command_published_ns = 0, wake_steady_ns = 0, resend_due_ns = 0, hold_ns = 0;
+  // Group small fields to avoid per-row alignment padding. CSV columns are unchanged.
   uint8_t frames = 0;
   StreamCycleOutcome outcome = StreamCycleOutcome::kSent;
-  StreamCommand command{};  // Post-stale replacement, before encoder saturation/conversion.
-  std::array<uint8_t, 8> command_block{};
-  int64_t send_before_steady_ns = -1;
-  int64_t send_after_steady_ns = -1;
-  bool command_valid = false;
-  bool encoded_valid = false;
-  bool send_attempted = false;
-  bool send_success = false;
-  bool command_stale = false;
+  bool command_valid = false, encoded_valid = false, send_attempted = false;
+  bool send_success = false, command_stale = false;
+  uint8_t send_kind = 0;  // 0 periodic, 1 bootstrap, 2 new write, 3 resend, 4 stale zero gain.
+  bool snapshot_failed = false;
 };
 
 struct StreamRxRecord
@@ -137,6 +189,8 @@ struct StreamRxRecord
   double motor_position = 0.0;
   double motor_velocity = 0.0;
   double motor_torque = 0.0;
+  uint64_t sequence = 0;
+  int64_t published_ns = 0;
 };
 
 struct StreamAxisMetadata
@@ -156,6 +210,7 @@ struct StreamTrace
   std::chrono::steady_clock::time_point origin{};
   size_t axes = 0;
   int64_t send_loop_start_steady_ns = -1;
+  int64_t writes_armed_steady_ns = 0;
   int64_t stream_stop_steady_ns = -1;
   int64_t allocation_ns = 0;
   size_t payload_bytes = 0;
@@ -185,6 +240,20 @@ struct StreamStats
   // On a command-age stop: zero-gain frames sent in the stopping cycle, out of the expected count.
   size_t command_stale_zero_gain_frames = 0;
   size_t command_stale_expected_frames = 0;
+  uint64_t resends = 0;
+  uint64_t command_snapshot_failures = 0;
+  uint64_t command_coalesced = 0;
+  uint64_t minimum_interval_holds = 0;
+  uint64_t writes_after_resend = 0;
+  uint64_t resend_command_holds = 0;
+  uint64_t new_command_holds = 0;
+  uint64_t bootstrap_command_holds = 0;
+  int64_t max_hold_ns = 0;
+  bool feedback_stale_at_stop = false;
+  StreamFault received_fault_at_stop = StreamFault::kNone;
+  int temperature_fault_axis = -1;
+  double temperature_fault_c = 0.0;
+  int64_t temperature_fault_received_ns = 0;
   uint64_t rx_frames = 0;
   uint64_t rx_ignored = 0;
   uint64_t forbidden_replies = 0;
@@ -207,7 +276,8 @@ public:
 
   BxiBusStreamer(
     CanBus * tx_bus, CanBus * rx_bus, std::vector<BxiActuatorDriver *> drivers,
-    StreamConfig config, CycleHook hook, std::atomic<bool> * stop_all);
+    StreamConfig config, CycleHook hook, std::atomic<bool> * stop_all,
+    std::unique_ptr<WriteStreamStorage> storage = nullptr);
   ~BxiBusStreamer();
   BxiBusStreamer(const BxiBusStreamer &) = delete;
   BxiBusStreamer & operator=(const BxiBusStreamer &) = delete;
@@ -221,7 +291,15 @@ public:
   bool waitForFirstFeedback(std::chrono::nanoseconds timeout);
   // Asks the send thread to stop sending, without waiting. No frame leaves after the request is
   // seen. stop() still has to join. Lets an owner stop several buses before joining any of them.
-  void requestStop() {tx_running_ = false;}
+  void requestStop();
+  // Single control-thread writer. Scratch values supplied by HWIF, already allocated.
+  bool publishCommands(const PublishedCommand * commands);
+  bool readFeedback(size_t axis, PublishedFeedback & scratch, unsigned * attempts = nullptr) const;
+  void setControlUnavailable(size_t axis, bool unavailable);
+  bool controlUnavailable(size_t axis) const;
+  // Called after on_activate's bootstrap feedback handshake, before controller write begins.
+  void armWrites();
+  void notify();
   // Joins the send thread, then the receive thread. Safe to call more than once.
   void stop();
 
@@ -255,6 +333,7 @@ private:
   bool validate();
   void receiveLoop();
   void sendLoop();
+  void sendWriteLoop();
   void fault(StreamFault kind, int axis);
 
   CanBus * tx_bus_;
@@ -302,6 +381,14 @@ private:
   StreamStats tx_stats_;
   // Cycle rows and tx_thread by the send thread, rx rows and rx_thread by the receive thread.
   StreamTrace trace_;
+  std::unique_ptr<WriteStreamStorage> write_storage_;
+  std::atomic<int64_t> writes_armed_ns_{0};
+  std::atomic<StreamFault> rx_fault_{StreamFault::kNone};
+  std::atomic<int> rx_fault_axis_{-1};
+  // First thermal fault only; RX writes, stats() reads after RX join.
+  double rx_temperature_fault_c_ = 0.0;
+  int64_t rx_temperature_fault_received_ns_ = 0;
+  std::atomic<bool> notification_failed_{false};
 };
 
 }  // namespace bxi_hardware

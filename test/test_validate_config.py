@@ -180,3 +180,15 @@ def test_isolated_single_motor_broadcast_is_limited_to_can0_id1_fd(tmp_path):
                for error in transport_errors(tmp_path, isolated, ids=(1,), fmt="fd_brs"))
     errors = transport_errors(tmp_path, isolated.replace("blocks: 3", "blocks: 4"), ids=(1,))
     assert any("3 was expected" in error for error in errors)
+
+
+def test_write_trigger_requires_explicit_grace_and_separate_rx(tmp_path):
+    valid = {"rx_mode": "separate", "tx_trigger": "write", "tx_frame": "broadcast",
+             "stream_feedback_max_age_ms": 3, "stream_write_grace_ms": 0.5}
+    assert not transport_errors(tmp_path, valid)
+    for changes in ({"stream_write_grace_ms": 2}, {"stream_write_grace_ms": 0},
+                    {"rx_mode": "sequential"}, {"tx_trigger": "periodic"}):
+        assert transport_errors(tmp_path, dict(valid, **changes))
+    missing = dict(valid)
+    del missing["stream_write_grace_ms"]
+    assert transport_errors(tmp_path, missing)

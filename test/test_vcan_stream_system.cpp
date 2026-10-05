@@ -15,6 +15,8 @@
 #include <vector>
 
 #include <sys/resource.h>
+#include <pthread.h>
+#include <unistd.h>
 
 #include <gtest/gtest.h>
 #include <yaml-cpp/yaml.h>
@@ -73,6 +75,15 @@ public:
   }
 
   bool opened() const {return opened_;}
+  bool pinThreads(int cpu, int priority)
+  {
+    cpu_set_t cpus; CPU_ZERO(&cpus); CPU_SET(cpu, &cpus);
+    sched_param param{}; param.sched_priority = priority;
+    return pthread_setaffinity_np(receiver_.native_handle(), sizeof(cpus), &cpus) == 0 &&
+           pthread_setaffinity_np(sender_.native_handle(), sizeof(cpus), &cpus) == 0 &&
+           pthread_setschedparam(receiver_.native_handle(), SCHED_FIFO, &param) == 0 &&
+           pthread_setschedparam(sender_.native_handle(), SCHED_FIFO, &param) == 0;
+  }
   void setDelays(std::vector<clock_type::duration> delays)
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -993,6 +1004,200 @@ TEST(StreamedSystemAt1kHz, ExpandedTraceCoversPreparationWaitAndEffectiveOffset)
   EXPECT_NE(metadata.find("trace_cycles_capacity=620000"), std::string::npos);
   RecordProperty("elapsed_ms", std::to_string(
       std::chrono::duration_cast<std::chrono::milliseconds>(clock_type::now() - begin).count()));
+}
+
+TEST(WriteTriggeredSystem, NaNWriteBeforeControllersAndThreeMotorSafeStop)
+{
+  const char * iface = std::getenv("BXI_VCAN_IFACE");
+  if (!iface) {GTEST_SKIP();}
+  MotorEmulator motors(iface, {1, 2, 3});
+  ASSERT_TRUE(motors.opened());
+  auto text = streamConfig(iface, 200, 15, true, 3);
+  const auto at = text.find("stream_feedback_max_age_ms:");
+  text.insert(at, "tx_trigger: write, stream_write_grace_ms: 2.5, "
+    "stream_command_max_age_ms: 25, ");
+  RecordsStreamStats system;
+  ASSERT_EQ(system.on_init(hardwareInfo(text, jointNames(3))), hardware_interface::CallbackReturn::SUCCESS);
+  for (int activation = 0; activation < 2; ++activation) {
+    ASSERT_EQ(system.on_activate(rclcpp_lifecycle::State()), hardware_interface::CallbackReturn::SUCCESS);
+    // No controller commands: the NaN default becomes a zero-gain publication.
+    Writer writer(system, 5ms);
+    std::this_thread::sleep_for(50ms);
+    EXPECT_EQ(readOnce(system), hardware_interface::return_type::OK);
+    writer.stop();
+    EXPECT_EQ(writer.errors(), 0);
+    ASSERT_TRUE(waitForReadError(system, 500ms));
+    EXPECT_EQ(system.on_deactivate(rclcpp_lifecycle::State()), hardware_interface::CallbackReturn::SUCCESS);
+    std::lock_guard<std::mutex> lock(system.mutex);
+    ASSERT_FALSE(system.stats.empty());
+    EXPECT_EQ(system.stats.back().fault, StreamFault::kCommandStale);
+    EXPECT_GT(system.stats.back().resends, 0U);
+    for (auto count : system.stats.back().replies) {EXPECT_GT(count, 0U);}
+  }
+}
+TEST(WriteTriggeredSystem, RejectsMissingGraceBeforeAnyMotorCanEnable)
+{
+  const char * iface = std::getenv("BXI_VCAN_IFACE");
+  if (!iface) {GTEST_SKIP();}
+  auto text = streamConfig(iface, 1000, 3, true, 1);
+  text.insert(text.find("stream_feedback_max_age_ms:"), "tx_trigger: write, ");
+  BxiSystemInterface system;
+  EXPECT_EQ(system.on_init(hardwareInfo(text, jointNames(1))), hardware_interface::CallbackReturn::ERROR);
+}
+
+TEST(WriteTriggeredSystem, Full620kCapacityActivatesAndPublishesControlTrace)
+{
+  const char * iface = std::getenv("BXI_VCAN_IFACE");
+  if (!iface) {GTEST_SKIP();}
+  const char * saved = std::getenv("BXI_WRITE_620K_DIR");
+  const auto dir = saved ? std::filesystem::path(saved) :
+    std::filesystem::path(::testing::TempDir()) / ("bxi_write_620k_" + std::to_string(getpid()));
+  ASSERT_FALSE(std::filesystem::exists(dir));
+  std::filesystem::create_directories(dir);
+  setenv("BXI_WORKER_TIMING_DIR", dir.c_str(), 1);
+  setenv("BXI_STREAM_TRACE_CYCLES", "620000", 1);
+  struct ResetEnv {
+    ~ResetEnv() {unsetenv("BXI_WORKER_TIMING_DIR"); unsetenv("BXI_STREAM_TRACE_CYCLES");}
+  } reset;
+  MotorEmulator motors(iface, {1}); ASSERT_TRUE(motors.opened());
+  auto text = streamConfig(iface, 200, 15, true, 1);
+  text.insert(text.find("stream_feedback_max_age_ms:"),
+    "tx_trigger: write, stream_write_grace_ms: 2.5, stream_command_max_age_ms: 25, ");
+  BxiSystemInterface system;
+  ASSERT_EQ(system.on_init(hardwareInfo(text, jointNames(1))), hardware_interface::CallbackReturn::SUCCESS);
+  ASSERT_EQ(system.on_activate(rclcpp_lifecycle::State()), hardware_interface::CallbackReturn::SUCCESS);
+  {Writer writer(system, 5ms); std::this_thread::sleep_for(50ms); writer.stop();}
+  ASSERT_EQ(system.on_deactivate(rclcpp_lifecycle::State()), hardware_interface::CallbackReturn::SUCCESS);
+  size_t payload = 0;
+  bool control = false, complete = false;
+  for (const auto & file : std::filesystem::directory_iterator(dir)) {
+    if (file.path().extension() == ".complete") {
+      complete = true;
+      EXPECT_EQ(YAML::LoadFile(file.path().string())["fault"].as<std::string>(), "none");
+    }
+    if (file.path().filename().string().find("_control.csv") != std::string::npos) {
+      control = true;
+      std::ifstream input(file.path()); std::string metadata; std::getline(input, metadata);
+      const auto at = metadata.find("payload_bytes="); ASSERT_NE(at, std::string::npos);
+      payload += std::stoull(metadata.substr(at + 14));
+      const auto diagnostic = metadata.find("diagnostic_payload_bytes="); ASSERT_NE(diagnostic, std::string::npos);
+      payload += std::stoull(metadata.substr(diagnostic + 25));
+    }
+    if (file.path().filename().string().find("_cycles.csv") != std::string::npos) {
+      std::ifstream input(file.path()); std::string metadata; std::getline(input, metadata);
+      const auto at = metadata.find("trace_payload_bytes="); ASSERT_NE(at, std::string::npos);
+      payload += std::stoull(metadata.substr(at + 20));
+    }
+  }
+  EXPECT_TRUE(control); EXPECT_TRUE(complete);
+  EXPECT_EQ(payload, 263508192U);
+  EXPECT_LT(payload, 256U * 1024U * 1024U);
+}
+
+TEST(WriteTriggeredSystem, FaultWakesAndDisablesTwoWriteBuses)
+{
+  const char * a_raw = std::getenv("BXI_VCAN_IFACE");
+  const char * b_raw = std::getenv("BXI_VCAN_IFACE_B");
+  if (!a_raw || !b_raw) {GTEST_SKIP();}
+  const std::string a = a_raw, b = b_raw;
+  MotorEmulator motors_a(a_raw, {1}), motors_b(b_raw, {1});
+  ASSERT_TRUE(motors_a.opened()); ASSERT_TRUE(motors_b.opened());
+  const std::string options = "{rx_mode: separate, tx_frame: broadcast, tx_trigger: write, "
+    "stream_write_grace_ms: 2.5, stream_feedback_max_age_ms: 15, stream_command_max_age_ms: 25}";
+  const auto config = "active_can_buses: [" + a + ", " + b + "]\ncan_frame_format: {" + a +
+    ": fd, " + b + ": fd}\ndefaults: {control_timeout_ms: 5, maximum_consecutive_timeouts: 3, can_hz: 200}\n"
+    "can_transport:\n  " + a + ": " + options + "\n  " + b + ": " + options +
+    "\njoints:\n" + jointYaml("joint1", a, 1) + jointYaml("joint2", b, 1);
+  RecordsStreamStats system;
+  ASSERT_EQ(system.on_init(hardwareInfo(config, {"joint1", "joint2"})), hardware_interface::CallbackReturn::SUCCESS);
+  ASSERT_EQ(system.on_activate(rclcpp_lifecycle::State()), hardware_interface::CallbackReturn::SUCCESS);
+  Writer writer(system, 5ms);
+  std::this_thread::sleep_for(50ms);
+  motors_a.silent_mask = 1;
+  const bool stopped = waitForReadError(system, 500ms);
+  writer.stop();
+  EXPECT_TRUE(stopped);
+  EXPECT_EQ(system.on_deactivate(rclcpp_lifecycle::State()), hardware_interface::CallbackReturn::SUCCESS);
+  EXPECT_GE(motors_a.disables(1), 1); EXPECT_GE(motors_b.disables(1), 1);
+  std::lock_guard<std::mutex> lock(system.mutex);
+  ASSERT_EQ(system.stats.size(), 2U);
+  EXPECT_TRUE(std::any_of(system.stats.begin(), system.stats.end(), [](const StreamStats & stats) {
+    return stats.fault == StreamFault::kFeedbackStale;
+  }));
+  EXPECT_TRUE(std::any_of(system.stats.begin(), system.stats.end(), [](const StreamStats & stats) {
+    return stats.stopped_externally;
+  }));
+}
+
+// Opt-in trace collection: the shell driver creates and verifies an actual vcan device.
+// Independent files for baseline, direct RX, and write-triggered TX; never touches a motor.
+TEST(WriteTriggeredComparison, CollectThreeModes)
+{
+  const char * root = std::getenv("BXI_WRITE_COMPARE_DIR");
+  const char * iface = std::getenv("BXI_VCAN_IFACE");
+  if (!root || !iface) {GTEST_SKIP() << "opt-in trace comparison";}
+  ASSERT_EQ(std::string(iface).substr(0, 4), "vcan");
+  for (const std::string mode : {"periodic", "direct", "write"}) {
+    const char * only = std::getenv("BXI_WRITE_COMPARE_MODE");
+    if (only && mode != only) {continue;}
+    const auto dir = std::filesystem::path(root) / mode;
+    ASSERT_FALSE(std::filesystem::exists(dir));
+    std::filesystem::create_directories(dir);
+    ASSERT_EQ(setenv("BXI_WORKER_TIMING_DIR", dir.c_str(), 1), 0);
+    ASSERT_EQ(setenv("BXI_CONTROL_TRACE", "1", 1), 0);
+    struct ResetEnv {
+      ~ResetEnv() {unsetenv("BXI_WORKER_TIMING_DIR"); unsetenv("BXI_CONTROL_TRACE");}
+    } reset;
+    MotorEmulator motors(iface, {1, 2, 3});
+    ASSERT_TRUE(motors.opened());
+    const bool realtime = std::getenv("BXI_WRITE_COMPARE_RT") != nullptr;
+    if (realtime) {ASSERT_TRUE(motors.pinThreads(18, 60));}
+    auto text = streamConfig(iface, 1000, 3, true, 3);
+    const auto at = text.find("stream_feedback_max_age_ms:");
+    std::string options = "stream_command_max_age_ms: 5, ";
+    if (realtime) {
+      options += "send_thread_priority: 45, receive_thread_priority: 46, thread_cpus: [9], ";
+    }
+    if (mode == "direct") {options += "direct_feedback: true, ";}
+    if (mode == "write") {
+      const char * grace = std::getenv("BXI_WRITE_COMPARE_GRACE_MS");
+      ASSERT_NE(grace, nullptr) << "explicit grace required";
+      options += "tx_trigger: write, stream_write_grace_ms: " + std::string(grace) + ", ";
+    }
+    text.insert(at, options);
+    RecordsStreamStats system;
+    ASSERT_EQ(system.on_init(hardwareInfo(text, jointNames(3))), hardware_interface::CallbackReturn::SUCCESS);
+    ASSERT_EQ(system.on_activate(rclcpp_lifecycle::State()), hardware_interface::CallbackReturn::SUCCESS);
+    struct RestoreThread {
+      cpu_set_t cpus{}; int policy = 0; sched_param param{}; bool armed = false;
+      ~RestoreThread() {
+        if (armed) {
+          pthread_setschedparam(pthread_self(), policy, &param);
+          pthread_setaffinity_np(pthread_self(), sizeof(cpus), &cpus);
+        }
+      }
+    } restore;
+    if (realtime) {
+      ASSERT_EQ(pthread_getschedparam(pthread_self(), &restore.policy, &restore.param), 0);
+      ASSERT_EQ(pthread_getaffinity_np(pthread_self(), sizeof(restore.cpus), &restore.cpus), 0);
+      restore.armed = true;
+      cpu_set_t cpus; CPU_ZERO(&cpus); CPU_SET(11, &cpus);
+      ASSERT_EQ(pthread_setaffinity_np(pthread_self(), sizeof(cpus), &cpus), 0);
+      sched_param param{}; param.sched_priority = 50;
+      ASSERT_EQ(pthread_setschedparam(pthread_self(), SCHED_FIFO, &param), 0);
+    }
+    auto next = clock_type::now();
+    bool healthy = true;
+    for (int cycle = 0; cycle < 2000; ++cycle) {
+      healthy = readOnce(system) == hardware_interface::return_type::OK &&
+        system.write(rclcpp::Time(), rclcpp::Duration(0, 0)) == hardware_interface::return_type::OK;
+      if (!healthy) {break;}
+      next += 1ms;
+      std::this_thread::sleep_until(next);
+    }
+    EXPECT_TRUE(healthy) << mode;
+    EXPECT_EQ(system.on_deactivate(rclcpp_lifecycle::State()), hardware_interface::CallbackReturn::SUCCESS);
+  }
 }
 
 }  // namespace

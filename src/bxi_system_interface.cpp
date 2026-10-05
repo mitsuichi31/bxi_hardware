@@ -76,6 +76,9 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_init(
   fb_vel_.assign(n_joints_, 0.0);
   fb_eff_.assign(n_joints_, 0.0);
   fb_temp_.assign(n_joints_, 0.0);
+  fb_sequence_.assign(n_joints_, 0);
+  fb_received_ns_.assign(n_joints_, 0);
+  fb_published_ns_.assign(n_joints_, 0);
 
   if (!parseConfig()) {
     return hardware_interface::CallbackReturn::ERROR;
@@ -239,6 +242,8 @@ bool BxiSystemInterface::parseConfig()
       bool has_max_age = false;
       bool has_command_max_age = false;
       bool has_thread_setting = false;
+      bool has_grace = false;
+      bool has_first_write_timeout = false;
       for (const auto & item : entry.second) {
         const auto key = item.first.as<std::string>();
         if (key == "rx_mode") {
@@ -249,6 +254,18 @@ bool BxiSystemInterface::parseConfig()
             return false;
           }
           transport.separate = value == "separate";
+        } else if (key == "tx_trigger") {
+          const auto value = item.second.as<std::string>();
+          if (value != "write" && value != "periodic") {return false;}
+          transport.write_triggered = value == "write";
+        } else if (key == "direct_feedback") {
+          transport.direct_feedback = item.second.as<bool>();
+        } else if (key == "stream_write_grace_ms") {
+          transport.write_grace_ms = item.second.as<double>();
+          has_grace = true;
+        } else if (key == "stream_first_write_timeout_ms") {
+          transport.first_write_timeout_ms = item.second.as<double>();
+          has_first_write_timeout = true;
         } else if (key == "tx_frame") {
           const auto value = item.second.as<std::string>();
           if (value != "unicast" && value != "broadcast") {
@@ -300,7 +317,8 @@ bool BxiSystemInterface::parseConfig()
 
       if (!transport.separate) {
         if (transport.broadcast || has_max_age || has_command_max_age ||
-          transport.isolated_id1_broadcast_blocks != 0 || has_thread_setting)
+          transport.isolated_id1_broadcast_blocks != 0 || has_thread_setting ||
+          transport.write_triggered || transport.direct_feedback || has_grace)
         {
           RCLCPP_ERROR(logger(), "can_transport.%s: tx_frame: broadcast、"
             "stream_feedback_max_age_ms、stream_command_max_age_ms、"
@@ -331,6 +349,24 @@ bool BxiSystemInterface::parseConfig()
             "（%.3f ms）以上 50 ms 以下", bus.c_str(), 2.0 * period_ms);
           return false;
         }
+      }
+
+      if (transport.write_triggered) {
+        transport.direct_feedback = true;
+        if (!has_grace || !std::isfinite(transport.write_grace_ms) ||
+          transport.write_grace_ms <= 0 ||
+          period_ms + transport.write_grace_ms >= transport.stream_feedback_max_age_ms ||
+          period_ms + transport.write_grace_ms >= transport.stream_command_max_age_ms ||
+          !std::isfinite(transport.first_write_timeout_ms) ||
+          transport.first_write_timeout_ms <= 0 || transport.first_write_timeout_ms > 1000)
+        {
+          RCLCPP_ERROR(logger(), "write trigger requires explicit grace with freshness margin "
+            "and finite first-write timeout (0,1000] ms");
+          return false;
+        }
+      } else if (has_grace || has_first_write_timeout) {
+        RCLCPP_ERROR(logger(), "write grace / first-write timeout require tx_trigger: write");
+        return false;
       }
 
       auto ids = bus_motor_ids[bus];
@@ -527,8 +563,53 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_activate(
         throw std::invalid_argument("expanded trace requires 1-axis separate broadcast");
       }
     }
+    control_sequence_ = 0;
+    legacy_command_sequence_ = 0;
+    legacy_command_published_ns_ = 0;
+    std::fill(fb_sequence_.begin(), fb_sequence_.end(), 0);
+    direct_joint_.assign(n_joints_, false);
+    write_joint_.assign(n_joints_, false);
+    control_streams_.clear();
+    const bool control_trace = std::getenv("BXI_CONTROL_TRACE") != nullptr;
+    for (const auto & [bus_name, indices] : bus_joints) {
+      const auto & transport = bus_transport_.at(bus_name);
+      if (transport.write_triggered || transport.direct_feedback) {
+        prepared_write_storage_[bus_name] = std::make_unique<WriteStreamStorage>(indices.size());
+        for (auto i : indices) {
+          direct_joint_[i] = transport.direct_feedback;
+          write_joint_[i] = transport.write_triggered;
+        }
+      }
+      if (transport.write_triggered || transport.direct_feedback ||
+        (control_trace && transport.separate))
+      {
+        ControlStream control;
+        control.indices = indices;
+        control.read_diagnostics = transport.direct_feedback;
+        control.commands.resize(indices.size());
+        control.feedback.resize(indices.size());
+        control.failures.resize(indices.size());
+        control.diagnostics.resize(256);
+        if (!worker_timing_dir_.empty()) {
+          control.capacity = stream_trace_cycles_;
+          const size_t bytes = stream_trace_cycles_ * indices.size() * sizeof(ControlRecord);
+          if (bytes > kStreamTraceMemoryLimit) {throw std::length_error("control trace too large");}
+          control.records.resize(stream_trace_cycles_ * indices.size());
+          control.output = std::make_unique<TraceBufferedWriter>(std::make_shared<TraceFileOps>());
+        }
+        control_streams_.push_back(std::move(control));
+      }
+    }
     // Validate the aggregate before allocating; no bus may enable during this whole pass.
     size_t total_trace_bytes = 0;
+    for (const auto & control : control_streams_) {
+      const size_t bytes = control.records.capacity() * sizeof(ControlRecord) +
+        control.diagnostics.capacity() * sizeof(ControlStream::DiagnosticEvent);
+      if (bytes > kStreamTraceMemoryLimit - total_trace_bytes) {
+        throw std::length_error("aggregate control trace exceeds 256 MiB");
+      }
+      total_trace_bytes += bytes;
+    }
     for (const auto & [bus_name, indices] : bus_joints) {
       if (!worker_timing_dir_.empty() && bus_transport_.at(bus_name).separate) {
         const auto bytes = streamTracePayloadBytes(stream_trace_cycles_, indices.size());
@@ -538,7 +619,12 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_activate(
         total_trace_bytes += bytes;
       }
     }
-    size_t actual_trace_bytes = 0;
+    size_t actual_trace_bytes = total_trace_bytes;
+    for (const auto & [name, indices] : bus_joints) {
+      if (!worker_timing_dir_.empty() && bus_transport_.at(name).separate) {
+        actual_trace_bytes -= streamTracePayloadBytes(stream_trace_cycles_, indices.size());
+      }
+    }
     for (const auto & [bus_name, indices] : bus_joints) {
       if (worker_timing_dir_.empty()) {
         if (bus_transport_.at(bus_name).separate) {
@@ -560,6 +646,14 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_activate(
         auto output = prepareTimingOutput(worker_timing_dir_, bus_name);
         if (!output) {throw std::runtime_error("missing trace output");}
         RCLCPP_INFO(logger(), "[%s] trace output prepared before enable: %s", bus_name.c_str(), output->stem().c_str());
+        for (auto & control : control_streams_) {
+          if (control.indices == indices && control.output) {
+            control.output_path = output->stem() + "_control.csv";
+            if (std::filesystem::exists(control.output_path)) {
+              throw std::runtime_error("control trace output already exists");
+            }
+          }
+        }
         stream_trace_outputs_.emplace(bus_name, std::move(output));
       } else {
         auto trace = std::make_unique<WorkerTimingTrace>();
@@ -706,6 +800,9 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_activate(
       workers_.emplace_back(
         &BxiSystemInterface::streamMonitorLoop, this, bus_name, live_joints_[bus_name]);
     }
+    for (auto & [bus_name, streamer] : streamers_) {
+      if (streamer->config().write_triggered) {streamer->armWrites();}
+    }
     onStreamFeedbackConfirmed();
     // Any worker or stream may have stopped since its own check; never report a stopped system
     // as active.
@@ -772,6 +869,9 @@ void BxiSystemInterface::releaseResources()
   for (const auto & [bus_name, streamer] : streamers_) {
     reportStream(bus_name);
   }
+  writeControlTiming();
+  control_streams_.clear();
+  prepared_write_storage_.clear();
   streamers_.clear();
   prepared_stream_traces_.clear();
   stream_trace_outputs_.clear();
@@ -894,6 +994,24 @@ bool BxiSystemInterface::startStream(
   rx_buses_[bus_name] = rx_bus;
 
   StreamConfig config;
+  config.write_triggered = transport.write_triggered;
+  config.direct_feedback = transport.direct_feedback;
+  config.write_grace = std::chrono::duration_cast<std::chrono::nanoseconds>(
+    std::chrono::duration<double, std::milli>(transport.write_grace_ms));
+  config.control_trace = std::getenv("BXI_CONTROL_TRACE") != nullptr;
+  config.first_write_timeout = std::chrono::duration_cast<std::chrono::nanoseconds>(
+    std::chrono::duration<double, std::milli>(transport.first_write_timeout_ms));
+  for (const auto & [name, storage] : prepared_write_storage_) {
+    if (storage) {config.stop_wake_fds.push_back(storage->event_fd);}
+  }
+  // Already-started streamers also own FDs needed by this bus's fault fan-out.
+  for (const auto & [name, streamer] : streamers_) {
+    const auto & wake_fds = streamer->config().stop_wake_fds;
+    config.stop_wake_fds.insert(config.stop_wake_fds.end(), wake_fds.begin(), wake_fds.end());
+  }
+  std::sort(config.stop_wake_fds.begin(), config.stop_wake_fds.end());
+  config.stop_wake_fds.erase(std::unique(config.stop_wake_fds.begin(), config.stop_wake_fds.end()),
+    config.stop_wake_fds.end());
   config.period = std::chrono::nanoseconds(static_cast<int64_t>(1e9 / can_hz_));
   config.max_feedback_age = std::chrono::duration_cast<std::chrono::nanoseconds>(
     std::chrono::duration<double, std::milli>(transport.stream_feedback_max_age_ms));
@@ -945,13 +1063,18 @@ bool BxiSystemInterface::startStream(
   }
   tx_bus->flushRx();
 
+  if (auto * socket = dynamic_cast<SocketCanBus *>(tx_bus.get())) {
+    socket->setNonblockingSend(config.write_triggered);
+  }
+  auto storage = prepared_write_storage_.count(bus_name) ?
+    std::move(prepared_write_storage_.at(bus_name)) : nullptr;
   auto streamer = std::make_unique<BxiBusStreamer>(
     tx_bus.get(), rx_bus.get(), drivers, config,
     [this, bus_name, indices](
       const std::vector<StreamFeedback> & feedback, std::vector<StreamCommand> & commands) {
       return streamCycle(bus_name, indices, feedback, commands);
     },
-    &safe_stopped_);
+    &safe_stopped_, std::move(storage));
   // Even tracing-off uses a prepared empty trace, keeping allocation out of start().
   if (!prepared_stream_traces_.count(bus_name)) {
     RCLCPP_ERROR(logger(), "[%s] missing pre-enable trace storage", bus_name.c_str());
@@ -962,6 +1085,9 @@ bool BxiSystemInterface::startStream(
     RCLCPP_ERROR(logger(), "[%s] 送受信分離を開始できません: %s", bus_name.c_str(),
       streamer->error().c_str());
     return false;
+  }
+  for (auto & control : control_streams_) {
+    if (control.indices == indices) {control.streamer = streamer.get();}
   }
   streamers_[bus_name] = std::move(streamer);
   RCLCPP_INFO(logger(), "[%s] 送受信分離を開始 (%zu motors, %s, %dHz, 鮮度しきい値 %.1f ms, "
@@ -989,6 +1115,9 @@ bool BxiSystemInterface::streamCycle(
         fb_vel_[i] = fb.velocity;
         fb_eff_[i] = fb.effort;
         fb_temp_[i] = fb.temperature;
+        fb_sequence_[i] = feedback[k].sequence;
+        fb_received_ns_[i] = feedback[k].received_ns;
+        fb_published_ns_[i] = std::chrono::steady_clock::now().time_since_epoch().count();
         if (!std::isfinite(fb.temperature)) {
           joints_[i].temperature_sensor_fault = true;
           sensor_fault = static_cast<int>(i);
@@ -999,6 +1128,8 @@ bool BxiSystemInterface::streamCycle(
         }
       }
       commands[k] = {tgt_pos_[i], tgt_vel_[i], tgt_kp_[i], tgt_kd_[i], tgt_eff_[i]};
+      commands[k].sequence = legacy_command_sequence_;
+      commands[k].published_ns = legacy_command_published_ns_;
     }
   }
   if (sensor_fault >= 0) {
@@ -1017,7 +1148,16 @@ void BxiSystemInterface::streamMonitorLoop(std::string bus_name, std::vector<siz
   const auto thread_name = ("bxim_" + bus_name).substr(0, 15);
   pthread_setname_np(pthread_self(), thread_name.c_str());
   BxiBusStreamer * streamer = streamers_.at(bus_name).get();
+  std::vector<bool> unavailable(indices.size(), false);
   while (running_ && !streamer->sendFinished()) {
+    for (size_t axis = 0; axis < indices.size(); ++axis) {
+      const bool current = streamer->controlUnavailable(axis);
+      if (current != unavailable[axis]) {
+        RCLCPP_WARN(logger(), "[%s] %s feedback_snapshot_unavailable=%s (diagnostic only)",
+          bus_name.c_str(), joints_[indices[axis]].name.c_str(), current ? "true" : "false");
+        unavailable[axis] = current;
+      }
+    }
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
   if (!running_ || !safe_stopped_) {
@@ -1051,6 +1191,9 @@ void BxiSystemInterface::stopStream(const std::string & bus_name)
     {
       RCLCPP_ERROR(logger(), "[%s] 送信ソケットの受信を再開できません", bus_name.c_str());
     }
+    if (auto * socketcan = dynamic_cast<SocketCanBus *>(tx_bus->second.get())) {
+      socketcan->setNonblockingSend(false);
+    }
     tx_bus->second->flushRx();
   }
   rx_bus->second->close();
@@ -1075,6 +1218,19 @@ void BxiSystemInterface::reportStream(const std::string & bus_name)
   }
   onStreamReport(bus_name);
   const auto stats = streamer->stats();
+  if (stats.temperature_fault_axis >= 0) {
+    const auto i = live_joints_.at(bus_name).at(static_cast<size_t>(stats.temperature_fault_axis));
+    const bool sensors_failed = !std::isfinite(stats.temperature_fault_c);
+    {
+      std::lock_guard<std::mutex> lock(data_mutex_);
+      joints_[i].temperature_sensor_fault = sensors_failed;
+      joints_[i].overheated = !sensors_failed;
+    }
+    RCLCPP_ERROR(logger(), "[%s] %s motor id=%d thermal fault: temperature=%.3f C "
+      "both_sensors_failed=%s received_steady_ns=%lld",
+      bus_name.c_str(), joints_[i].name.c_str(), joints_[i].can_id, stats.temperature_fault_c,
+      sensors_failed ? "true" : "false", static_cast<long long>(stats.temperature_fault_received_ns));
+  }
   onStreamStats(bus_name, stats);
   std::string per_axis;
   for (size_t k = 0; k < stats.replies.size(); ++k) {
@@ -1333,13 +1489,87 @@ void BxiSystemInterface::workerLoop(
 hardware_interface::return_type BxiSystemInterface::read(
   const rclcpp::Time & /*time*/, const rclcpp::Duration & /*period*/)
 {
-  std::lock_guard<std::mutex> lk(data_mutex_);
-  for (size_t i = 0; i < n_joints_; ++i) {
-    st_pos_[i] = fb_pos_[i];
-    st_vel_[i] = fb_vel_[i];
-    st_eff_[i] = fb_eff_[i];
-    st_temp_[i] = fb_temp_[i];
+  const auto read_start = std::chrono::steady_clock::now().time_since_epoch().count();
+  for (auto & control : control_streams_) {
+    control.record_index = control.record_count++;
+    if (control.record_index < control.capacity) {
+      for (size_t axis = 0; axis < control.indices.size(); ++axis) {
+        auto & row = control.records[control.record_index * control.indices.size() + axis];
+        row.read_start = read_start;
+      }
+    }
   }
+  const auto copy_legacy = [&] {
+    for (size_t i = 0; i < n_joints_; ++i) {
+      if (!direct_joint_.empty() && direct_joint_[i]) {continue;}
+      st_pos_[i] = fb_pos_[i]; st_vel_[i] = fb_vel_[i];
+      st_eff_[i] = fb_eff_[i]; st_temp_[i] = fb_temp_[i];
+    }
+  };
+  bool legacy_read = direct_joint_.empty();
+  for (size_t i = 0; i < n_joints_ && !legacy_read; ++i) {
+    legacy_read = joints_[i].actuator && !direct_joint_[i];
+  }
+  if (legacy_read)
+  {
+    std::lock_guard<std::mutex> lk(data_mutex_);
+    copy_legacy();
+    for (auto & control : control_streams_) {
+      if (control.read_diagnostics) {continue;}
+      for (size_t axis = 0; axis < control.indices.size(); ++axis) {
+        const auto i = control.indices[axis];
+        control.feedback[axis].sequence = fb_sequence_[i];
+        control.feedback[axis].received_ns = fb_received_ns_[i];
+        control.feedback[axis].published_ns = fb_published_ns_[i];
+      }
+    }
+  }
+  for (auto & control : control_streams_) {
+    for (size_t axis = 0; axis < control.indices.size(); ++axis) {
+      const auto i = control.indices[axis];
+      PublishedFeedback scratch;
+      unsigned attempts = 0;
+      const bool got = control.read_diagnostics && control.streamer->readFeedback(axis, scratch, &attempts);
+      const bool was_unavailable = control.failures[axis] >= 3;
+      if (got) {
+        control.feedback[axis] = scratch;
+        control.failures[axis] = 0;
+        st_pos_[i] = scratch.feedback.position; st_vel_[i] = scratch.feedback.velocity;
+        st_eff_[i] = scratch.feedback.effort; st_temp_[i] = scratch.feedback.temperature;
+      } else if (control.read_diagnostics && control.failures[axis] < UINT32_MAX) {
+        ++control.failures[axis];
+      }
+      if (control.read_diagnostics) {
+        const bool unavailable = control.failures[axis] >= 3;
+        control.streamer->setControlUnavailable(axis, unavailable);
+        if (unavailable != was_unavailable) {
+          if (control.diagnostic_count < control.diagnostics.size()) {
+            control.diagnostics[control.diagnostic_count] = {
+              std::chrono::steady_clock::now().time_since_epoch().count(),
+              control_sequence_ + 1, i, unavailable};
+          }
+          ++control.diagnostic_count;
+        }
+      }
+      if (control.record_index < control.capacity) {
+        auto & row = control.records[control.record_index * control.indices.size() + axis];
+        row.acquired_ns = std::chrono::steady_clock::now().time_since_epoch().count();
+        row.rx_sequence = control.feedback[axis].sequence;
+        row.rx_received = control.feedback[axis].received_ns;
+        row.rx_published = control.feedback[axis].published_ns;
+        row.setAttempts(attempts); row.failures = control.failures[axis];
+      }
+    }
+  }
+  const auto read_end = std::chrono::steady_clock::now().time_since_epoch().count();
+  for (auto & control : control_streams_) {
+    if (control.record_index < control.capacity) {
+      for (size_t axis = 0; axis < control.indices.size(); ++axis) {
+        control.records[control.record_index * control.indices.size() + axis].read_done = read_end;
+      }
+    }
+  }
+
   return safe_stopped_ ? hardware_interface::return_type::ERROR :
          hardware_interface::return_type::OK;
 }
@@ -1350,29 +1580,128 @@ hardware_interface::return_type BxiSystemInterface::write(
   if (safe_stopped_) {
     return hardware_interface::return_type::ERROR;
   }
-  std::lock_guard<std::mutex> lk(data_mutex_);
-  for (size_t i = 0; i < n_joints_; ++i) {
-    if (!joints_[i].actuator) {
-      continue;
-    }
-    const bool active = std::isfinite(cmd_pos_[i]);
-    const double kp = active ? (std::isfinite(cmd_kp_[i]) ? cmd_kp_[i] : joints_[i].default_kp)
-                             : 0.0;
-    const double kd = active ? (std::isfinite(cmd_kd_[i]) ? cmd_kd_[i] : joints_[i].default_kd)
-                             : 0.0;
-    const double pos = active ? cmd_pos_[i] : st_pos_[i];
-    const double vel = (active && std::isfinite(cmd_vel_[i])) ? cmd_vel_[i] : 0.0;
-    const double eff = (active && std::isfinite(cmd_eff_[i])) ? cmd_eff_[i] : 0.0;
-    tgt_pos_[i] = pos;
-    tgt_vel_[i] = vel;
-    tgt_kp_[i] = kp;
-    tgt_kd_[i] = kd;
-    tgt_eff_[i] = eff;
+  const auto write_start = std::chrono::steady_clock::now().time_since_epoch().count();
+  for (auto & control : control_streams_) {
+    if (control.record_index == SIZE_MAX) {control.record_index = control.record_count++;}
   }
+  ++control_sequence_;
+  // Publish write-triggered buses without entering any legacy worker lock.
+  for (auto & control : control_streams_) {
+    if (!control.streamer->config().write_triggered) {continue;}
+    for (size_t axis = 0; axis < control.indices.size(); ++axis) {
+      const auto i = control.indices[axis];
+      const bool active = std::isfinite(cmd_pos_[i]);
+      auto & packet = control.commands[axis];
+      packet.command = {active ? cmd_pos_[i] : st_pos_[i],
+        active && std::isfinite(cmd_vel_[i]) ? cmd_vel_[i] : 0.0,
+        active ? (std::isfinite(cmd_kp_[i]) ? cmd_kp_[i] : joints_[i].default_kp) : 0.0,
+        active ? (std::isfinite(cmd_kd_[i]) ? cmd_kd_[i] : joints_[i].default_kd) : 0.0,
+        active && std::isfinite(cmd_eff_[i]) ? cmd_eff_[i] : 0.0};
+      packet.sequence = control_sequence_;
+    }
+    const auto published = std::chrono::steady_clock::now().time_since_epoch().count();
+    for (auto & packet : control.commands) {packet.published_ns = published;}
+    const auto notify_before = std::chrono::steady_clock::now().time_since_epoch().count();
+    const bool ok = control.streamer->publishCommands(control.commands.data());
+    const auto notify_after = std::chrono::steady_clock::now().time_since_epoch().count();
+    if (control.record_index < control.capacity) {
+      for (size_t axis = 0; axis < control.indices.size(); ++axis) {
+        auto & row = control.records[control.record_index * control.indices.size() + axis];
+        row.published = published; row.notify_before = notify_before; row.notify_after = notify_after;
+      }
+    }
+    if (!ok) {return hardware_interface::return_type::ERROR;}
+  }
+  bool legacy_write = write_joint_.empty();
+  for (size_t i = 0; i < n_joints_ && !legacy_write; ++i) {
+    legacy_write = joints_[i].actuator && !write_joint_[i];
+  }
+  if (legacy_write)
+  {
+    std::lock_guard<std::mutex> lk(data_mutex_);
+    for (size_t i = 0; i < n_joints_; ++i) {
+      if (!joints_[i].actuator) {
+        continue;
+      }
+      const bool active = std::isfinite(cmd_pos_[i]);
+      const double kp = active ? (std::isfinite(cmd_kp_[i]) ? cmd_kp_[i] : joints_[i].default_kp)
+                               : 0.0;
+      const double kd = active ? (std::isfinite(cmd_kd_[i]) ? cmd_kd_[i] : joints_[i].default_kd)
+                               : 0.0;
+      const double pos = active ? cmd_pos_[i] : st_pos_[i];
+      const double vel = (active && std::isfinite(cmd_vel_[i])) ? cmd_vel_[i] : 0.0;
+      const double eff = (active && std::isfinite(cmd_eff_[i])) ? cmd_eff_[i] : 0.0;
+      if (!write_joint_.empty() && write_joint_[i]) {continue;}
+      tgt_pos_[i] = pos;
+      tgt_vel_[i] = vel;
+      tgt_kp_[i] = kp;
+      tgt_kd_[i] = kd;
+      tgt_eff_[i] = eff;
+    }
+    legacy_command_sequence_ = control_sequence_;
+    legacy_command_published_ns_ = std::chrono::steady_clock::now().time_since_epoch().count();
+  }
+
   // Streamed buses safe-stop when this stops advancing (stream_command_max_age_ms).
   last_write_ns_.store(
     std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_relaxed);
+  const auto write_end = std::chrono::steady_clock::now().time_since_epoch().count();
+  for (auto & control : control_streams_) {
+    if (control.record_index < control.capacity) {
+      for (size_t axis = 0; axis < control.indices.size(); ++axis) {
+        auto & row = control.records[control.record_index * control.indices.size() + axis];
+        row.setCycle(control_sequence_); row.write_start = write_start; row.write_end = write_end;
+        if (!row.published) {row.published = write_end;}
+      }
+    }
+    control.record_index = SIZE_MAX;
+  }
   return hardware_interface::return_type::OK;
+}
+
+void BxiSystemInterface::writeControlTiming()
+{
+  // Lifecycle cleanup only: controller_manager has stopped read/write. The safe-stop monitor
+  // may report TX/RX earlier, but must never serialize a control-thread-owned trace.
+  for (auto & control : control_streams_) {
+    for (size_t event = 0; event < std::min(control.diagnostic_count, control.diagnostics.size()); ++event) {
+      const auto & d = control.diagnostics[event];
+      RCLCPP_WARN(logger(), "%s feedback_snapshot_unavailable=%s cycle=%llu steady_ns=%lld",
+        joints_[d.joint].name.c_str(), d.unavailable ? "true" : "false",
+        static_cast<unsigned long long>(d.cycle), static_cast<long long>(d.at_ns));
+    }
+    if (control.diagnostic_count > control.diagnostics.size()) {
+      RCLCPP_WARN(logger(), "dropped feedback snapshot diagnostic events=%zu",
+        control.diagnostic_count - control.diagnostics.size());
+    }
+    if (!control.output || control.output_path.empty()) {continue;}
+    try {
+      auto & out = *control.output;
+      out.open(control.output_path);
+      out.text("#format_version=1,dropped_control_cycles=");
+      out.number(control.record_count > control.capacity ? control.record_count - control.capacity : 0);
+      out.text(",payload_bytes="); out.number(control.records.capacity() * sizeof(ControlRecord));
+      out.text(",diagnostic_payload_bytes=");
+      out.number(control.diagnostics.capacity() * sizeof(ControlStream::DiagnosticEvent));
+      out.text("\ncycle,joint_index,read_start_ns,read_end_ns,acquired_ns,rx_sequence,rx_received_ns,"
+        "rx_published_ns,attempts,consecutive_failures,feedback_snapshot_unavailable,write_start_ns,"
+        "command_published_ns,notify_before_ns,notify_after_ns,write_end_ns\n");
+      for (size_t cycle = 0; cycle < std::min(control.record_count, control.capacity); ++cycle) {
+        for (size_t axis = 0; axis < control.indices.size(); ++axis) {
+          const auto & r = control.records[cycle * control.indices.size() + axis];
+          out.field(r.cycle()); out.field(control.indices[axis]); out.field(r.read_start);
+          out.field(r.read_done); out.field(r.acquired_ns); out.field(r.rx_sequence);
+          out.field(r.rx_received); out.field(r.rx_published); out.field(r.attempts());
+          out.field(r.failures); out.field(r.failures >= 3 ? 1 : 0); out.field(r.write_start);
+          out.field(r.published); out.field(r.notify_before); out.field(r.notify_after);
+          out.number(r.write_end); out.text("\n");
+        }
+      }
+      out.close();
+    } catch (const std::exception & e) {
+      RCLCPP_ERROR(logger(), "control trace failed: %s", e.what());
+    }
+  }
 }
 
 }  // namespace bxi_hardware

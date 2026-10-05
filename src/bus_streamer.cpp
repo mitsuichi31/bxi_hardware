@@ -6,6 +6,14 @@
 #include <cstring>
 #include <set>
 #include <utility>
+#include <cmath>
+#include <cerrno>
+#include <stdexcept>
+#include <sys/eventfd.h>
+#include <sys/timerfd.h>
+#include <unistd.h>
+#include <poll.h>
+#include "bxi_hardware/write_schedule.hpp"
 
 #include <pthread.h>
 #include <sched.h>
@@ -120,15 +128,20 @@ const char * streamFaultName(StreamFault fault)
     case StreamFault::kForbiddenReply: return "reply from a motor that must be absent";
     case StreamFault::kOwnerRequested: return "owner requested stop";
     case StreamFault::kCommandStale: return "command stale";
+    case StreamFault::kCommandSnapshotUnavailable: return "command snapshot unavailable";
+    case StreamFault::kStartupTimeout: return "first write timeout";
+    case StreamFault::kTemperature: return "temperature fault";
+    case StreamFault::kNotificationFailed: return "notification failed";
   }
   return "unknown";
 }
 
 BxiBusStreamer::BxiBusStreamer(
   CanBus * tx_bus, CanBus * rx_bus, std::vector<BxiActuatorDriver *> drivers,
-  StreamConfig config, CycleHook hook, std::atomic<bool> * stop_all)
+  StreamConfig config, CycleHook hook, std::atomic<bool> * stop_all,
+  std::unique_ptr<WriteStreamStorage> storage)
 : tx_bus_(tx_bus), rx_bus_(rx_bus), drivers_(std::move(drivers)), config_(std::move(config)),
-  hook_(std::move(hook)), stop_all_(stop_all)
+  hook_(std::move(hook)), stop_all_(stop_all), write_storage_(std::move(storage))
 {
 }
 
@@ -188,9 +201,19 @@ bool BxiBusStreamer::validate()
     return false;
   }
   if (config_.max_command_age.count() != 0 &&
-    (config_.max_command_age < 2 * config_.period || config_.command_written_ns == nullptr))
+    (config_.max_command_age < 2 * config_.period ||
+      (!config_.write_triggered && config_.command_written_ns == nullptr)))
   {
     error_ = "max_command_age must be 0 (off), or at least two periods with command_written_ns";
+    return false;
+  }
+  if (config_.write_triggered &&
+    (config_.write_grace <= std::chrono::nanoseconds::zero() ||
+    config_.period + config_.write_grace >= config_.max_feedback_age ||
+    config_.period + config_.write_grace >= config_.max_command_age ||
+    config_.first_write_timeout <= std::chrono::nanoseconds::zero()))
+  {
+    error_ = "write trigger needs positive grace/startup timeout and freshness margin";
     return false;
   }
   std::set<int> ids;
@@ -253,6 +276,22 @@ bool BxiBusStreamer::start(std::unique_ptr<StreamTrace> prepared)
     reply_ids_.push_back(protocol::defaultMasterId(static_cast<uint32_t>(driver->canId())));
     limits_.push_back(driver->limits());
   }
+  if ((config_.write_triggered || config_.direct_feedback) && !write_storage_) {
+    write_storage_ = std::make_unique<WriteStreamStorage>(n);
+  }
+  if (write_storage_ && write_storage_->feedback.size() != n) {
+    error_ = "write storage shape mismatch";
+    return false;
+  }
+  if (write_storage_) {
+    for (size_t i = 0; i < n; ++i) {
+      write_storage_->transforms[i] = drivers_[i]->feedbackTransform();
+    }
+  }
+  writes_armed_ns_ = 0;
+  rx_fault_ = StreamFault::kNone;
+  rx_temperature_fault_c_ = 0.0; rx_temperature_fault_received_ns_ = 0;
+  notification_failed_ = false;
   slots_.assign(n, ReplySlot{});
   forbidden_replies_ = 0;
   forbidden_reply_id_ = 0;
@@ -307,7 +346,8 @@ bool BxiBusStreamer::start(std::unique_ptr<StreamTrace> prepared)
   tx_done_ = false;
   first_send_ns_ = 0;
   tx_running_ = true;
-  tx_thread_ = std::thread(&BxiBusStreamer::sendLoop, this);
+  tx_thread_ = std::thread(config_.write_triggered ?
+    &BxiBusStreamer::sendWriteLoop : &BxiBusStreamer::sendLoop, this);
   if (!waitForThread(tx_state_)) {
     stop();
     error_ = "send thread: " + (tx_setup_error_.empty() ? "did not start in time" :
@@ -351,7 +391,7 @@ bool BxiBusStreamer::waitForFirstFeedback(std::chrono::nanoseconds timeout)
 
 void BxiBusStreamer::stop()
 {
-  tx_running_ = false;
+  requestStop();
   if (tx_thread_.joinable()) {
     tx_thread_.join();
   }
@@ -369,6 +409,13 @@ StreamStats BxiBusStreamer::stats() const
   StreamStats stats = tx_stats_;
   stats.rx_frames = rx_frames_;
   stats.rx_ignored = rx_ignored_;
+  stats.forbidden_replies = forbidden_replies_;
+  stats.forbidden_reply_id = forbidden_reply_id_;
+  if (rx_fault_.load() == StreamFault::kTemperature) {
+    stats.temperature_fault_axis = rx_fault_axis_.load();
+    stats.temperature_fault_c = rx_temperature_fault_c_;
+    stats.temperature_fault_received_ns = rx_temperature_fault_received_ns_;
+  }
   return stats;
 }
 
@@ -400,6 +447,7 @@ void BxiBusStreamer::receiveLoop()
       }
       const auto decoded = decodeMotorReply(frame, can_ids_[i], limits_[i]);
       if (decoded.has_value()) {
+        {
         std::lock_guard<std::mutex> lock(slot_mutex_);
         auto & slot = slots_[i];
         slot.decoded = *decoded;
@@ -407,6 +455,29 @@ void BxiBusStreamer::receiveLoop()
         slot.rx_kernel_realtime_ns = frame.rx_kernel_realtime_ns;
         slot.rx_userspace_realtime_ns = frame.rx_userspace_realtime_ns;
         ++slot.sequence;
+        }
+        if (write_storage_) {
+          auto & published = write_storage_->rx_cache[i];
+          published.feedback = convertFeedback(*decoded, write_storage_->transforms[i]);
+          published.feedback.rx_kernel_realtime_ns = frame.rx_kernel_realtime_ns;
+          published.feedback.rx_userspace_realtime_ns = frame.rx_userspace_realtime_ns;
+          ++published.sequence;
+          published.received_ns = received_at.time_since_epoch().count();
+          published.published_ns = clock_type::now().time_since_epoch().count();
+          write_storage_->feedback[i]->publish(&published);
+          write_storage_->received_ns[i].store(published.received_ns);
+          if (!std::isfinite(published.feedback.temperature) ||
+            published.feedback.temperature > 80.0)
+          {
+            if (rx_fault_.load() == StreamFault::kNone) {
+              rx_temperature_fault_c_ = published.feedback.temperature;
+              rx_temperature_fault_received_ns_ = published.received_ns;
+              rx_fault_axis_ = static_cast<int>(i);
+              rx_fault_ = StreamFault::kTemperature;
+            }
+            if (config_.write_triggered) {notify();}
+          }
+        }
         used = true;
       }
       if (decoded.has_value()) {
@@ -417,6 +488,9 @@ void BxiBusStreamer::receiveLoop()
           row.rx_kernel_realtime_ns = frame.rx_kernel_realtime_ns;
           row.rx_userspace_realtime_ns = frame.rx_userspace_realtime_ns;
           row.rx_hardware_raw_ns = frame.rx_hardware_raw_ns;
+          row.sequence = write_storage_ ? write_storage_->rx_cache[i].sequence : slots_[i].sequence;
+          row.published_ns = write_storage_ ? write_storage_->rx_cache[i].published_ns :
+            clock_type::now().time_since_epoch().count();
           row.motor_position = decoded->position;
           row.motor_velocity = decoded->velocity;
           row.motor_torque = decoded->torque;
@@ -431,6 +505,11 @@ void BxiBusStreamer::receiveLoop()
           std::lock_guard<std::mutex> lock(slot_mutex_);
           ++forbidden_replies_;
           forbidden_reply_id_ = id;
+          if (rx_fault_.load() == StreamFault::kNone) {
+            rx_fault_axis_ = -1;
+            rx_fault_ = StreamFault::kForbiddenReply;
+          }
+          if (config_.write_triggered) {notify();}
           used = true;
           break;
         }
@@ -447,6 +526,12 @@ void BxiBusStreamer::fault(StreamFault kind, int axis)
   tx_stats_.fault = kind;
   tx_stats_.fault_axis = axis;
   stop_all_->store(true);
+  const uint64_t one = 1;
+  for (int fd : config_.stop_wake_fds) {
+    const auto notified = ::write(fd, &one, sizeof(one));
+    if (notified < 0 && errno != EAGAIN) {notification_failed_ = true;}
+  }
+  if (config_.write_triggered) {return;}  // Non-RT monitor reports the latched reason after disable.
   if (axis >= 0) {
     RCLCPP_ERROR(logger(), "[%s] motor id=%d: %s; stopping all motors",
       tx_bus_->name().c_str(), can_ids_[static_cast<size_t>(axis)], streamFaultName(kind));
@@ -533,6 +618,8 @@ void BxiBusStreamer::sendLoop()
         last_reply[i] = latest[i].received_at;
         has_reply[i] = true;
         tx_stats_.replies[i] = seen_sequence[i];
+        feedback[i].sequence = seen_sequence[i];
+        feedback[i].received_ns = latest[i].received_at.time_since_epoch().count();
       } else if (sent_previous_cycle) {
         ++tx_stats_.cycles_without_new_reply[i];
       }
@@ -554,6 +641,10 @@ void BxiBusStreamer::sendLoop()
         fault(StreamFault::kFeedbackStale, static_cast<int>(i));
         faulted = true;
       }
+    }
+    if (!faulted && config_.direct_feedback && rx_fault_.load() == StreamFault::kTemperature) {
+      fault(StreamFault::kTemperature, rx_fault_axis_.load());
+      faulted = true;
     }
     if (!faulted && forbidden_seen > 0) {
       tx_stats_.forbidden_replies = forbidden_seen;
@@ -608,6 +699,9 @@ void BxiBusStreamer::sendLoop()
       const bool hook_ok = hook_(feedback, commands);
       if (row != nullptr) {
         row->hook_ns = toNanoseconds(clock_type::now() - hook_start);
+        row->command_sequence = commands[0].sequence;
+        row->command_published_ns = commands[0].published_ns;
+        row->send_kind = 2;
       }
       if (!hook_ok) {
         set_outcome(StreamCycleOutcome::kStopped);
@@ -616,7 +710,8 @@ void BxiBusStreamer::sendLoop()
       }
     }
     if (row != nullptr && config_.broadcast && n == 1) {
-      row->command = commands[0];
+      row->command = {commands[0].position, commands[0].velocity, commands[0].kp,
+        commands[0].kd, commands[0].effort};
       row->command_valid = true;
       row->command_stale = command_stale;
     }
@@ -657,12 +752,12 @@ void BxiBusStreamer::sendLoop()
         const auto frame = buildBroadcastFrame(blocks, block_count_, padding_block_);
         bool success = false;
         if (frame.has_value()) {
-          if (row != nullptr && n == 1) {
+          if (row != nullptr && (n == 1 || config_.control_trace)) {
             row->send_attempted = true;
             row->send_before_steady_ns = toNanoseconds(clock_type::now().time_since_epoch());
           }
           success = tx_bus_->send(*frame);
-          if (row != nullptr && n == 1) {
+          if (row != nullptr && (n == 1 || config_.control_trace)) {
             row->send_after_steady_ns = toNanoseconds(clock_type::now().time_since_epoch());
             row->send_success = success;
           }
@@ -758,6 +853,341 @@ void BxiBusStreamer::sendLoop()
     std::lock_guard<std::mutex> lock(slot_mutex_);
     for (size_t i = 0; i < n; ++i) {
       tx_stats_.replies[i] = slots_[i].sequence;
+    }
+  }
+  tx_done_ = true;
+}
+
+WriteStreamStorage::WriteStreamStorage(size_t axes)
+: commands(axes), received_ns(std::make_unique<std::atomic<int64_t>[]>(axes)),
+  control_unavailable(std::make_unique<std::atomic<bool>[]>(axes)), tx_seen_feedback(axes),
+  tx_cache(axes), tx_scratch(axes), rx_cache(axes), tx_feedback(axes), transforms(axes),
+  tx_commands(axes), tx_blocks(axes)
+{
+  static_assert(clock_type::period::num == 1 && clock_type::period::den == 1000000000,
+    "write stream requires nanosecond steady_clock ticks");
+  // timerfd absolute deadlines and the published timestamps must share an epoch.
+  const auto before = clock_type::now().time_since_epoch().count();
+  timespec monotonic{};
+  const int clock_result = ::clock_gettime(CLOCK_MONOTONIC, &monotonic);
+  const auto after = clock_type::now().time_since_epoch().count();
+  const int64_t clock_ns = monotonic.tv_sec * 1000000000LL + monotonic.tv_nsec;
+  if (clock_result != 0 || clock_ns < before || clock_ns > after) {
+    throw std::runtime_error("steady_clock and CLOCK_MONOTONIC have different epochs");
+  }
+  if (!commands.lockFree() || !received_ns[0].is_lock_free() ||
+    !control_unavailable[0].is_lock_free()) {
+    throw std::runtime_error("stream atomics are not lock free");
+  }
+  for (size_t i = 0; i < axes; ++i) {
+    feedback.push_back(std::make_unique<AtomicSnapshot<PublishedFeedback>>());
+    if (!feedback.back()->lockFree()) {throw std::runtime_error("feedback atomics not lock free");}
+    received_ns[i].store(0);
+    control_unavailable[i].store(false);
+  }
+  event_fd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+  timer_fd = ::timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+  if (event_fd < 0 || timer_fd < 0) {
+    if (event_fd >= 0) {::close(event_fd);}
+    if (timer_fd >= 0) {::close(timer_fd);}
+    throw std::runtime_error("stream eventfd/timerfd creation failed");
+  }
+}
+WriteStreamStorage::~WriteStreamStorage()
+{
+  if (event_fd >= 0) {::close(event_fd);}
+  if (timer_fd >= 0) {::close(timer_fd);}
+}
+void BxiBusStreamer::notify()
+{
+  if (!write_storage_) {return;}
+  const uint64_t one = 1;
+  if (::write(write_storage_->event_fd, &one, sizeof(one)) != sizeof(one) && errno != EAGAIN) {
+    notification_failed_ = true;
+  }
+}
+void BxiBusStreamer::requestStop()
+{
+  tx_running_ = false;
+  notify();
+}
+void BxiBusStreamer::armWrites()
+{
+  trace_.writes_armed_steady_ns = clock_type::now().time_since_epoch().count();
+  writes_armed_ns_ = trace_.writes_armed_steady_ns;
+  notify();
+}
+bool BxiBusStreamer::publishCommands(const PublishedCommand * commands)
+{
+  if (!config_.write_triggered || !writes_armed_ns_.load() ||
+    !tx_running_ || stop_all_->load()) {return false;}
+  write_storage_->commands.publish(commands);
+  notify();
+  return !notification_failed_.load();
+}
+bool BxiBusStreamer::readFeedback(size_t axis, PublishedFeedback & scratch,
+  unsigned * attempts) const
+{
+  return write_storage_ && axis < write_storage_->feedback.size() &&
+         write_storage_->feedback[axis]->tryRead(&scratch, attempts);
+}
+
+void BxiBusStreamer::setControlUnavailable(size_t axis, bool unavailable)
+{
+  if (write_storage_ && axis < write_storage_->feedback.size()) {
+    write_storage_->control_unavailable[axis].store(unavailable);
+  }
+}
+bool BxiBusStreamer::controlUnavailable(size_t axis) const
+{
+  return write_storage_ && axis < write_storage_->feedback.size() &&
+         write_storage_->control_unavailable[axis].load();
+}
+
+void BxiBusStreamer::sendWriteLoop()
+{
+  const auto setup = applyThreadScheduling(config_.send_priority, config_.cpus);
+  if (!setup.empty()) {
+    tx_setup_error_ = setup; tx_state_ = kFailed; tx_done_ = true; return;
+  }
+  trace_.tx_thread = nameAndDescribeThread("bxtx_" + tx_bus_->name());
+  auto & storage = *write_storage_;
+  const size_t n = drivers_.size();
+  auto & commands = storage.tx_commands;
+  auto & feedback = storage.tx_feedback;
+  auto & blocks = storage.tx_blocks;
+  WriteSchedule schedule{config_.period.count(), config_.write_grace.count()};
+  const auto ns_now = [] {return clock_type::now().time_since_epoch().count();};
+  trace_.send_loop_start_steady_ns = ns_now();
+  int64_t bootstrap_due = ns_now(), first_send = 0, retry_due = 0, hold_start = 0;
+  uint64_t observed_version = 0;
+  int last_send_kind = 0;
+  bool snapshot_failed = false;
+  tx_state_ = kReady;
+  while (tx_running_) {
+    int64_t now = ns_now();
+    if (stop_all_->load()) {tx_stats_.stopped_externally = true; break;}
+    if (notification_failed_) {fault(StreamFault::kNotificationFailed, -1); break;}
+    // Take a whole command batch, never extend freshness with a torn/failed read.
+    const auto version = storage.commands.version();
+    if (version != observed_version || snapshot_failed) {
+      snapshot_failed = !storage.commands.tryRead(storage.tx_scratch.data());
+      if (!snapshot_failed) {
+        const auto & packet = storage.tx_scratch[0];
+        if (packet.sequence != schedule.sequence) {
+          if (schedule.last_was_resend && packet.published_ns >= schedule.last_send_ns &&
+            packet.published_ns < schedule.earliestSend()) {++tx_stats_.writes_after_resend;}
+          if (schedule.sequence && packet.sequence > schedule.sequence + 1) {
+            tx_stats_.command_coalesced += packet.sequence - schedule.sequence - 1;
+          }
+          storage.tx_cache.swap(storage.tx_scratch);
+          schedule.published(packet.sequence, packet.published_ns);
+        }
+        observed_version = version;
+        retry_due = 0;
+      } else {
+        ++tx_stats_.command_snapshot_failures;
+        retry_due = now + std::max(int64_t{1}, config_.period.count() / 20);
+      }
+    }
+    const bool active = schedule.sequence != 0;
+    const auto armed = writes_armed_ns_.load();
+    const bool startup_expired = !active && armed &&
+      now >= armed + config_.first_write_timeout.count();
+    const bool stale = active && now >= schedule.published_ns + config_.max_command_age.count();
+    // Safe-stop independent of write notifications. Command expiry takes precedence.
+    StreamFault stop_reason = stale ? (snapshot_failed ? StreamFault::kCommandSnapshotUnavailable :
+      StreamFault::kCommandStale) : StreamFault::kNone;
+    int stop_axis = -1;
+    if (!stale && startup_expired) {stop_reason = StreamFault::kStartupTimeout;}
+    if (!stale && rx_fault_.load() != StreamFault::kNone) {
+      stop_reason = rx_fault_.load(); stop_axis = rx_fault_axis_.load();
+    }
+    int64_t feedback_due = now + config_.max_feedback_age.count();
+    for (size_t i = 0; i < n; ++i) {
+      PublishedFeedback scratch;
+      if (storage.feedback[i]->tryRead(&scratch)) {feedback[i] = scratch;}
+      const auto received = storage.received_ns[i].load();
+      const auto base = received ? received : first_send;
+      if (base) {
+        feedback_due = std::min(feedback_due, base + config_.max_feedback_age.count());
+        tx_stats_.max_age_ms[i] = std::max(tx_stats_.max_age_ms[i], (now - base) / 1.e6);
+        if (now >= base + config_.max_feedback_age.count()) {
+          tx_stats_.feedback_stale_at_stop = true;
+          if (stop_reason == StreamFault::kNone) {
+            stop_reason = StreamFault::kFeedbackStale; stop_axis = static_cast<int>(i);
+          }
+        }
+      }
+      tx_stats_.replies[i] = feedback[i].sequence;
+    }
+    if (active) {
+      tx_stats_.max_command_age_ms = std::max(tx_stats_.max_command_age_ms,
+        (now - schedule.published_ns) / 1.e6);
+    }
+    const bool zero_stop = stop_reason == StreamFault::kCommandStale ||
+      stop_reason == StreamFault::kCommandSnapshotUnavailable ||
+      stop_reason == StreamFault::kStartupTimeout;
+    if (stop_reason != StreamFault::kNone) {tx_stats_.received_fault_at_stop = rx_fault_.load();}
+    if (stop_reason != StreamFault::kNone && !zero_stop) {
+      if (stop_reason == StreamFault::kFeedbackStale && stop_axis >= 0) {
+        drivers_[stop_axis]->latchCommunicationFault(false);
+      }
+      fault(stop_reason, stop_axis); break;
+    }
+    bool resend = active && !snapshot_failed && schedule.resendDue(now);
+    bool due = zero_stop || (!active && now >= bootstrap_due) ||
+      (active && !snapshot_failed && (schedule.pending() || resend));
+    if (due && !zero_stop && schedule.held(now)) {
+      if (!hold_start) {
+        hold_start = now; ++tx_stats_.minimum_interval_holds;
+        if (active && schedule.pending()) {
+          if (last_send_kind == 3) {++tx_stats_.resend_command_holds;}
+          else if (last_send_kind == 2) {++tx_stats_.new_command_holds;}
+          else {++tx_stats_.bootstrap_command_holds;}
+        }
+      }
+      due = false;
+    }
+    if (due) {
+      const auto row_index = trace_.cycle_count++;
+      auto * row = row_index < trace_.cycles.size() ? &trace_.cycles[row_index] : nullptr;
+      if (row) {
+        *row = StreamCycleRecord{};
+        row->cycle = row_index; row->wake_lateness_ns = -1; row->send_lateness_ns = -1;
+        row->wake_steady_ns = now; row->command_sequence = schedule.sequence;
+        row->command_published_ns = schedule.published_ns; row->resend_due_ns = schedule.resend_ns;
+        row->command_age_ns = active ? now - schedule.published_ns : -1;
+        row->send_kind = zero_stop ? 4 : !active ? 1 : resend ? 3 : 2;
+        row->snapshot_failed = snapshot_failed;
+        row->hold_ns = hold_start ? now - hold_start : 0;
+        for (size_t i = 0; i < n; ++i) {
+          trace_.age_ns[row_index * n + i] = feedback[i].received_ns ?
+            now - feedback[i].received_ns : -1;
+          trace_.fresh[row_index * n + i] =
+            feedback[i].sequence != storage.tx_seen_feedback[i];
+        }
+      }
+      for (size_t i = 0; i < n; ++i) {
+        if (schedule.last_send_ns && storage.tx_seen_feedback[i] == feedback[i].sequence) {
+          ++tx_stats_.cycles_without_new_reply[i];
+        }
+        storage.tx_seen_feedback[i] = feedback[i].sequence;
+      }
+      if (hold_start) {tx_stats_.max_hold_ns = std::max(tx_stats_.max_hold_ns, now - hold_start);}
+      hold_start = 0;
+      bool encoded = true;
+      for (size_t i = 0; i < n; ++i) {
+        commands[i] = active && !zero_stop ? storage.tx_cache[i].command :
+          StreamCommand{feedback[i].feedback.position, 0, 0, 0, 0};
+        const auto & c = commands[i];
+        const auto block = drivers_[i]->encodeControlBlock(c.position, c.velocity, c.kp, c.kd, c.effort);
+        if (!block) {encoded = false; fault(StreamFault::kEncodeFailed, static_cast<int>(i)); break;}
+        blocks[i] = {can_ids_[i], *block};
+      }
+      if (!encoded) {break;}
+      if (row && n == 1) {
+        row->command = {commands[0].position, commands[0].velocity, commands[0].kp,
+        commands[0].kd, commands[0].effort}; row->command_valid = true; row->command_stale = zero_stop;
+        row->command_block = blocks[0].second; row->encoded_valid = true;
+      }
+      size_t sent = 0;
+      int64_t send_at = 0;
+      bool failed = false;
+      const size_t frames = config_.broadcast ? 1 : n;
+      for (size_t i = 0; i < frames; ++i) {
+        if (!tx_running_ || stop_all_->load()) {break;}
+        // Recheck at the send boundary too: a publication during encoding cancels the old
+        // batch before its first frame. Once started, finish this immutable batch; safety
+        // stops and freshness limits are still checked before EVERY frame.
+        if (!zero_stop && active && sent == 0 &&
+          storage.commands.version() != observed_version) {break;}
+        if (!zero_stop && rx_fault_.load() != StreamFault::kNone) {break;}
+        if (!zero_stop && active && ns_now() >= schedule.published_ns + config_.max_command_age.count()) {
+          break;  // Re-enter watchdog immediately; never emit a stale normal frame.
+        }
+        CanFrame frame;
+        if (config_.broadcast) {
+          frame = *buildBroadcastFrame(blocks, block_count_, padding_block_);
+        } else {
+          frame.id = static_cast<uint32_t>(can_ids_[i]); frame.setData(blocks[i].second);
+        }
+        const auto before = ns_now();
+        if (!zero_stop && active && before >= schedule.published_ns + config_.max_command_age.count()) {
+          break;
+        }
+        if (!send_at) {send_at = before;}
+        if (row) {
+          if (!row->send_attempted) {row->send_before_steady_ns = before;}
+          row->send_attempted = true;
+        }
+        const bool success = tx_bus_->send(frame);
+        if (row) {row->send_after_steady_ns = ns_now(); row->send_success = success;}
+        if (!success) {
+          if (config_.broadcast) {
+            for (auto * driver : drivers_) {driver->latchCommunicationFault(false);}
+          } else {drivers_[i]->latchCommunicationFault(false);}
+          fault(StreamFault::kSendFailed, config_.broadcast ? -1 : static_cast<int>(i));
+          failed = true; break;
+        }
+        ++sent;
+      }
+      tx_stats_.frames_sent += sent;
+      if (row) {
+        row->send_success = sent == frames;
+        row->frames = static_cast<uint8_t>(sent);
+        row->outcome = sent == frames ? StreamCycleOutcome::kSent : StreamCycleOutcome::kPartial;
+      }
+      if (sent) {
+        if (!first_send) {first_send = send_at; first_send_ns_ = send_at;}
+        schedule.sent(send_at, resend);
+        last_send_kind = zero_stop ? 4 : !active ? 1 : resend ? 3 : 2;
+        bootstrap_due = send_at + config_.period.count();
+        if (resend) {++tx_stats_.resends;}
+        if (sent == frames) {++tx_stats_.cycles;} else {++tx_stats_.partial_cycles;}
+      }
+      if (zero_stop) {
+        tx_stats_.command_stale_zero_gain_frames = sent;
+        tx_stats_.command_stale_expected_frames = frames;
+        if (row) {row->outcome = StreamCycleOutcome::kStopped;}
+        if (!failed && tx_running_ && !stop_all_->load()) {fault(stop_reason, -1);}
+        else if (!failed) {tx_stats_.stopped_externally = true;}
+        break;
+      }
+      if (failed) {break;}
+      continue;
+    }
+    int64_t deadline = feedback_due;
+    if (active) {
+      deadline = std::min(deadline, schedule.published_ns + config_.max_command_age.count());
+      if (snapshot_failed) {deadline = std::min(deadline, retry_due);}
+      else if (schedule.pending() || resend) {deadline = std::min(deadline, schedule.earliestSend());}
+      else {deadline = std::min(deadline, schedule.resend_ns);}
+    } else {
+      deadline = std::min(deadline, bootstrap_due);
+      if (snapshot_failed) {deadline = std::min(deadline, retry_due);}
+      if (armed) {deadline = std::min(deadline, armed + config_.first_write_timeout.count());}
+    }
+    deadline = std::max(deadline, ns_now() + 1);
+    itimerspec timer{};
+    timer.it_value.tv_sec = deadline / 1000000000;
+    timer.it_value.tv_nsec = deadline % 1000000000;
+    if (::timerfd_settime(storage.timer_fd, TFD_TIMER_ABSTIME, &timer, nullptr) != 0) {
+      fault(StreamFault::kNotificationFailed, -1); break;
+    }
+    pollfd fds[2]{{storage.event_fd, POLLIN, 0}, {storage.timer_fd, POLLIN, 0}};
+    const int result = ::poll(fds, 2, -1);
+    if (result < 0) {
+      if (errno == EINTR) {continue;}
+      fault(StreamFault::kNotificationFailed, -1); break;
+    }
+    uint64_t count;
+    for (auto & fd : fds) {
+      if (fd.revents & (POLLERR | POLLHUP | POLLNVAL)) {notification_failed_ = true;}
+      if (fd.revents & POLLIN) {
+        const auto consumed = ::read(fd.fd, &count, sizeof(count));
+        if (consumed < 0 && errno != EAGAIN && errno != EINTR) {notification_failed_ = true;}
+      }
     }
   }
   tx_done_ = true;

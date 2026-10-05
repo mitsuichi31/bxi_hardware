@@ -129,6 +129,10 @@ private:
   // Per-bus transport from can_transport. The defaults keep the sequential worker.
   struct BusTransport
   {
+    bool write_triggered = false;
+    bool direct_feedback = false;
+    double write_grace_ms = 0.0;
+    double first_write_timeout_ms = 20.0;
     bool separate = false;   // rx_mode: separate
     bool broadcast = false;  // tx_frame: broadcast
     double stream_feedback_max_age_ms = 0.0;
@@ -176,6 +180,47 @@ private:
   std::map<std::string, std::unique_ptr<BxiBusStreamer>> streamers_;
   // steady_clock ns of the latest write(); read by every send thread (max_command_age).
   std::atomic<int64_t> last_write_ns_{0};
+  struct ControlRecord
+  {
+    uint64_t rx_sequence = 0;
+    // At most 620000 recorded cycles; 30 bits for cycle, 2 for the bounded attempts.
+    uint32_t cycle_attempts = 0;
+    uint32_t failures = 0;
+    uint32_t cycle() const {return cycle_attempts & 0x3fffffffU;}
+    uint32_t attempts() const {return cycle_attempts >> 30;}
+    void setCycle(uint64_t value) {
+      cycle_attempts = (cycle_attempts & 0xc0000000U) |
+        (static_cast<uint32_t>(value) & 0x3fffffffU);
+    }
+    void setAttempts(unsigned value) {cycle_attempts = (cycle_attempts & 0x3fffffffU) | (value << 30);}
+    int64_t read_start = 0, read_done = 0, acquired_ns = 0;
+    int64_t rx_received = 0, rx_published = 0;
+    int64_t write_start = 0, published = 0, notify_before = 0, notify_after = 0, write_end = 0;
+  };
+  struct ControlStream
+  {
+    struct DiagnosticEvent {int64_t at_ns; uint64_t cycle; size_t joint; bool unavailable;};
+    BxiBusStreamer * streamer = nullptr;
+    std::vector<size_t> indices;
+    std::vector<PublishedCommand> commands;
+    std::vector<PublishedFeedback> feedback;
+    std::vector<uint32_t> failures;
+    std::vector<DiagnosticEvent> diagnostics;
+    size_t diagnostic_count = 0;
+    std::vector<ControlRecord> records;
+    size_t capacity = 0, record_count = 0, record_index = SIZE_MAX;
+    std::unique_ptr<TraceBufferedWriter> output;
+    std::string output_path;
+    bool read_diagnostics = false;
+  };
+  // Built during activation and never modified while read/write run.
+  std::vector<ControlStream> control_streams_;
+  std::vector<bool> direct_joint_, write_joint_;
+  std::map<std::string, std::unique_ptr<WriteStreamStorage>> prepared_write_storage_;
+  uint64_t control_sequence_ = 0;
+  uint64_t legacy_command_sequence_ = 0;
+  int64_t legacy_command_published_ns_ = 0;
+  void writeControlTiming();
   std::mutex stream_stop_mutex_;
   std::set<std::string> reported_streams_;  // streams already logged and written
   std::map<std::string, BxiSpec> specs_;
@@ -192,6 +237,8 @@ private:
   std::mutex data_mutex_;
   std::vector<double> tgt_pos_, tgt_vel_, tgt_kp_, tgt_kd_, tgt_eff_;
   std::vector<double> fb_pos_, fb_vel_, fb_eff_, fb_temp_;
+  std::vector<uint64_t> fb_sequence_;
+  std::vector<int64_t> fb_received_ns_, fb_published_ns_;
 
   std::vector<std::thread> workers_;
   std::map<std::string, std::vector<size_t>> live_joints_;

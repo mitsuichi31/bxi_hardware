@@ -40,6 +40,10 @@
       "additionalProperties": false,
       "properties": {
         "rx_mode": {"type": "string", "enum": ["sequential", "separate"]},
+        "tx_trigger": {"type": "string", "enum": ["periodic", "write"]},
+        "direct_feedback": {"type": "boolean"},
+        "stream_write_grace_ms": {"type": "number", "exclusiveMinimum": 0, "maximum": 50},
+        "stream_first_write_timeout_ms": {"type": "number", "exclusiveMinimum": 0, "maximum": 1000},
         "tx_frame": {"type": "string", "enum": ["unicast", "broadcast"]},
         "stream_feedback_max_age_ms": {"type": "number", "exclusiveMinimum": 0, "maximum": 50},
         "stream_command_max_age_ms": {"type": "number", "exclusiveMinimum": 0, "maximum": 50},
