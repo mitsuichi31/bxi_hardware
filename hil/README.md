@@ -24,7 +24,7 @@ tools/hil_stage4r.sh --motor-id SN-0001 --sine-90deg --sine-frequency 0.5 --trac
 ## 0. 準備（ホスト）
 
 ```bash
-# can0 を CAN FD 1 Mbps / 5 Mbps（サンプル点 0.8 / 0.8125、berr-reporting on）で up する。
+# can0 を CAN FD 1 Mbps / 5 Mbps（サンプル点 0.75 / 0.75、SJW 20 / 4、berr-reporting off）で up する。
 # FD で起動しても、通常の CAN（can_frame_format: classic）はそのまま使える。
 cd ~/devel/minibexkai_ros2_ws
 ./docker/can_setup.sh can0
@@ -32,6 +32,10 @@ ip -details -statistics link show can0      # state ERROR-ACTIVE を確認
 ```
 
 `docker/can_setup.sh` はワークスペース（`minibexkai_ros2_ws`）側にある。引数を省略すると can0〜can3 をすべて up する。
+
+9/25の記録は個体・配線・終端が10/6以降の試験と同一か未確認の履歴であり、近い旧条件（SP80%）で後に受信スタッフエラーが再発しているため、再現性の根拠にはしない。
+
+現在の固定条件はISO FD、公称1M/SP75%/SJW20（250 ns）、データ5M/SP75%/SJW4（50 ns）、80 MHz/BRP1、listen-only OFF、berr-reporting OFF、restart-ms0。`ip -details -statistics`でSP・SJW・クロック・BRPも確認する。BRSは送信アプリのフレーム設定で指定する。ワークスペースの `docs/test-reports/2026-10-12-pcan-brs-fixed-condition.md` が根拠で、PCAN第1ch・今回の配線・1 kHzゼロゲインの確認結果。動作負荷時や他チャンネルの確認は別に行う。通常のros2_control/candumpではberr-reporting OFFのバスエラーが見えず、試験用PCIe kprobe監視は通常運用には無い。事前確認の80 MHz/BRP1/SJW20・4判定もPCAN-M.2第1ch向けで、他アダプタの数値表現が異なるとNGになる。起動時の過去のエラーは解消未確定であり、TEC/REC0だけでエラーなしと判定しない。
 
 - モーターの電源出力が ON で、MENU の状態（`STATE : 01 MENU`）であることを確認する。前の試験から出力を維持した場合も再確認する。
 - モーターの `can_timeout` は 0（通信が止まっても最後の指令を出し続ける）。**試験中にプロセスを強制終了すると、最後の指令が残る。** 停止の順序は下記「段階6 実機試験前の確認」の「止めるとき」に従う。
