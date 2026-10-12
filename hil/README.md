@@ -27,6 +27,8 @@ tools/hil_stage4r.sh --motor-id SN-0001 --sine-90deg --sine-frequency 0.5 --trac
 # can0 を CAN FD 1 Mbps / 5 Mbps（サンプル点 0.75 / 0.75、SJW 20 / 4、berr-reporting off）で up する。
 # FD で起動しても、通常の CAN（can_frame_format: classic）はそのまま使える。
 cd ~/devel/minibexkai_ros2_ws
+# 先に同じ端末で sudo -v を実行する（can_setup.shはsudo -nを使用）。
+sudo -v
 ./docker/can_setup.sh can0
 ip -details -statistics link show can0      # state ERROR-ACTIVE を確認
 ```
@@ -255,6 +257,8 @@ CSV／bag境界試験、controller全軌道・拒否試験、正常／途中Ctrl
    - `can_setup.sh` のビットレートとサンプル点を確かめる。
 5. `can0` を設定し直して UP する。`can_setup.sh` は、いったん DOWN にしてから設定し直して UP する。これでコントローラの状態とエラーカウンタが初期化される想定だが、bus-off からの復帰では実機で確かめていない。復帰後の値を必ず確認し、`ERROR-ACTIVE`・TEC/REC 0/0 でなければ先に進まない。
    ```bash
+   # 先に同じ端末で sudo -v を実行する（can_setup.shはsudo -nを使用）。
+   sudo -v
    ./docker/can_setup.sh can0
    ip -details -statistics link show can0   # ERROR-ACTIVE、TEC/REC 0/0、restart-ms 0 を確かめる
    ```
