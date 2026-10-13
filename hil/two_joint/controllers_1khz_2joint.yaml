@@ -1,0 +1,21 @@
+# ROS updateは1kHz。軌道は2軸版Pythonが同じ時刻の標本を両軸へ公開する。
+# 1軸RT軌道controllerと同一の起床/リース保護ではない。実機使用は別レビュー。
+controller_manager:
+  ros__parameters:
+    update_rate: 1000
+    thread_priority: 50
+    cpu_affinity: 11
+    lock_memory: true
+    overruns.manage: true
+    use_sim_time: false
+    joint_state_broadcaster: {type: joint_state_broadcaster/JointStateBroadcaster}
+    joint1_command: {type: forward_command_controller/MultiInterfaceForwardCommandController}
+    joint2_command: {type: forward_command_controller/MultiInterfaceForwardCommandController}
+joint1_command:
+  ros__parameters:
+    joint: joint1
+    interface_names: [position, velocity, kp, kd, effort]
+joint2_command:
+  ros__parameters:
+    joint: joint2
+    interface_names: [position, velocity, kp, kd, effort]

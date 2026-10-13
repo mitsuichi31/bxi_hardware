@@ -1,0 +1,24 @@
+# 段階B/Cの準備。実機試験は別承認。ID 1・2、16-byte FD+BRS。
+active_can_buses: [can0]
+can_frame_format: {can0: fd_brs}
+can_transport:
+  can0:
+    rx_mode: separate
+    tx_frame: broadcast
+    tx_trigger: write
+    direct_feedback: true
+    stream_write_grace_ms: 0.20
+    stream_first_write_timeout_ms: 20.0
+    stream_feedback_max_age_ms: 3.0
+    stream_command_max_age_ms: 5.0
+    send_thread_priority: 45
+    receive_thread_priority: 46
+    thread_cpus: [9]
+defaults:
+  control_timeout_ms: 10
+  maximum_consecutive_timeouts: 3
+  can_hz: 1000
+  temperature_sensor_fault_below_c: -20.0
+joints:
+  joint1: {enabled: true, can_bus: can0, can_id: 1, motor_dir: 1, motor_type: MOTOR_70, lower: -1.65, upper: 1.65, default_kp: 0.0, default_kd: 0.0}
+  joint2: {enabled: true, can_bus: can0, can_id: 2, motor_dir: 1, motor_type: MOTOR_70, lower: -1.65, upper: 1.65, default_kp: 0.0, default_kd: 0.0}
