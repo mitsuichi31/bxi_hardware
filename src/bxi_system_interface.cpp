@@ -55,6 +55,11 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_init(
     return hardware_interface::CallbackReturn::ERROR;
   }
 
+  const auto mode = get_param("command_commit_mode", "legacy");
+  if (mode != "legacy" && mode != "pair_generation_v1") {
+    return hardware_interface::CallbackReturn::ERROR;
+  }
+  pair_mode_ = mode == "pair_generation_v1";
   n_joints_ = info_.joints.size();
   joints_.resize(n_joints_);
 
@@ -83,6 +88,8 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_init(
   if (!parseConfig()) {
     return hardware_interface::CallbackReturn::ERROR;
   }
+
+  if (!configurePair()) {return hardware_interface::CallbackReturn::ERROR;}
 
   RCLCPP_INFO(logger(), "on_init 完了: %zu joints, active_can_buses=%zu",
               n_joints_, active_buses_.size());
@@ -353,7 +360,8 @@ bool BxiSystemInterface::parseConfig()
 
       if (transport.write_triggered) {
         transport.direct_feedback = true;
-        if (!has_grace || !std::isfinite(transport.write_grace_ms) ||
+        if ((pair_mode_ && !has_first_write_timeout) ||
+          !has_grace || !std::isfinite(transport.write_grace_ms) ||
           transport.write_grace_ms <= 0 ||
           period_ms + transport.write_grace_ms >= transport.stream_feedback_max_age_ms ||
           period_ms + transport.write_grace_ms >= transport.stream_command_max_age_ms ||
@@ -475,6 +483,7 @@ BxiSystemInterface::export_state_interfaces()
     v.emplace_back(name, hardware_interface::HW_IF_EFFORT, &st_eff_[i]);
     v.emplace_back(name, HW_IF_TEMPERATURE, &st_temp_[i]);
   }
+  if (pair_mode_) {v.emplace_back("bxi_pair", "accepted_generation", &pair_accepted_);}
   return v;
 }
 
@@ -490,6 +499,7 @@ BxiSystemInterface::export_command_interfaces()
     v.emplace_back(name, HW_IF_KD, &cmd_kd_[i]);
     v.emplace_back(name, hardware_interface::HW_IF_EFFORT, &cmd_eff_[i]);
   }
+  if (pair_mode_) {v.emplace_back("bxi_pair", "commit_generation", &pair_generation_);}
   return v;
 }
 
@@ -505,6 +515,16 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_activate(
   const rclcpp_lifecycle::State & /*previous_state*/)
 {
   const auto activation_start = std::chrono::steady_clock::now();
+  if (pair_mode_) {
+    pair_activation_ns_ = activation_start.time_since_epoch().count();
+    const auto & transport = bus_transport_.at(joints_[0].can_bus);
+    pair_commit_.reset(pair_activation_ns_, static_cast<int64_t>(transport.first_write_timeout_ms * 1.e6));
+    pair_generation_ = pair_accepted_ = 0;
+    pair_claimed_ = pair_terminal_ = false;
+    for (auto * values : {&cmd_pos_, &cmd_vel_, &cmd_kp_, &cmd_kd_, &cmd_eff_}) {
+      std::fill(values->begin(), values->end(), kNaN);
+    }
+  }
   auto is_active = [&](const std::string & b) {
     return std::find(active_buses_.begin(), active_buses_.end(), b) != active_buses_.end();
   };
@@ -562,6 +582,12 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_activate(
       if (first.second.size() != 1 || !transport.separate || !transport.broadcast) {
         throw std::invalid_argument("expanded trace requires 1-axis separate broadcast");
       }
+    }
+    if (pair_mode_) {
+      if (worker_timing_dir_.empty()) {return fail_activation();}
+      pair_records_.assign(stream_trace_cycles_, PairRecord{});
+      pair_record_count_ = 0;
+      pair_records_saved_ = false;
     }
     control_sequence_ = 0;
     legacy_command_sequence_ = 0;
@@ -742,6 +768,8 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_activate(
         joints_[i].actuator->setAngleRange(joints_[i].lower, joints_[i].upper);
       }
 
+      // G profiles must remain within the codec after the startup offset adjustment.
+      if (pair_mode_ && !configurePair()) {return fail_activation();}
       for (size_t i : live) {
         auto fb = joints_[i].actuator->sendControl(0, 0, 0, 0, 0);
         if (!fb.valid) {
@@ -870,6 +898,7 @@ void BxiSystemInterface::releaseResources()
     reportStream(bus_name);
   }
   writeControlTiming();
+  savePairRecords();
   control_streams_.clear();
   prepared_write_storage_.clear();
   streamers_.clear();
@@ -994,6 +1023,7 @@ bool BxiSystemInterface::startStream(
   rx_buses_[bus_name] = rx_bus;
 
   StreamConfig config;
+  config.activation_origin_ns = pair_mode_ ? pair_activation_ns_ : 0;
   config.write_triggered = transport.write_triggered;
   config.direct_feedback = transport.direct_feedback;
   config.write_grace = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1068,6 +1098,17 @@ bool BxiSystemInterface::startStream(
   }
   auto storage = prepared_write_storage_.count(bus_name) ?
     std::move(prepared_write_storage_.at(bus_name)) : nullptr;
+  if (pair_mode_ && storage) {
+    // Only validated activation feedback, never the uncommitted command stage.
+    for (size_t axis = 0; axis < indices.size(); ++axis) {
+      auto & initial = storage->tx_feedback[axis];
+      const auto i = indices[axis];
+      if (!std::isfinite(st_pos_[i])) {return false;}
+      initial.feedback.position = st_pos_[i];
+      initial.feedback.valid = true;
+      // Do not invent a stream RX sequence/time or satisfy waitForFirstFeedback here.
+    }
+  }
   auto streamer = std::make_unique<BxiBusStreamer>(
     tx_bus.get(), rx_bus.get(), drivers, config,
     [this, bus_name, indices](
@@ -1581,6 +1622,7 @@ hardware_interface::return_type BxiSystemInterface::write(
     return hardware_interface::return_type::ERROR;
   }
   const auto write_start = std::chrono::steady_clock::now().time_since_epoch().count();
+  if (pair_mode_) {return writePair(write_start);}
   for (auto & control : control_streams_) {
     if (control.record_index == SIZE_MAX) {control.record_index = control.record_count++;}
   }

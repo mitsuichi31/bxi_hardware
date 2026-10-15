@@ -20,6 +20,7 @@
 
 #include "bxi_hardware/actuator/bxi_actuator.hpp"
 #include "bxi_hardware/bus_streamer.hpp"
+#include "bxi_hardware/pair_commit.hpp"
 #include "bxi_hardware/stream_trace_io.hpp"
 #include "bxi_hardware/can/socketcan_bus.hpp"
 
@@ -54,6 +55,9 @@ public:
   hardware_interface::CallbackReturn on_init(
     const hardware_interface::HardwareInfo & info) override;
 
+  hardware_interface::CallbackReturn on_configure(
+    const rclcpp_lifecycle::State & previous_state) override;
+
   std::vector<hardware_interface::StateInterface> export_state_interfaces() override;
   std::vector<hardware_interface::CommandInterface> export_command_interfaces() override;
 
@@ -67,7 +71,21 @@ public:
   hardware_interface::return_type write(
     const rclcpp::Time & time, const rclcpp::Duration & period) override;
 
+  hardware_interface::return_type prepare_command_mode_switch(
+    const std::vector<std::string> & start, const std::vector<std::string> & stop) override;
+  hardware_interface::return_type perform_command_mode_switch(
+    const std::vector<std::string> & start, const std::vector<std::string> & stop) override;
+
 protected:
+  virtual int64_t pairSteadyNow() const noexcept {
+    return std::chrono::steady_clock::now().time_since_epoch().count();
+  }
+  virtual CommandPublishResult publishPairBatch(const PublishedCommand * packets) {
+    if (control_streams_.size() != 1 || !control_streams_[0].streamer) {
+      return CommandPublishResult::kNotPublished;
+    }
+    return control_streams_[0].streamer->publishCommandBatch(packets);
+  }
   virtual std::shared_ptr<CanBus> makeBus(CanFrameFormat format);
   // Preparation seams: run for all buses before the first CAN enable.
   virtual std::unique_ptr<StreamTrace> prepareTimingTrace(size_t cycles, size_t axes)
@@ -88,6 +106,7 @@ protected:
   virtual void onStreamStats(const std::string & /*bus_name*/, const StreamStats & /*stats*/) {}
 
 private:
+  friend struct PairSystemTestAccess;
   struct WorkerTimingCycle
   {
     uint64_t cycle = 0;
@@ -146,6 +165,27 @@ private:
   };
 
   bool parseConfig();
+  bool configurePair();
+  hardware_interface::return_type writePair(int64_t now);
+  void savePairRecords();
+  bool pair_mode_ = false;
+  std::atomic<bool> pair_claimed_{false}, pair_terminal_{false};
+  double pair_generation_ = 0, pair_accepted_ = 0;
+  int64_t pair_activation_ns_ = 0;
+  PairCommit pair_commit_;
+  std::array<std::string, 11> pair_keys_;
+  struct PairRecord {
+    uint64_t cycle = 0, previous = 0, accepted = 0;
+    double received = 0;
+    PairCommit::Values values{};
+    int64_t inspected_ns = 0, accepted_ns = 0, published_ns = 0;
+    PairCommit::Reason reason = PairCommit::Reason::kBootWait;
+    CommandPublishResult result = CommandPublishResult::kNotPublished;
+  };
+  std::vector<PairRecord> pair_records_;
+  size_t pair_record_count_ = 0;
+  bool pair_records_saved_ = true;
+
   bool startStream(const std::string & bus_name, const std::vector<size_t> & indices);
   // Runs on the send thread of a streamed bus once per cycle.
   bool streamCycle(

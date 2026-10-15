@@ -1683,5 +1683,65 @@ TEST(BusStreamerWrite, StopWakesAnIdleTxWithoutAwaitingItsWatchdog)
   EXPECT_FALSE(streamer->publishCommands(&packet));
 }
 
+TEST(PairPublication, ThreePublishOutcomesAreDistinct)
+{
+  Rig rig({1, 2});
+  auto storage = std::make_unique<WriteStreamStorage>(2);
+  auto * raw = storage.get();
+  auto streamer = rig.makeStreamer(writeConfig(), nullptr, std::move(storage));
+  std::array<PublishedCommand, 2> batch{};
+  EXPECT_EQ(streamer->publishCommandBatch(batch.data()), CommandPublishResult::kNotPublished);
+  EXPECT_EQ(raw->commands.version(), 0U);
+  ASSERT_TRUE(streamer->start());
+  ASSERT_TRUE(streamer->waitForFirstFeedback(100ms));
+  streamer->armWrites();
+  for (auto & packet : batch) {
+    packet.sequence = 1; packet.published_ns = clock_type::now().time_since_epoch().count();
+  }
+  EXPECT_EQ(streamer->publishCommandBatch(batch.data()), CommandPublishResult::kSnapshotPublished);
+  const auto version = raw->commands.version();
+  int descriptors[2]; ASSERT_EQ(::pipe(descriptors), 0);
+  ASSERT_EQ(::dup2(descriptors[0], raw->event_fd), raw->event_fd);
+  ::close(descriptors[0]); ::close(descriptors[1]);
+  for (auto & packet : batch) {packet.sequence = 2;}
+  EXPECT_EQ(streamer->publishCommandBatch(batch.data()), CommandPublishResult::kSnapshotPublishedNotifyFailed);
+  EXPECT_GT(raw->commands.version(), version);
+  std::array<PublishedCommand, 2> read{}; ASSERT_TRUE(raw->commands.tryRead(read.data()));
+  EXPECT_EQ(read[0].sequence, 2U); EXPECT_EQ(read[1].sequence, 2U);
+  streamer->stop();
+}
+TEST(PairPublication, ArmUsesFixedActivationOrigin)
+{
+  Rig rig({1, 2}); auto config = writeConfig();
+  config.activation_origin_ns = clock_type::now().time_since_epoch().count() - 1000000000;
+  auto streamer = rig.makeStreamer(config);
+  ASSERT_TRUE(streamer->start());
+  ASSERT_TRUE(rig.waitForStop(500ms).has_value());  // G expires even before armWrites.
+  streamer->armWrites(); streamer->stop();
+  EXPECT_EQ(streamer->trace().writes_armed_steady_ns, config.activation_origin_ns);
+  EXPECT_EQ(streamer->stats().fault, StreamFault::kStartupTimeout);
+}
+
+TEST(PairPublication, BootstrapUsesPreparedFeedbackNotUncommittedStage)
+{
+  Rig rig({1, 2}); auto config = writeConfig();
+  auto storage = std::make_unique<WriteStreamStorage>(2);
+  storage->tx_feedback[0].feedback.position = .25;
+  storage->tx_feedback[0].feedback.valid = true;
+  storage->tx_feedback[1].feedback.position = -.25;
+  storage->tx_feedback[1].feedback.valid = true;
+  auto streamer = rig.makeStreamer(config, nullptr, std::move(storage));
+  const auto expected1 = rig.drivers[0]->encodeControlBlock(.25, 0, 0, 0, 0);
+  const auto expected2 = rig.drivers[1]->encodeControlBlock(-.25, 0, 0, 0, 0);
+  ASSERT_TRUE(expected1); ASSERT_TRUE(expected2);
+  ASSERT_TRUE(streamer->start()); ASSERT_TRUE(streamer->waitForFirstFeedback(100ms));
+  streamer->stop();
+  const auto sent = rig.link.sent();
+  const auto frame = std::find_if(sent.begin(), sent.end(), [](const auto & f) {return f.id == 0x7FF;});
+  ASSERT_NE(frame, sent.end());
+  EXPECT_TRUE(std::equal(expected1->begin(), expected1->end(), frame->data.begin()));
+  EXPECT_TRUE(std::equal(expected2->begin(), expected2->end(), frame->data.begin() + 8));
+}
+
 }  // namespace
 }  // namespace bxi_hardware

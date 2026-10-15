@@ -95,8 +95,11 @@ enum class StreamFault
 
 const char * streamFaultName(StreamFault fault);
 
+enum class CommandPublishResult {kNotPublished, kSnapshotPublished, kSnapshotPublishedNotifyFailed};
+
 struct StreamConfig
 {
+  int64_t activation_origin_ns = 0;  // G only; zero retains legacy armWrites origin.
   bool control_trace = false;
   bool write_triggered = false;
   bool direct_feedback = false;  // periodic TX + direct RX is supported for comparisons.
@@ -294,6 +297,7 @@ public:
   void requestStop();
   // Single control-thread writer. Scratch values supplied by HWIF, already allocated.
   bool publishCommands(const PublishedCommand * commands);
+  CommandPublishResult publishCommandBatch(const PublishedCommand * commands);
   bool readFeedback(size_t axis, PublishedFeedback & scratch, unsigned * attempts = nullptr) const;
   void setControlUnavailable(size_t axis, bool unavailable);
   bool controlUnavailable(size_t axis) const;

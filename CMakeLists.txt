@@ -31,6 +31,7 @@ add_library(${BXI_HW_LIB} SHARED
   src/bus_streamer.cpp
   src/stream_trace_io.cpp
   src/bxi_system_interface.cpp
+  src/pair_system_interface.cpp
   src/hil_trajectory.cpp
 )
 target_include_directories(${BXI_HW_LIB} PUBLIC
@@ -122,6 +123,14 @@ if(BUILD_TESTING)
   ament_add_gtest(test_stream_trace_io test/test_stream_trace_io.cpp)
   target_link_libraries(test_stream_trace_io ${BXI_HW_LIB} yaml-cpp)
   set_target_properties(test_stream_trace_io PROPERTIES BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}")
+  ament_add_gtest(test_pair_system test/test_pair_system.cpp)
+  target_link_libraries(test_pair_system ${BXI_HW_LIB})
+  ament_target_dependencies(test_pair_system hardware_interface rclcpp rclcpp_lifecycle)
+  target_compile_definitions(test_pair_system PRIVATE BXI_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+
+  ament_add_gtest(test_pair_commit test/test_pair_commit.cpp)
+  target_link_libraries(test_pair_commit ${BXI_HW_LIB})
+
   ament_add_gtest(test_atomic_snapshot test/test_atomic_snapshot.cpp)
   target_link_libraries(test_atomic_snapshot ${BXI_HW_LIB})
   ament_add_gtest(test_bus_streamer test/test_bus_streamer.cpp)

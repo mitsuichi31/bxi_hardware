@@ -913,17 +913,23 @@ void BxiBusStreamer::requestStop()
 }
 void BxiBusStreamer::armWrites()
 {
-  trace_.writes_armed_steady_ns = clock_type::now().time_since_epoch().count();
+  trace_.writes_armed_steady_ns = config_.activation_origin_ns ? config_.activation_origin_ns :
+    clock_type::now().time_since_epoch().count();
   writes_armed_ns_ = trace_.writes_armed_steady_ns;
   notify();
 }
 bool BxiBusStreamer::publishCommands(const PublishedCommand * commands)
 {
+  return publishCommandBatch(commands) == CommandPublishResult::kSnapshotPublished;
+}
+CommandPublishResult BxiBusStreamer::publishCommandBatch(const PublishedCommand * commands)
+{
   if (!config_.write_triggered || !writes_armed_ns_.load() ||
-    !tx_running_ || stop_all_->load()) {return false;}
+    !tx_running_ || stop_all_->load()) {return CommandPublishResult::kNotPublished;}
   write_storage_->commands.publish(commands);
   notify();
-  return !notification_failed_.load();
+  return notification_failed_.load() ? CommandPublishResult::kSnapshotPublishedNotifyFailed :
+    CommandPublishResult::kSnapshotPublished;
 }
 bool BxiBusStreamer::readFeedback(size_t axis, PublishedFeedback & scratch,
   unsigned * attempts) const
@@ -991,7 +997,8 @@ void BxiBusStreamer::sendWriteLoop()
       }
     }
     const bool active = schedule.sequence != 0;
-    const auto armed = writes_armed_ns_.load();
+    const auto armed = config_.activation_origin_ns ? config_.activation_origin_ns :
+      writes_armed_ns_.load();
     const bool startup_expired = !active && armed &&
       now >= armed + config_.first_write_timeout.count();
     const bool stale = active && now >= schedule.published_ns + config_.max_command_age.count();
