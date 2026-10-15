@@ -5,6 +5,8 @@
 #ifndef BXI_HARDWARE__HIL_TRAJECTORY_HPP_
 #define BXI_HARDWARE__HIL_TRAJECTORY_HPP_
 
+#include <optional>
+
 namespace bxi_hardware
 {
 namespace hil
@@ -44,6 +46,9 @@ public:
   SineTrajectory(
     double center, double amplitude, double frequency, double cycles, double ramp_cycles);
   Setpoint at(double t) const noexcept;
+  // Analytic acceleration, using the same clamped time and envelope as at(). RT-safe:
+  // no allocation, locks, I/O or exceptions. Invalid numeric inputs return NaN.
+  double accelerationAt(double t) const noexcept;
   double duration() const noexcept {return duration_;}
   // An upper bound of |target velocity| over the whole trajectory, including the envelope's
   // derivative while the amplitude ramps up and down:
@@ -52,14 +57,25 @@ public:
   // or A w without a ramp. Never below the true maximum, however short the ramp (sampling the
   // ramps would miss the peak of one shorter than the sampling step).
   double velocityUpperBound() const noexcept;
+  // NON-RT ONLY. An outward-rounded upper bound, NOT an estimate of the maximum.
+  // Isolates every possible stationary point analytically (no time sampling).
+  // Supported: finite center, A > 0, f > 0, ramp_cycles exactly 1 or 2, and integer
+  // flat cycles in [0, 20]. nullopt means unsupported/invalid input or overflow.
+  // Requires IEEE-754 double arithmetic without fast-math; no controller calls this yet.
+  std::optional<double> accelerationUpperBound() const;
 
 private:
+  struct Envelope {double a; double da; double dda;};
+  Envelope envelope(double t, bool second_derivative) const noexcept;
   double center_;
   double amplitude_;
   double omega_;
   double ramp_;
   double flat_;
   double duration_;
+  double frequency_;
+  double cycles_;
+  double ramp_cycles_;
 };
 
 // Torque added in the direction of the target velocity (sine_command.py's friction_torque,
