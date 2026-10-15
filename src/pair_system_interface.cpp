@@ -14,12 +14,12 @@ namespace
 constexpr const char * fields[] = {"position", "velocity", "kp", "kd", "effort"};
 // Mode-switch exposes names, not owners. This tests only the requested key set.
 bool complete(const std::vector<std::string> & request,
-  const std::array<std::string, 11> & expected)
+  const std::array<std::string, PairCommit::kMaxValues + 1> & expected, size_t count)
 {
   if (request.empty()) {return true;}
-  if (request.size() != expected.size()) {return false;}
-  for (const auto & key : expected) {
-    if (std::count(request.begin(), request.end(), key) != 1) {return false;}
+  if (request.size() != count) {return false;}
+  for (size_t i = 0; i < count; ++i) {
+    if (std::count(request.begin(), request.end(), expected[i]) != 1) {return false;}
   }
   return true;
 }
@@ -50,12 +50,10 @@ bool BxiSystemInterface::configurePair()
     gpio->command_interfaces[0].name != "commit_generation" ||
     gpio->state_interfaces[0].name != "accepted_generation" ||
     gpio->command_interfaces[0].data_type != "double" ||
-    gpio->state_interfaces[0].data_type != "double" || n_joints_ != 2 ||
-    info_.joints[0].name != "joint1" || info_.joints[1].name != "joint2" ||
+    gpio->state_interfaces[0].data_type != "double" ||
+    n_joints_ < 2 || n_joints_ > PairCommit::kMaxAxes ||
     active_buses_.size() != 1 || active_buses_[0] != "can0" ||
-    joints_[0].can_bus != "can0" || joints_[1].can_bus != "can0" ||
-    !joints_[0].enabled || !joints_[1].enabled || joints_[0].can_id != 1 ||
-    joints_[1].can_id != 2 || bus_formats_.at("can0") != CanFrameFormat::kFdBrs)
+    bus_formats_.at("can0") != CanFrameFormat::kFdBrs)
   {return false;}
   const auto bus = bus_transport_.find("can0");
   if (bus == bus_transport_.end() || !bus->second.separate || !bus->second.broadcast ||
@@ -63,10 +61,12 @@ bool BxiSystemInterface::configurePair()
     bus->second.stream_command_max_age_ms != 5.0 || bus->second.stream_feedback_max_age_ms != 3.0)
   {return false;}
   PairCommit::Bounds bounds;
-  for (size_t axis = 0; axis < 2; ++axis) {
+  for (size_t axis = 0; axis < n_joints_; ++axis) {
     const auto & joint = info_.joints[axis];
     const auto & runtime = joints_[axis];
-    if (joint.command_interfaces.size() != 5 || !loadSpec(runtime.motor_type)) {return false;}
+    if (joint.name != "joint" + std::to_string(axis + 1) || runtime.can_bus != "can0" ||
+      !runtime.enabled || runtime.can_id != static_cast<int>(axis + 1) ||
+      joint.command_interfaces.size() != 5 || !loadSpec(runtime.motor_type)) {return false;}
     const auto & spec = specs_.at(runtime.motor_type);
     const auto * driver = dynamic_cast<const BxiActuatorDriver *>(runtime.actuator.get());
     const double offset = driver ? driver->effectiveAngleOffset() : runtime.offset_angle;
@@ -95,7 +95,8 @@ bool BxiSystemInterface::configurePair()
       {return false;}
     }
   }
-  pair_keys_[10] = "bxi_pair/commit_generation";
+  if (!pair_commit_.axes(n_joints_)) {return false;}
+  pair_keys_[pair_commit_.valueCount()] = "bxi_pair/commit_generation";
   pair_commit_.bounds(bounds);
   return true;
 }
@@ -104,7 +105,8 @@ hardware_interface::return_type BxiSystemInterface::prepare_command_mode_switch(
   const std::vector<std::string> & start, const std::vector<std::string> & stop)
 {
   if (!pair_mode_) {return hardware_interface::return_type::OK;}
-  if (!complete(start, pair_keys_) || !complete(stop, pair_keys_) ||
+  if (!complete(start, pair_keys_, pair_commit_.valueCount() + 1) ||
+    !complete(stop, pair_keys_, pair_commit_.valueCount() + 1) ||
     (!start.empty() && (pair_terminal_ || pair_claimed_ || !stop.empty())) ||
     (!stop.empty() && !pair_claimed_))
   {return hardware_interface::return_type::ERROR;}
@@ -126,7 +128,7 @@ hardware_interface::return_type BxiSystemInterface::writePair(int64_t now)
   PairRecord row;
   row.cycle = control_sequence_; row.received = pair_generation_;
   row.previous = pair_commit_.last(); row.inspected_ns = now;
-  for (size_t axis = 0; axis < 2; ++axis) {
+  for (size_t axis = 0; axis < n_joints_; ++axis) {
     const size_t i = axis * 5;
     row.values[i] = cmd_pos_[axis]; row.values[i + 1] = cmd_vel_[axis];
     row.values[i + 2] = cmd_kp_[axis]; row.values[i + 3] = cmd_kd_[axis];
@@ -136,15 +138,15 @@ hardware_interface::return_type BxiSystemInterface::writePair(int64_t now)
   row.reason = pair_claimed_ ? pair_commit_.inspect(pair_generation_, row.values, now) :
     PairCommit::Reason::kNotClaimed;
   if (row.reason == PairCommit::Reason::kAccepted) {
-    std::array<PublishedCommand, 2> packets;
-    for (size_t axis = 0; axis < 2; ++axis) {
+    std::array<PublishedCommand, PairCommit::kMaxAxes> packets{};
+    for (size_t axis = 0; axis < n_joints_; ++axis) {
       const size_t i = axis * 5;
       packets[axis].command = {row.values[i], row.values[i + 1], row.values[i + 2],
         row.values[i + 3], row.values[i + 4]};
       packets[axis].sequence = static_cast<uint64_t>(pair_generation_);
     }
     row.published_ns = pairSteadyNow();
-    for (auto & packet : packets) {packet.published_ns = row.published_ns;}
+    for (size_t axis = 0; axis < n_joints_; ++axis) {packets[axis].published_ns = row.published_ns;}
     // Recheck the fixed initial deadline at batch completion, not only at write entry.
     row.reason = pair_commit_.inspect(pair_generation_, row.values, row.published_ns);
     if (row.reason == PairCommit::Reason::kAccepted) {
@@ -182,14 +184,14 @@ void BxiSystemInterface::savePairRecords()
   out << "#dropped=" << (pair_record_count_ > pair_records_.size() ?
     pair_record_count_ - pair_records_.size() : 0) << '\n';
   out << "cycle,received_g,previous_L,accepted_g,reason,inspected_ns,accepted_ns,published_ns,publish_result";
-  for (size_t i = 0; i < 10; ++i) {out << ",value" << i;}
+  for (size_t i = 0; i < pair_commit_.valueCount(); ++i) {out << ",value" << i;}
   out << '\n' << std::setprecision(17);
   for (size_t i = 0; i < std::min(pair_record_count_, pair_records_.size()); ++i) {
     const auto & row = pair_records_[i];
     out << row.cycle << ',' << row.received << ',' << row.previous << ',' << row.accepted << ',' <<
       static_cast<unsigned>(row.reason) << ',' << row.inspected_ns << ',' << row.accepted_ns << ',' << row.published_ns << ',' <<
       static_cast<unsigned>(row.result);
-    for (const auto value : row.values) {out << ',' << value;}
+    for (size_t field = 0; field < pair_commit_.valueCount(); ++field) {out << ',' << row.values[field];}
     out << '\n';
   }
   out.flush();

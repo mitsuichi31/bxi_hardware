@@ -173,7 +173,7 @@ private:
   double pair_generation_ = 0, pair_accepted_ = 0;
   int64_t pair_activation_ns_ = 0;
   PairCommit pair_commit_;
-  std::array<std::string, 11> pair_keys_;
+  std::array<std::string, PairCommit::kMaxValues + 1> pair_keys_;
   struct PairRecord {
     uint64_t cycle = 0, previous = 0, accepted = 0;
     double received = 0;

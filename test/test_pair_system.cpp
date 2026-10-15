@@ -2,6 +2,8 @@
 #include <fstream>
 #include <algorithm>
 #include <limits>
+#include <cstdlib>
+#include <filesystem>
 #include "bxi_hardware/bxi_system_interface.hpp"
 #include "hardware_interface/resource_manager.hpp"
 namespace bxi_hardware
@@ -12,6 +14,12 @@ struct PairSystemTestAccess
     s.pair_commit_.reset(1000000000, 20000000);
     s.pair_records_.resize(2); s.pair_record_count_ = 0;
   }
+  static void save(BxiSystemInterface & s, const std::string & directory) {
+    std::filesystem::create_directories(directory);
+    s.worker_timing_dir_ = directory; s.pair_records_saved_ = false;
+    s.savePairRecords();
+  }
+  static void capacity(BxiSystemInterface & s, size_t capacity) {s.pair_records_.resize(capacity);}
   static auto write(BxiSystemInterface & s, int64_t now) {return s.writePair(now);}
   static auto reason(const BxiSystemInterface & s) {return s.pair_records_[0].reason;}
   static size_t count(const BxiSystemInterface & s) {return s.pair_record_count_;}
@@ -21,7 +29,7 @@ namespace
 {
 using H = hardware_interface::CallbackReturn;
 using Ret = hardware_interface::return_type;
-hardware_interface::HardwareInfo info(bool pair = true, bool gpio = true)
+hardware_interface::HardwareInfo info(bool pair = true, bool gpio = true, size_t axes = 2)
 {
   const auto path = ::testing::TempDir() + "pair_system.yaml";
   std::ofstream out(path);
@@ -30,7 +38,7 @@ hardware_interface::HardwareInfo info(bool pair = true, bool gpio = true)
     "  can0: {rx_mode: separate, tx_frame: broadcast, tx_trigger: write, "
     "stream_feedback_max_age_ms: 3, stream_command_max_age_ms: 5, "
     "stream_write_grace_ms: 0.2, stream_first_write_timeout_ms: 20}\njoints:\n";
-  for (int axis = 1; axis <= 2; ++axis) {
+  for (size_t axis = 1; axis <= axes; ++axis) {
     out << "  joint" << axis << ": {enabled: true, can_bus: can0, can_id: " << axis <<
       ", motor_dir: 1, motor_type: MOTOR_70, lower: -1.0, upper: 1.0}\n";
   }
@@ -40,8 +48,8 @@ hardware_interface::HardwareInfo info(bool pair = true, bool gpio = true)
   h.hardware_parameters["config_file"] = path;
   h.hardware_parameters["spec_dir"] = std::string(BXI_TEST_SOURCE_DIR) + "/config/specs";
   if (pair) {h.hardware_parameters["command_commit_mode"] = "pair_generation_v1";}
-  for (const auto & name : {"joint1", "joint2"}) {
-    hardware_interface::ComponentInfo joint; joint.name = name; joint.type = "joint";
+  for (size_t axis = 1; axis <= axes; ++axis) {
+    hardware_interface::ComponentInfo joint; joint.name = "joint" + std::to_string(axis); joint.type = "joint";
     for (const auto & field : {"position", "velocity", "kp", "kd", "effort"}) {
       hardware_interface::InterfaceInfo interface;
       interface.name = field; interface.data_type = "double";
@@ -128,12 +136,13 @@ class PairHarness : public BxiSystemInterface
 public:
   int64_t now = 1000000100;
   unsigned publications = 0;
-  std::array<PublishedCommand, 2> last{};
+  std::array<PublishedCommand, PairCommit::kMaxAxes> last{};
+  size_t axes = 2;
   CommandPublishResult result = CommandPublishResult::kSnapshotPublished;
 protected:
   int64_t pairSteadyNow() const noexcept override {return now;}
   CommandPublishResult publishPairBatch(const PublishedCommand * packets) override {
-    ++publications; std::copy(packets, packets + 2, last.begin()); return result;
+    ++publications; std::copy(packets, packets + axes, last.begin()); return result;
   }
 };
 TEST(PairSystem, SameGenerationDoesNotPublishOrRefreshTimestamp)
@@ -186,6 +195,150 @@ TEST(PairSystem, RejectedSetterSeamDoesNotProduceNormalCommit)
     EXPECT_EQ(PairSystemTestAccess::last(s), 0U);
   }
 }
+// This same test is run against f4bd290 before production changes and after the refactor.
+TEST(PairN2Regression, DeterministicPublicationAndCsvFixtures)
+{
+  const char * directory = std::getenv("BXI_N_AXIS_OUTPUT_DIR");
+  const std::string output = directory ? directory : ::testing::TempDir() + "pair_regression";
+  std::filesystem::create_directories(output);
+  for (int scenario = 0; scenario < 10; ++scenario) {
+    PairHarness s; ASSERT_EQ(s.on_init(info()), H::SUCCESS); PairSystemTestAccess::arm(s);
+    PairSystemTestAccess::capacity(s, scenario == 9 ? 2 : 8);
+    ASSERT_EQ(s.perform_command_mode_switch(keys(s), {}), Ret::OK);
+    auto commands = s.export_command_interfaces();
+    for (size_t i = 0; i < 10; ++i) {ASSERT_TRUE(commands[i].set_value(0.));}
+    ASSERT_TRUE(commands[10].set_value(1.));
+    if (scenario == 1) {s.result = CommandPublishResult::kNotPublished;}
+    if (scenario == 2) {s.result = CommandPublishResult::kSnapshotPublishedNotifyFailed;}
+    if (scenario == 3) {s.now = 1020000000;}
+    PairSystemTestAccess::write(s, s.now);
+    for (int step = 0; step < 4; ++step) {
+      s.now += 1000;
+      const double generation = scenario == 4 ? 1 : scenario == 5 ? 3 :
+        scenario == 6 ? 0 : scenario == 7 ? 1.5 : 2 + step;
+      ASSERT_TRUE(commands[10].set_value(generation));
+      if (scenario == 8) {ASSERT_TRUE(commands[9].set_value(std::numeric_limits<double>::quiet_NaN()));}
+      PairSystemTestAccess::write(s, s.now);
+    }
+    PairSystemTestAccess::save(s, output + "/scenario" + std::to_string(scenario));
+    std::ofstream trace(output + "/publication" + std::to_string(scenario) + ".txt");
+    trace << s.publications << ',' << PairSystemTestAccess::last(s) << '\n';
+    for (size_t i = 0; i < 2; ++i) {
+      const auto & packet = s.last[i];
+      trace << packet.sequence << ',' << packet.published_ns << '\n';
+    }
+  }
+}
+TEST(PairN3System, ExportAndPublishAllAxesWithOneGenerationAndClock)
+{
+  PairHarness s; s.axes = 3; ASSERT_EQ(s.on_init(info(true, true, 3)), H::SUCCESS);
+  ASSERT_EQ(s.on_configure(rclcpp_lifecycle::State()), H::SUCCESS);
+  EXPECT_EQ(s.export_state_interfaces().size(), 13U);
+  auto commands = s.export_command_interfaces(); ASSERT_EQ(commands.size(), 16U);
+  PairSystemTestAccess::arm(s); ASSERT_EQ(s.perform_command_mode_switch(keys(s), {}), Ret::OK);
+  for (size_t i = 0; i < 15; ++i) {ASSERT_TRUE(commands[i].set_value(i % 5 == 0 ? .01 * i : 0));}
+  ASSERT_TRUE(commands[15].set_value(1.)); PairSystemTestAccess::write(s, s.now);
+  ASSERT_EQ(s.publications, 1U);
+  for (size_t i = 0; i < 3; ++i) {
+    EXPECT_DOUBLE_EQ(s.last[i].command.position, .05 * i);
+    EXPECT_EQ(s.last[i].sequence, 1U); EXPECT_EQ(s.last[i].published_ns, s.now);
+  }
+  EXPECT_DOUBLE_EQ(s.export_state_interfaces().back().get_optional().value(), 1);
+  s.now += 1000; ASSERT_TRUE(commands[10].set_value(.25));
+  PairSystemTestAccess::write(s, s.now); EXPECT_EQ(s.publications, 1U);
+  ASSERT_TRUE(commands[15].set_value(2.)); PairSystemTestAccess::write(s, s.now);
+  ASSERT_EQ(s.publications, 2U); EXPECT_DOUBLE_EQ(s.last[2].command.position, .25);
+  for (const auto & packet : s.last) {EXPECT_EQ(packet.sequence, 2U);}
+  const char * directory = std::getenv("BXI_N_AXIS_OUTPUT_DIR");
+  const auto output = directory ? std::string(directory) + "/n3" : ::testing::TempDir() + "pair_n3_csv";
+  PairSystemTestAccess::save(s, output);
+  std::ifstream csv(output + "/pair_commits.csv");
+  std::string line; ASSERT_TRUE(std::getline(csv, line)); EXPECT_EQ(line, "#dropped=1");
+  ASSERT_TRUE(std::getline(csv, line)); EXPECT_EQ(std::count(line.begin(), line.end(), ','), 23);
+  EXPECT_NE(line.find(",value14"), std::string::npos); EXPECT_EQ(line.find("value15"), std::string::npos);
+  for (int i = 0; i < 2; ++i) {ASSERT_TRUE(std::getline(csv, line)); EXPECT_EQ(std::count(line.begin(), line.end(), ','), 23);}
+}
+TEST(PairN3System, EveryFieldAndCommitSetterRefusalPreventsPublication)
+{
+  for (size_t refused = 0; refused < 16; ++refused) {
+    PairHarness s; s.axes = 3; ASSERT_EQ(s.on_init(info(true, true, 3)), H::SUCCESS);
+    PairSystemTestAccess::arm(s); ASSERT_EQ(s.perform_command_mode_switch(keys(s), {}), Ret::OK);
+    auto commands = s.export_command_interfaces(); bool valid = true;
+    for (size_t i = 0; i < 15; ++i) {
+      if (i == refused || !commands[i].set_value(0.)) {valid = false;}
+    }
+    if (valid && refused != 15) {ASSERT_TRUE(commands[15].set_value(1.));}
+    PairSystemTestAccess::write(s, s.now); EXPECT_EQ(s.publications, 0U);
+    EXPECT_EQ(PairSystemTestAccess::last(s), 0U);
+  }
+}
+TEST(PairN3System, EveryStoredFieldInvalidityRejectsWholeBatch)
+{
+  for (size_t field = 0; field < 15; ++field) {
+    PairHarness s; s.axes = 3; ASSERT_EQ(s.on_init(info(true, true, 3)), H::SUCCESS);
+    PairSystemTestAccess::arm(s); ASSERT_EQ(s.perform_command_mode_switch(keys(s), {}), Ret::OK);
+    auto commands = s.export_command_interfaces();
+    for (size_t i = 0; i < 15; ++i) {ASSERT_TRUE(commands[i].set_value(0.));}
+    ASSERT_TRUE(commands[field].set_value(std::numeric_limits<double>::quiet_NaN()));
+    ASSERT_TRUE(commands[15].set_value(1.)); PairSystemTestAccess::write(s, s.now);
+    EXPECT_EQ(s.publications, 0U); EXPECT_EQ(PairSystemTestAccess::reason(s), PairCommit::Reason::kInvalidBatch);
+  }
+}
+TEST(PairN3System, CompleteSetsRejectEveryMissingExtraDuplicateAndTerminate)
+{
+  BxiSystemInterface s; ASSERT_EQ(s.on_init(info(true, true, 3)), H::SUCCESS);
+  auto full = keys(s); ASSERT_EQ(full.size(), 16U);
+  EXPECT_EQ(s.perform_command_mode_switch({}, {}), Ret::OK);
+  for (size_t index = 0; index < 16; ++index) {
+    auto partial = full; partial.erase(partial.begin() + index);
+    auto duplicate = full; duplicate[index] = full[(index + 1) % 16];
+    auto extra = full; extra.push_back("other/position");
+    for (const auto & invalid : {partial, duplicate, extra}) {
+      EXPECT_EQ(s.prepare_command_mode_switch(invalid, {}), Ret::ERROR);
+      EXPECT_EQ(s.perform_command_mode_switch(invalid, {}), Ret::ERROR);
+    }
+  }
+  ASSERT_EQ(s.perform_command_mode_switch(full, {}), Ret::OK);
+  EXPECT_EQ(s.prepare_command_mode_switch(full, full), Ret::ERROR);
+  EXPECT_EQ(s.prepare_command_mode_switch(full, {}), Ret::ERROR);
+  for (size_t index = 0; index < 16; ++index) {
+    auto partial = full; partial.erase(partial.begin() + index);
+    auto duplicate = full; duplicate[index] = full[(index + 1) % 16];
+    auto extra = full; extra.push_back("other/position");
+    for (const auto & invalid : {partial, duplicate, extra}) {
+      EXPECT_EQ(s.prepare_command_mode_switch({}, invalid), Ret::ERROR);
+      EXPECT_EQ(s.perform_command_mode_switch({}, invalid), Ret::ERROR);
+    }
+  }
+  EXPECT_EQ(s.perform_command_mode_switch({}, full), Ret::OK);
+  EXPECT_EQ(s.perform_command_mode_switch(full, {}), Ret::ERROR);
+}
+TEST(PairN3System, RejectsWrongCountsJointOrderAndIds)
+{
+  for (size_t count : {0U, 1U, 4U}) {
+    BxiSystemInterface s; EXPECT_EQ(s.on_init(info(true, true, count)), H::ERROR);
+  }
+  auto h = info(true, true, 3); std::swap(h.joints[1], h.joints[2]);
+  BxiSystemInterface wrong_order; EXPECT_EQ(wrong_order.on_init(h), H::ERROR);
+  h = info(true, true, 3);
+  // Give the third configured joint a different, nonduplicate CAN ID.
+  std::ifstream input(h.hardware_parameters.at("config_file"));
+  std::string yaml((std::istreambuf_iterator<char>(input)), {}); input.close();
+  const auto position = yaml.find("can_id: 3"); ASSERT_NE(position, std::string::npos);
+  yaml.replace(position, std::string("can_id: 3").size(), "can_id: 4");
+  std::ofstream output(h.hardware_parameters.at("config_file")); output << yaml; output.close();
+  BxiSystemInterface wrong_id; EXPECT_EQ(wrong_id.on_init(h), H::ERROR);
+  h = info(true, true, 3); h.joints[2].command_interfaces[4].max = "";
+  BxiSystemInterface missing; EXPECT_EQ(missing.on_init(h), H::ERROR);
+}
+TEST(PairN3System, LegacyJointCountsRemainUnrestrictedByCommitMode)
+{
+  for (size_t count : {1U, 2U, 3U, 4U}) {
+    BxiSystemInterface s; ASSERT_EQ(s.on_init(info(false, false, count)), H::SUCCESS);
+    EXPECT_EQ(s.export_command_interfaces().size(), 5 * count);
+    EXPECT_EQ(s.export_state_interfaces().size(), 4 * count);
+  }
+}
 // Limit observations deliberately use SKIP, never the successful acceptance count.
 TEST(PairLimits, AggregatedOwnersCannotBeDistinguished)
 {
@@ -216,6 +369,35 @@ TEST(PairLimits, OldFiniteValueWithDishonestCommitCannotBeDistinguished)
   ASSERT_TRUE(commands[10].set_value(2.)); PairSystemTestAccess::write(s, s.now + 1);
   ASSERT_EQ(s.publications, 2U);
   GTEST_SKIP() << "Observed limitation: old finite field plus dishonest commit accepted; not acceptance.";
+}
+TEST(PairN3Limits, AggregatedOwnersCannotBeDistinguished)
+{
+  BxiSystemInterface s; ASSERT_EQ(s.on_init(info(true, true, 3)), H::SUCCESS);
+  auto aggregate = keys(s); std::reverse(aggregate.begin(), aggregate.end());
+  ASSERT_EQ(s.prepare_command_mode_switch(aggregate, {}), Ret::OK);
+  GTEST_SKIP() << "Observed N=3 limitation: flattened A/B/C/D keys accepted; not acceptance.";
+}
+TEST(PairN3Limits, TransformedValidGenerationCannotBeDistinguished)
+{
+  PairHarness s; s.axes = 3; ASSERT_EQ(s.on_init(info(true, true, 3)), H::SUCCESS);
+  PairSystemTestAccess::arm(s); ASSERT_EQ(s.perform_command_mode_switch(keys(s), {}), Ret::OK);
+  auto commands = s.export_command_interfaces();
+  for (size_t i = 0; i < 15; ++i) {ASSERT_TRUE(commands[i].set_value(0.));}
+  ASSERT_TRUE(commands[15].set_value(std::floor(1.5)));
+  PairSystemTestAccess::write(s, s.now); ASSERT_EQ(s.publications, 1U);
+  GTEST_SKIP() << "Observed N=3 limitation: transformed 1.5->1 accepted; not acceptance.";
+}
+TEST(PairN3Limits, OldFiniteValueWithDishonestCommitCannotBeDistinguished)
+{
+  PairHarness s; s.axes = 3; ASSERT_EQ(s.on_init(info(true, true, 3)), H::SUCCESS);
+  PairSystemTestAccess::arm(s); ASSERT_EQ(s.perform_command_mode_switch(keys(s), {}), Ret::OK);
+  auto commands = s.export_command_interfaces();
+  for (size_t i = 0; i < 15; ++i) {ASSERT_TRUE(commands[i].set_value(0.));}
+  ASSERT_TRUE(commands[15].set_value(1.)); PairSystemTestAccess::write(s, s.now);
+  // No third-axis field is newly written, but a dishonest writer advances the generation.
+  ASSERT_TRUE(commands[15].set_value(2.)); PairSystemTestAccess::write(s, s.now + 1);
+  ASSERT_EQ(s.publications, 2U);
+  GTEST_SKIP() << "Observed N=3 limitation: old finite third-axis values accepted; not acceptance.";
 }
 TEST(PairSystem, ResourceManagerRejectsDuplicateKeyAndReleasesLoan)
 {

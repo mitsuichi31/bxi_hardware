@@ -1743,5 +1743,82 @@ TEST(PairPublication, BootstrapUsesPreparedFeedbackNotUncommittedStage)
   EXPECT_TRUE(std::equal(expected2->begin(), expected2->end(), frame->data.begin() + 8));
 }
 
+// In-memory transports only. These tests make no SocketCAN calls.
+TEST(PairN3Publication, BootstrapUsesAllThreePreparedPositions)
+{
+  Rig rig({1, 2, 3}); auto c = writeConfig();
+  auto storage = std::make_unique<WriteStreamStorage>(3);
+  const std::array<double, 3> positions{.25, -.25, .125};
+  for (size_t axis = 0; axis < 3; ++axis) {
+    storage->tx_feedback[axis].feedback.position = positions[axis];
+    storage->tx_feedback[axis].feedback.valid = true;
+  }
+  auto streamer = rig.makeStreamer(c, nullptr, std::move(storage));
+  ASSERT_TRUE(streamer->start()); ASSERT_TRUE(streamer->waitForFirstFeedback(100ms));
+  streamer->stop();
+  const auto sent = rig.link.sent();
+  auto frame = std::find_if(sent.begin(), sent.end(), [](const auto & f) {return f.id == 0x7FF;});
+  ASSERT_NE(frame, sent.end()); ASSERT_EQ(frame->dlc, 24);
+  for (size_t axis = 0; axis < 3; ++axis) {
+    const auto block = rig.drivers[axis]->encodeControlBlock(positions[axis], 0, 0, 0, 0);
+    ASSERT_TRUE(block); EXPECT_TRUE(std::equal(block->begin(), block->end(), frame->data.begin() + 8 * axis));
+  }
+}
+TEST(PairN3Publication, SnapshotEncodesAllThreeBlocksInOneFrame)
+{
+  Rig rig({1, 2, 3}); auto c = writeConfig();
+  auto storage = std::make_unique<WriteStreamStorage>(3); auto * raw = storage.get();
+  auto streamer = rig.makeStreamer(c, nullptr, std::move(storage));
+  ASSERT_TRUE(streamer->start()); ASSERT_TRUE(streamer->waitForFirstFeedback(100ms));
+  streamer->armWrites();
+  std::array<PublishedCommand, 3> batch{};
+  const auto published = clock_type::now().time_since_epoch().count();
+  for (size_t axis = 0; axis < 3; ++axis) {
+    batch[axis].command = {.1 * (axis + 1), 0, 10. + axis, 1, 0};
+    batch[axis].sequence = 7; batch[axis].published_ns = published;
+  }
+  ASSERT_EQ(streamer->publishCommandBatch(batch.data()), CommandPublishResult::kSnapshotPublished);
+  std::array<PublishedCommand, 3> adopted{}; ASSERT_TRUE(raw->commands.tryRead(adopted.data()));
+  for (const auto & packet : adopted) {EXPECT_EQ(packet.sequence, 7U); EXPECT_EQ(packet.published_ns, published);}
+  std::this_thread::sleep_for(20ms); streamer->stop();
+  const auto frames = rig.link.sent(); bool found = false;
+  for (const auto & frame : frames) {
+    if (frame.id != 0x7FF || frame.dlc != 24) {continue;}
+    bool matches = true;
+    for (size_t axis = 0; axis < 3; ++axis) {
+      const auto block = rig.drivers[axis]->encodeControlBlock(.1 * (axis + 1), 0, 10. + axis, 1, 0);
+      ASSERT_TRUE(block); matches &= std::equal(block->begin(), block->end(), frame.data.begin() + axis * 8);
+    }
+    found |= matches;
+  }
+  EXPECT_TRUE(found);
+  const auto & rows = streamer->trace().cycles;
+  auto row = std::find_if(rows.begin(), rows.end(), [](const auto & r) {
+      return r.send_kind == 2 && r.command_sequence == 7 && r.send_success;
+    });
+  ASSERT_NE(row, rows.end()); EXPECT_EQ(row->frames, 1U); EXPECT_EQ(row->command_published_ns, published);
+}
+TEST(PairN3Publication, ThirdAxisStaleUsesExistingFaultPath)
+{
+  Rig rig({1, 2, 3}); auto c = writeConfig();
+  c.period = 1ms; c.write_grace = 200us; c.max_feedback_age = 3ms;
+  c.max_command_age = 5ms; c.first_write_timeout = 1000ms;
+  auto streamer = rig.makeStreamer(c);
+  ASSERT_TRUE(streamer->start()); ASSERT_TRUE(streamer->waitForFirstFeedback(100ms));
+  streamer->armWrites(); rig.link.setRespondingIds({1, 2});
+  for (uint64_t generation = 1; generation < 200 && !rig.stop_all; ++generation) {
+    // The streamer may fault between the loop condition and publication; that rejection is expected.
+    std::array<PublishedCommand, 3> batch{};
+    const auto stamp = clock_type::now().time_since_epoch().count();
+    for (auto & packet : batch) {packet.sequence = generation; packet.published_ns = stamp;}
+    streamer->publishCommandBatch(batch.data());
+    std::this_thread::sleep_for(200us);
+  }
+  ASSERT_TRUE(rig.waitForStop(100ms).has_value()); streamer->stop();
+  EXPECT_EQ(streamer->stats().fault, StreamFault::kFeedbackStale);
+  EXPECT_EQ(streamer->stats().fault_axis, 2);
+  EXPECT_EQ(rig.drivers[2]->state(), ActuatorState::kSafeStopped);
+  // All-axis ERROR/safety delivery is outside b-1; do not assert it as implemented here.
+}
 }  // namespace
 }  // namespace bxi_hardware
