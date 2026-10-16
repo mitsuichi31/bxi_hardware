@@ -246,3 +246,24 @@ def test_trigger_cli_displays_record_and_does_not_retry_stop(monkeypatch,capsys,
         def failed(*args,**kwargs):raise RuntimeError('uncertain stop response')
         monkeypatch.setattr(rclpy,'spin_until_future_complete',failed)
         calls.clear();assert command.main(['stop'])==1;assert calls==['stop']
+
+
+@pytest.mark.parametrize('tool', [
+    'make_n_axis_config.py', 'n_axis_check_config.py',
+    'n_axis_command.py', 'n_axis_evaluate.py',
+])
+def test_entry_scripts_are_executable_and_run_directly(tool):
+    import os
+    import stat
+    from ament_index_python.packages import get_package_prefix
+
+    source = HERE / tool
+    installed = Path(get_package_prefix('bxi_hardware')) / 'lib/bxi_hardware' / tool
+    for entry in (source, installed):
+        real = entry.resolve(strict=True)
+        assert real.is_file(), str(real)
+        assert stat.S_IMODE(real.stat().st_mode) & 0o111 == 0o111, str(real)
+        assert os.access(real, os.X_OK), str(real)
+        result = subprocess.run([str(entry), '--help'], capture_output=True, text=True, timeout=10)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert 'usage:' in result.stdout.lower(), result.stdout
