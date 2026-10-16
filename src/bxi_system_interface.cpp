@@ -517,6 +517,7 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_activate(
   const auto activation_start = std::chrono::steady_clock::now();
   if (pair_mode_) {
     pair_activation_ns_ = activation_start.time_since_epoch().count();
+    pair_safety_.reset(pair_safety_.epoch + 1, n_joints_);
     const auto & transport = bus_transport_.at(joints_[0].can_bus);
     pair_commit_.reset(pair_activation_ns_, static_cast<int64_t>(transport.first_write_timeout_ms * 1.e6));
     pair_generation_ = pair_accepted_ = 0;
@@ -899,6 +900,10 @@ void BxiSystemInterface::releaseResources()
   }
   writeControlTiming();
   savePairRecords();
+  if (pair_mode_ && pair_safety_.requested() &&
+    (worker_timing_dir_.empty() || !pair_safety_.save(worker_timing_dir_ + "/pair_safety.csv"))) {
+    RCLCPP_ERROR(logger(), "group safety record incomplete, missing, or save failed");
+  }
   control_streams_.clear();
   prepared_write_storage_.clear();
   streamers_.clear();
@@ -1024,6 +1029,8 @@ bool BxiSystemInterface::startStream(
 
   StreamConfig config;
   config.activation_origin_ns = pair_mode_ ? pair_activation_ns_ : 0;
+  config.group_safety = pair_mode_ ? &pair_safety_ : nullptr;
+  config.safety_drain_timeout = pair_safety_drain_timeout_;
   config.write_triggered = transport.write_triggered;
   config.direct_feedback = transport.direct_feedback;
   config.write_grace = std::chrono::duration_cast<std::chrono::nanoseconds>(

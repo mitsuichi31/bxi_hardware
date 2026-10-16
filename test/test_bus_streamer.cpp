@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstring>
 #include <functional>
+#include <fstream>
 #include <map>
 #include <limits>
 #include <memory>
@@ -23,6 +24,8 @@
 #include <gtest/gtest.h>
 
 #include "bxi_hardware/bus_streamer.hpp"
+#include "bxi_hardware/bxi_system_interface.hpp"
+#include <filesystem>
 #include "bxi_hardware/stream_trace_io.hpp"
 
 namespace bxi_hardware
@@ -31,6 +34,43 @@ struct AtomicSnapshotTestAccess
 {
   template<class T> static void pauseWriter(AtomicSnapshot<T> & value)
   {value.version_.store(value.version_.load() + 1);}
+};
+struct GroupSafetyTestAccess
+{
+  static void prepare(BxiBusStreamer & s) {
+    ASSERT_TRUE(s.validate());
+    for (auto * driver : s.drivers_) {s.can_ids_.push_back(driver->canId());}
+  }
+  static void perform(BxiBusStreamer & s) {s.performGroupSafety();}
+};
+struct PairSystemTestAccess
+{
+  static GroupSafety & safety(BxiSystemInterface & s) {return s.pair_safety_;}
+  static void attach(BxiSystemInterface & s, size_t n, std::unique_ptr<BxiBusStreamer> streamer,
+    std::shared_ptr<CanBus> tx, std::shared_ptr<CanBus> rx,
+    std::vector<std::unique_ptr<BxiActuatorDriver>> & drivers, const std::string & output) {
+    s.pair_mode_ = true; s.n_joints_ = n; s.pair_commit_.axes(n); s.pair_claimed_ = true;
+    s.joints_.resize(n); s.worker_timing_dir_ = output;
+    std::filesystem::create_directories(output);
+    s.bus_transport_["fake"].separate = true;
+    s.control_streams_.emplace_back(); s.control_streams_.back().streamer = streamer.get();
+    s.streamers_["fake"] = std::move(streamer); s.buses_["fake"] = tx; s.rx_buses_["fake"] = rx;
+    for (size_t axis = 0; axis < n; ++axis) {
+      s.joints_[axis].actuator = std::move(drivers[axis]); s.joints_[axis].name = "joint" + std::to_string(axis + 1);
+      s.live_joints_["fake"].push_back(axis);
+      const char * fields[] = {"position", "velocity", "kp", "kd", "effort"};
+      for (size_t field = 0; field < 5; ++field) {
+        s.pair_keys_[axis * 5 + field] = s.joints_[axis].name + "/" + fields[field];
+      }
+    }
+    s.pair_keys_[n * 5] = "bxi_pair/commit_generation";
+  }
+  static void request(BxiSystemInterface & s, bool mode) {
+    if (mode) {
+      std::vector<std::string> keys(s.pair_keys_.begin(), s.pair_keys_.begin() + s.n_joints_ * 5 + 1);
+      ASSERT_EQ(s.perform_command_mode_switch({}, keys), hardware_interface::return_type::OK);
+    } else {s.requestPairSafety(SafetySource::kHwFault, s.pairSteadyNow());}
+  }
 };
 namespace
 {
@@ -1820,5 +1860,217 @@ TEST(PairN3Publication, ThirdAxisStaleUsesExistingFaultPath)
   EXPECT_EQ(rig.drivers[2]->state(), ActuatorState::kSafeStopped);
   // All-axis ERROR/safety delivery is outside b-1; do not assert it as implemented here.
 }
+std::unique_ptr<WriteStreamStorage> safetyStorage(size_t n)
+{
+  auto storage = std::make_unique<WriteStreamStorage>(n);
+  for (size_t axis = 0; axis < n; ++axis) {
+    storage->tx_feedback[axis].feedback.valid = true;
+    storage->tx_feedback[axis].feedback.position = .1 * axis;
+  }
+  return storage;
+}
+class GroupSafetyAxes : public ::testing::TestWithParam<size_t> {};
+TEST_P(GroupSafetyAxes, ErrorGateAndOneAllAxisFrameSurviveStopFlags)
+{
+  const size_t n = GetParam(); Rig rig(n == 2 ? std::vector<int>{1, 2} : std::vector<int>{1, 2, 3});
+  GroupSafety safety; safety.reset(19, n); auto c = writeConfig(); c.group_safety = &safety;
+  auto storage = safetyStorage(n); auto streamer = rig.makeStreamer(c, nullptr, std::move(storage));
+  GroupSafetyTestAccess::prepare(*streamer);
+  const auto count = rig.link.sent().size();
+  ASSERT_TRUE(safety.request(19, SafetySource::kHwFault, 100, 101));
+  GroupSafetyTestAccess::perform(*streamer);
+  EXPECT_EQ(rig.link.sent().size(), count); EXPECT_EQ(safety.result, SafetyResult::kUnattempted);
+  rig.stop_all = true; streamer->requestStop();
+  safety.request(19, SafetySource::kWatchdog, 102, 103);
+  GroupSafetyTestAccess::perform(*streamer); EXPECT_FALSE(safety.send_attempted);
+  safety.observeError(clock_type::now().time_since_epoch().count());
+  GroupSafetyTestAccess::perform(*streamer);
+  ASSERT_EQ(safety.result, SafetyResult::kSucceeded); EXPECT_GT(safety.attempted_ns, safety.error_observed_ns);
+  EXPECT_GE(safety.completed_ns, safety.attempted_ns);
+  ASSERT_EQ(rig.link.sent().size(), count + 1);
+  const auto frame = rig.link.sent().back(); EXPECT_EQ(frame.id, 0x7FFU); EXPECT_EQ(frame.dlc, 8 * n);
+  for (size_t axis = 0; axis < n; ++axis) {
+    auto block = rig.drivers[axis]->encodeControlBlock(.1 * axis, 0, 0, 0, 0); ASSERT_TRUE(block);
+    EXPECT_TRUE(std::equal(block->begin(), block->end(), frame.data.begin() + 8 * axis));
+  }
+  safety.request(19, SafetySource::kWatchdog, 102, 103);
+  GroupSafetyTestAccess::perform(*streamer); EXPECT_EQ(rig.link.sent().size(), count + 1);
+  EXPECT_FALSE(safety.request(18, SafetySource::kModeStop, 103, 104));
+}
+TEST_P(GroupSafetyAxes, EveryAxisMaterialFailureAndSendFailureIsNotSuccess)
+{
+  const size_t n = GetParam();
+  for (size_t bad_axis = 0; bad_axis < n; ++bad_axis) {
+    for (int fault = 0; fault < 5; ++fault) {
+      Rig rig(n == 2 ? std::vector<int>{1, 2} : std::vector<int>{1, 2, 3});
+      GroupSafety safety; safety.reset(1, n); auto c = writeConfig(); c.group_safety = &safety;
+      auto storage = safetyStorage(n);
+      if (fault == 0) {storage->tx_feedback[bad_axis].feedback.valid = false;}
+      if (fault == 1) {storage->tx_feedback[bad_axis].feedback.position = std::numeric_limits<double>::quiet_NaN();}
+      if (fault == 2) {AtomicSnapshotTestAccess::pauseWriter(*storage->feedback[bad_axis]);}
+      if (fault == 3) {ASSERT_TRUE(rig.drivers[bad_axis]->disable().valid);}
+      if (fault == 4) {rig.link.send_ok = false;}
+      auto streamer = rig.makeStreamer(c, nullptr, std::move(storage)); GroupSafetyTestAccess::prepare(*streamer);
+      safety.request(1, SafetySource::kModeStop, 1, 2); GroupSafetyTestAccess::perform(*streamer);
+      EXPECT_EQ(safety.result, fault == 4 ? SafetyResult::kSendFailed : SafetyResult::kCannotGenerate);
+      EXPECT_EQ(safety.failure_axis, fault == 4 ? -1 : static_cast<int>(bad_axis));
+      EXPECT_FALSE(safety.send_success); EXPECT_EQ(safety.send_attempted, fault == 4);
+    }
+  }
+}
+TEST_P(GroupSafetyAxes, WakeWithoutAnotherWriteAndDrainBeforeJoin)
+{
+  const size_t n = GetParam();
+  for (int order = 0; order < 3; ++order) {
+    Rig rig(n == 2 ? std::vector<int>{1, 2} : std::vector<int>{1, 2, 3});
+    GroupSafety safety; safety.reset(2, n); auto c = writeConfig(); c.group_safety = &safety;
+    c.safety_drain_timeout = 100ms;
+    auto streamer = rig.makeStreamer(c, nullptr, safetyStorage(n));
+    ASSERT_TRUE(streamer->start()); ASSERT_TRUE(streamer->waitForFirstFeedback(100ms));
+    safety.request(2, SafetySource::kHwFault, 1, 2); streamer->notify();
+    if (order == 0) {rig.stop_all = true;}
+    if (order == 1) {streamer->requestStop();}
+    safety.observeError(clock_type::now().time_since_epoch().count()); streamer->notify();
+    streamer->stop();
+    EXPECT_EQ(safety.result, SafetyResult::kSucceeded); EXPECT_TRUE(safety.send_success);
+    EXPECT_FALSE(safety.drain_timed_out); EXPECT_TRUE(streamer->sendFinished());
+  }
+}
+TEST_P(GroupSafetyAxes, MissingErrorObservationTimesOutWithoutEarlySend)
+{
+  const size_t n = GetParam(); Rig rig(n == 2 ? std::vector<int>{1, 2} : std::vector<int>{1, 2, 3});
+  GroupSafety safety; safety.reset(2, n); auto c = writeConfig(); c.group_safety = &safety;
+  c.safety_drain_timeout = 2ms;
+  auto streamer = rig.makeStreamer(c, nullptr, safetyStorage(n));
+  ASSERT_TRUE(streamer->start()); ASSERT_TRUE(streamer->waitForFirstFeedback(100ms));
+  safety.request(2, SafetySource::kHwFault, 1, 2); streamer->notify(); streamer->stop();
+  EXPECT_TRUE(safety.drain_timed_out); EXPECT_EQ(safety.result, SafetyResult::kIncomplete);
+  EXPECT_FALSE(safety.send_attempted); EXPECT_EQ(safety.failure, SafetyFailure::kNoErrorObservation);
+}
+TEST_P(GroupSafetyAxes, WatchdogWithoutFurtherWritesHasOneSafetyResult)
+{
+  const size_t n = GetParam(); Rig rig(n == 2 ? std::vector<int>{1, 2} : std::vector<int>{1, 2, 3});
+  GroupSafety safety; safety.reset(3, n); auto c = writeConfig(); c.group_safety = &safety;
+  auto streamer = rig.makeStreamer(c, nullptr, safetyStorage(n));
+  ASSERT_TRUE(streamer->start()); ASSERT_TRUE(streamer->waitForFirstFeedback(100ms)); streamer->armWrites();
+  publishBatch(*streamer, n, 1);
+  ASSERT_TRUE(rig.waitForStop(500ms).has_value()); streamer->stop();
+  EXPECT_EQ(safety.sources, static_cast<uint32_t>(SafetySource::kWatchdog));
+  EXPECT_EQ(safety.result, SafetyResult::kSucceeded);
+  EXPECT_EQ(streamer->stats().command_stale_zero_gain_frames, 1U);
+  EXPECT_EQ(streamer->stats().fault, StreamFault::kCommandStale);
+  auto count = rig.link.sent().size(); safety.request(3, SafetySource::kHwFault, 1, 2);
+  safety.observeError(3); GroupSafetyTestAccess::perform(*streamer);
+  EXPECT_EQ(rig.link.sent().size(), count);
+}
+TEST_P(GroupSafetyAxes, UpperGenerationStillExpiresAtFiveMilliseconds)
+{
+  const size_t n = GetParam(); Rig rig(n == 2 ? std::vector<int>{1, 2} : std::vector<int>{1, 2, 3});
+  GroupSafety safety; safety.reset(7, n); auto c = writeConfig(); c.group_safety = &safety;
+  c.period = 1ms; c.write_grace = 200us; c.max_command_age = 5ms; c.max_feedback_age = 100ms;
+  auto streamer = rig.makeStreamer(c, nullptr, safetyStorage(n));
+  ASSERT_TRUE(streamer->start()); ASSERT_TRUE(streamer->waitForFirstFeedback(100ms)); streamer->armWrites();
+  publishBatch(*streamer, n, PairCommit::kMaxGeneration);
+  ASSERT_TRUE(rig.waitForStop(500ms).has_value()); streamer->stop();
+  EXPECT_EQ(safety.sources, static_cast<uint32_t>(SafetySource::kWatchdog));
+  EXPECT_EQ(safety.result, SafetyResult::kSucceeded);
+  EXPECT_EQ(safety.watchdog_sequence, PairCommit::kMaxGeneration);
+  EXPECT_GE(safety.attempted_ns - safety.watchdog_published_ns, 5000000);
+  EXPECT_EQ(streamer->stats().command_stale_zero_gain_frames, 1U);
+}
+TEST_P(GroupSafetyAxes, SeparateRecordCapacityAndSaveFailures)
+{
+  GroupSafety safety; safety.reset(4, GetParam()); safety.request(4, SafetySource::kModeStop, 1, 2);
+  safety.result = SafetyResult::kCannotGenerate; safety.completed_ns = 3;
+  const auto path = ::testing::TempDir() + "group_safety.csv";
+  EXPECT_TRUE(safety.save(path));
+  for (int i = 0; i < 10; ++i) {safety.request(4, SafetySource::kModeStop, 1, 2);}
+  EXPECT_TRUE(safety.save(path)); EXPECT_EQ(safety.requests, 11U); // One aggregate record, no overflow.
+  safety.record_capacity = 0; EXPECT_FALSE(safety.save(path));
+  EXPECT_FALSE(safety.save("/no_such_group_safety_directory/out.csv"));
+}
+class RefusedSafetyEncoder : public BxiBusStreamer
+{
+public:
+  using BxiBusStreamer::BxiBusStreamer;
+protected:
+  std::optional<std::array<uint8_t, 8>> encodeSafety(size_t, double) const override {return std::nullopt;}
+};
+TEST(GroupSafetyFaults, EncodeFailureAndUnavailableEventfdAreRecorded)
+{
+  for (size_t n : {2U, 3U}) {
+    Rig rig(n == 2 ? std::vector<int>{1, 2} : std::vector<int>{1, 2, 3});
+    GroupSafety safety; safety.reset(5, n); auto c = writeConfig(); c.group_safety = &safety;
+    std::vector<BxiActuatorDriver *> drivers; for (auto & driver : rig.drivers) {drivers.push_back(driver.get());}
+    RefusedSafetyEncoder refused(&rig.tx, &rig.rx, drivers, c,
+      [](const auto &, auto &) {return true;}, &rig.stop_all, safetyStorage(n));
+    GroupSafetyTestAccess::prepare(refused);
+    safety.request(5, SafetySource::kModeStop, 1, 2); GroupSafetyTestAccess::perform(refused);
+    EXPECT_EQ(safety.result, SafetyResult::kCannotGenerate); EXPECT_EQ(safety.failure, SafetyFailure::kEncode);
+    EXPECT_EQ(safety.failure_axis, 0); EXPECT_FALSE(safety.send_attempted);
+  }
+}
+TEST(GroupSafetyFaults, NotificationFailureStillAllowsRegisteredSafetyAtStop)
+{
+  for (size_t n : {2U, 3U}) {
+    Rig rig(n == 2 ? std::vector<int>{1, 2} : std::vector<int>{1, 2, 3});
+    GroupSafety safety; safety.reset(6, n); auto c = writeConfig(); c.group_safety = &safety;
+    auto storage = safetyStorage(n); auto * raw = storage.get();
+    auto streamer = rig.makeStreamer(c, nullptr, std::move(storage));
+    ASSERT_TRUE(streamer->start()); ASSERT_TRUE(streamer->waitForFirstFeedback(100ms));
+    safety.request(6, SafetySource::kHwFault, 1, 2);
+    int descriptors[2]; ASSERT_EQ(::pipe(descriptors), 0);
+    ASSERT_EQ(::dup2(descriptors[0], raw->event_fd), raw->event_fd);
+    ::close(descriptors[0]); ::close(descriptors[1]);
+    streamer->notify(); safety.observeError(clock_type::now().time_since_epoch().count());
+    streamer->stop();
+    EXPECT_EQ(safety.result, SafetyResult::kSucceeded); EXPECT_TRUE(safety.notification_failed);
+  }
+}
+class SafetyLifetimeBus : public FakeBus
+{
+public:
+  SafetyLifetimeBus(FakeLink & link, GroupSafety & safety) : FakeBus(link, "fake"), safety_(safety) {}
+  void close() override {
+    ++closes; closed_before_result |= !safety_.finished(); result_at_close = safety_.result.load();
+  }
+  int closes = 0; bool closed_before_result = false;
+  SafetyResult result_at_close = SafetyResult::kUnattempted;
+private:
+  GroupSafety & safety_;
+};
+TEST(GroupSafetyLifetime, HardwareDeactivateShutdownAndDestructionDrainBeforeClose)
+{
+  for (size_t n : {2U, 3U}) {
+    for (bool mode : {false, true}) {
+      for (int ending = 0; ending < 3; ++ending) {
+        Rig rig(n == 2 ? std::vector<int>{1, 2} : std::vector<int>{1, 2, 3});
+        auto system = std::make_unique<BxiSystemInterface>(); auto & safety = PairSystemTestAccess::safety(*system);
+        safety.reset(10, n);
+        auto tx = std::make_shared<SafetyLifetimeBus>(rig.link, safety);
+        auto rx = std::make_shared<SafetyLifetimeBus>(rig.link, safety);
+        auto c = writeConfig(); c.group_safety = &safety;
+        std::vector<BxiActuatorDriver *> drivers; for (auto & driver : rig.drivers) {drivers.push_back(driver.get());}
+        auto streamer = std::make_unique<BxiBusStreamer>(tx.get(), rx.get(), drivers, c,
+          [](const auto &, auto &) {return true;}, &rig.stop_all, safetyStorage(n));
+        ASSERT_TRUE(streamer->start()); ASSERT_TRUE(streamer->waitForFirstFeedback(100ms));
+        const char * base = std::getenv("BXI_N_AXIS_OUTPUT_DIR");
+        const auto output = (base ? std::string(base) : ::testing::TempDir()) + "/lifetime_" +
+          std::to_string(n) + "_" + std::to_string(mode) + "_" + std::to_string(ending);
+        PairSystemTestAccess::attach(*system, n, std::move(streamer), tx, rx, rig.drivers, output);
+        PairSystemTestAccess::request(*system, mode);
+        if (!mode) {system->on_error(rclcpp_lifecycle::State());}
+        if (ending == 0) {system->on_deactivate(rclcpp_lifecycle::State());}
+        if (ending == 1) {system->on_shutdown(rclcpp_lifecycle::State());}
+        system.reset();
+        EXPECT_GE(tx->closes, 1); EXPECT_GE(rx->closes, 1);
+        EXPECT_FALSE(tx->closed_before_result); EXPECT_FALSE(rx->closed_before_result);
+        EXPECT_EQ(tx->result_at_close, SafetyResult::kSucceeded);
+        std::ifstream saved(output + "/pair_safety.csv"); EXPECT_TRUE(saved.good());
+      }
+    }
+  }
+}
+INSTANTIATE_TEST_SUITE_P(TwoAndThree, GroupSafetyAxes, ::testing::Values(2U, 3U));
 }  // namespace
 }  // namespace bxi_hardware

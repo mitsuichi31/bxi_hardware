@@ -51,6 +51,7 @@ class BxiSystemInterface : public hardware_interface::SystemInterface
 {
 public:
   ~BxiSystemInterface() override;
+  hardware_interface::CallbackReturn on_error(const rclcpp_lifecycle::State & previous_state) override;
   hardware_interface::CallbackReturn on_shutdown(const rclcpp_lifecycle::State & previous_state) override;
   hardware_interface::CallbackReturn on_init(
     const hardware_interface::HardwareInfo & info) override;
@@ -166,6 +167,8 @@ private:
 
   bool parseConfig();
   bool configurePair();
+  void requestPairSafety(SafetySource source, int64_t detected);
+  void notifyPairSafety();
   hardware_interface::return_type writePair(int64_t now);
   void savePairRecords();
   bool pair_mode_ = false;
@@ -173,6 +176,8 @@ private:
   double pair_generation_ = 0, pair_accepted_ = 0;
   int64_t pair_activation_ns_ = 0;
   PairCommit pair_commit_;
+  GroupSafety pair_safety_;
+  std::chrono::milliseconds pair_safety_drain_timeout_{100};
   std::array<std::string, PairCommit::kMaxValues + 1> pair_keys_;
   struct PairRecord {
     uint64_t cycle = 0, previous = 0, accepted = 0;

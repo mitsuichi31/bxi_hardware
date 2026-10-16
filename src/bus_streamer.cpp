@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <fstream>
+#include <iomanip>
 #include <cstring>
 #include <set>
 #include <utility>
@@ -392,6 +394,16 @@ bool BxiBusStreamer::waitForFirstFeedback(std::chrono::nanoseconds timeout)
 void BxiBusStreamer::stop()
 {
   requestStop();
+  if (tx_thread_.joinable() && config_.group_safety && config_.group_safety->requested() && !tx_done_) {
+    const auto deadline = clock_type::now() + config_.safety_drain_timeout;
+    while (!tx_done_ && clock_type::now() < deadline) {std::this_thread::sleep_for(std::chrono::microseconds(100));}
+    if (!tx_done_) {
+      config_.group_safety->drain_timed_out = true;
+      config_.group_safety->abandoned = true;
+      notify();
+    }
+    // Join still owns all resources if a transport call is in flight; never detach raw pointers.
+  }
   if (tx_thread_.joinable()) {
     tx_thread_.join();
   }
@@ -858,6 +870,32 @@ void BxiBusStreamer::sendLoop()
   tx_done_ = true;
 }
 
+bool GroupSafety::save(const std::string & path) const
+{
+  std::ofstream out(path);
+  out << "#dropped=" << (requested() && record_capacity == 0 ? 1 : 0) << '\n';
+  out << "epoch,N,sources,detected_ns,registered_ns,error_observed_ns,attempted_ns,completed_ns,result,"
+    "failure,failure_axis,send_attempted,send_success,notification_failed,drain_timed_out,requests,mode_stop_observed_ns";
+  for (size_t axis = 0; axis < axes; ++axis) {
+    out << ",position" << axis << ",material" << axis << ",sequence" << axis << ",received_ns" << axis;
+  }
+  out << '\n' << std::setprecision(17);
+  if (requested() && record_capacity) {
+    out << epoch << ',' << axes << ',' << sources.load() << ',' << detected_ns.load() << ',' <<
+      registered_ns.load() << ',' << error_observed_ns.load() << ',' << attempted_ns.load() << ',' <<
+      completed_ns.load() << ',' << static_cast<unsigned>(drain_timed_out ? SafetyResult::kIncomplete : result.load()) << ',' <<
+      static_cast<unsigned>(failure) << ',' << failure_axis << ',' << send_attempted << ',' << send_success << ',' <<
+      notification_failed << ',' << drain_timed_out.load() << ',' << requests.load() << ',' << mode_stop_observed_ns.load();
+    for (size_t axis = 0; axis < axes; ++axis) {
+      out << ',' << position[axis] << ',' << static_cast<unsigned>(material[axis]) << ',' <<
+        feedback_sequence[axis] << ',' << feedback_received_ns[axis];
+    }
+    out << '\n';
+  }
+  out.flush();
+  return out.good() && record_capacity && finished() && !drain_timed_out.load();
+}
+
 WriteStreamStorage::WriteStreamStorage(size_t axes)
 : commands(axes), received_ns(std::make_unique<std::atomic<int64_t>[]>(axes)),
   control_unavailable(std::make_unique<std::atomic<bool>[]>(axes)), tx_seen_feedback(axes),
@@ -950,6 +988,90 @@ bool BxiBusStreamer::controlUnavailable(size_t axis) const
          write_storage_->control_unavailable[axis].load();
 }
 
+void BxiBusStreamer::performGroupSafety()
+{
+  auto & safety = *config_.group_safety;
+  auto & storage = *write_storage_;
+  const auto now = [] {return clock_type::now().time_since_epoch().count();};
+  if (safety.finished()) {return;}
+  if (safety.abandoned) {
+    safety.failure = safety.ready() ? SafetyFailure::kDrainTimeout : SafetyFailure::kNoErrorObservation;
+    safety.completed_ns = now(); safety.result = SafetyResult::kIncomplete;
+    return;
+  }
+  if (!safety.ready()) {return;}
+  auto expected = SafetyResult::kUnattempted;
+  if (!safety.result.compare_exchange_strong(expected, SafetyResult::kProcessing)) {return;}
+  safety.attempted_ns = now();
+  StreamCycleRecord * row = nullptr;
+  if (safety.sources.load() & static_cast<uint32_t>(SafetySource::kWatchdog)) {
+    const auto index = trace_.cycle_count++;
+    if (index < trace_.cycles.size()) {
+      row = &trace_.cycles[index]; *row = StreamCycleRecord{};
+      row->cycle = index; row->send_kind = 4; row->wake_steady_ns = safety.attempted_ns;
+      row->command_sequence = safety.watchdog_sequence;
+      row->command_published_ns = safety.watchdog_published_ns;
+      row->command_age_ns = safety.attempted_ns - safety.watchdog_published_ns;
+      for (size_t axis = 0; axis < drivers_.size(); ++axis) {
+        const auto received = storage.tx_feedback[axis].received_ns;
+        trace_.age_ns[index * drivers_.size() + axis] = received ? safety.attempted_ns - received : -1;
+        trace_.fresh[index * drivers_.size() + axis] = storage.tx_feedback[axis].sequence != storage.tx_seen_feedback[axis];
+      }
+    }
+  }
+  safety.notification_failed = notification_failed_.load();
+  auto finish = [&](SafetyResult result, SafetyFailure failure, int axis) {
+    safety.failure = failure; safety.failure_axis = axis;
+    if (row) {
+      row->frames = safety.send_success ? 1 : 0; row->send_attempted = safety.send_attempted;
+      row->send_success = safety.send_success; row->outcome = StreamCycleOutcome::kStopped;
+    }
+    safety.completed_ns = now(); safety.result = result;
+  };
+  const size_t n = drivers_.size();
+  if (n != safety.axes || n < 2 || n > 3 || block_count_ != n || !config_.broadcast) {
+    finish(SafetyResult::kCannotGenerate, SafetyFailure::kFrame, -1); return;
+  }
+  for (size_t axis = 0; axis < n; ++axis) {
+    PublishedFeedback feedback;
+    if (storage.feedback[axis]->version()) {
+      if (!storage.feedback[axis]->tryRead(&feedback)) {
+        finish(SafetyResult::kCannotGenerate, SafetyFailure::kFeedbackRead, static_cast<int>(axis)); return;
+      }
+      safety.material[axis] = 2;
+    } else {feedback = storage.tx_feedback[axis]; safety.material[axis] = 1;}
+    safety.position[axis] = feedback.feedback.position;
+    safety.feedback_sequence[axis] = feedback.sequence;
+    safety.feedback_received_ns[axis] = feedback.received_ns;
+    if (!feedback.feedback.valid) {
+      finish(SafetyResult::kCannotGenerate, SafetyFailure::kInvalidFeedback, static_cast<int>(axis)); return;
+    }
+    safety.material[axis] |= 4;
+    if (!std::isfinite(feedback.feedback.position)) {
+      finish(SafetyResult::kCannotGenerate, SafetyFailure::kPosition, static_cast<int>(axis)); return;
+    }
+    safety.material[axis] |= 8;
+    if (drivers_[axis]->state() != ActuatorState::kEnabled) {
+      finish(SafetyResult::kCannotGenerate, SafetyFailure::kDriver, static_cast<int>(axis)); return;
+    }
+    auto block = encodeSafety(axis, feedback.feedback.position);
+    if (!block) {finish(SafetyResult::kCannotGenerate, SafetyFailure::kEncode, static_cast<int>(axis)); return;}
+    storage.tx_blocks[axis] = {can_ids_[axis], *block};
+  }
+  const auto frame = buildBroadcastFrame(storage.tx_blocks, block_count_, padding_block_);
+  if (!frame) {finish(SafetyResult::kCannotGenerate, SafetyFailure::kFrame, -1); return;}
+  safety.send_attempted = true;
+  if (row) {row->send_before_steady_ns = now();}
+  safety.send_success = tx_bus_->send(*frame);
+  if (row) {row->send_after_steady_ns = now();}
+  if (safety.send_success) {++tx_stats_.frames_sent; ++tx_stats_.cycles;}
+  finish(safety.send_success ? SafetyResult::kSucceeded : SafetyResult::kSendFailed, SafetyFailure::kNone, -1);
+  if (safety.sources.load() & static_cast<uint32_t>(SafetySource::kWatchdog)) {
+    tx_stats_.command_stale_expected_frames = 1;
+    tx_stats_.command_stale_zero_gain_frames = safety.send_success ? 1 : 0;
+  }
+}
+
 void BxiBusStreamer::sendWriteLoop()
 {
   const auto setup = applyThreadScheduling(config_.send_priority, config_.cpus);
@@ -970,7 +1092,28 @@ void BxiBusStreamer::sendWriteLoop()
   int last_send_kind = 0;
   bool snapshot_failed = false;
   tx_state_ = kReady;
-  while (tx_running_) {
+  while (true) {
+    // G requests are handled before ordinary stop flags, without another HWIF write.
+    auto * safety = config_.group_safety;
+    if (safety && safety->requested()) {
+      performGroupSafety();
+      if (safety->finished()) {
+        fault(safety->terminal_fault, -1); break;
+      }
+      // A registered HWIF fault must wait for the post-ERROR observation boundary.
+      // Finite poll timeout also permits progress if eventfd notification failed.
+      pollfd wake{storage.event_fd, POLLIN, 0};
+      const int waited = ::poll(&wake, 1, 1);
+      if (waited > 0 && (wake.revents & POLLIN)) {
+        uint64_t value; const auto consumed = ::read(wake.fd, &value, sizeof(value));
+        if (consumed < 0 && errno != EAGAIN && errno != EINTR) {notification_failed_ = true;}
+      }
+      if (waited < 0 || (wake.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+        notification_failed_ = true; (void)::poll(nullptr, 0, 1);
+      }
+      continue;
+    }
+    if (!tx_running_) {break;}
     int64_t now = ns_now();
     if (stop_all_->load()) {tx_stats_.stopped_externally = true; break;}
     if (notification_failed_) {fault(StreamFault::kNotificationFailed, -1); break;}
@@ -1035,6 +1178,13 @@ void BxiBusStreamer::sendWriteLoop()
     const bool zero_stop = stop_reason == StreamFault::kCommandStale ||
       stop_reason == StreamFault::kCommandSnapshotUnavailable ||
       stop_reason == StreamFault::kStartupTimeout;
+    if (zero_stop && config_.group_safety) {
+      config_.group_safety->terminal_fault = stop_reason;
+      config_.group_safety->watchdog_sequence = schedule.sequence;
+      config_.group_safety->watchdog_published_ns = schedule.published_ns;
+      config_.group_safety->request(config_.group_safety->epoch, SafetySource::kWatchdog, now, ns_now());
+      continue;
+    }
     if (stop_reason != StreamFault::kNone) {tx_stats_.received_fault_at_stop = rx_fault_.load();}
     if (stop_reason != StreamFault::kNone && !zero_stop) {
       if (stop_reason == StreamFault::kFeedbackStale && stop_axis >= 0) {
@@ -1103,7 +1253,8 @@ void BxiBusStreamer::sendWriteLoop()
       bool failed = false;
       const size_t frames = config_.broadcast ? 1 : n;
       for (size_t i = 0; i < frames; ++i) {
-        if (!tx_running_ || stop_all_->load()) {break;}
+        if (!tx_running_ || stop_all_->load() ||
+          (config_.group_safety && config_.group_safety->requested())) {break;}
         // Recheck at the send boundary too: a publication during encoding cancels the old
         // batch before its first frame. Once started, finish this immutable batch; safety
         // stops and freshness limits are still checked before EVERY frame.

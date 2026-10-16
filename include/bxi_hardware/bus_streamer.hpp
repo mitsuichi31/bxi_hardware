@@ -97,8 +97,71 @@ const char * streamFaultName(StreamFault fault);
 
 enum class CommandPublishResult {kNotPublished, kSnapshotPublished, kSnapshotPublishedNotifyFailed};
 
+// One activation-owned request, independent of the normal command snapshot.
+// Metadata is atomic because the control thread, error callback and TX may interleave.
+enum class SafetySource : uint32_t {kHwFault = 1, kModeStop = 2, kWatchdog = 4};
+enum class SafetyResult : uint32_t {kUnattempted, kProcessing, kCannotGenerate, kSendFailed, kSucceeded, kIncomplete};
+enum class SafetyFailure : uint32_t {kNone, kFeedbackRead, kInvalidFeedback, kPosition, kDriver, kEncode, kFrame, kNoErrorObservation, kDrainTimeout};
+struct GroupSafety
+{
+  static_assert(std::atomic<int64_t>::is_always_lock_free && std::atomic<uint32_t>::is_always_lock_free &&
+    std::atomic<uint64_t>::is_always_lock_free && std::atomic<bool>::is_always_lock_free, "G safety requires lock-free atomics");
+  uint64_t epoch = 0;
+  size_t axes = 0, record_capacity = 1;
+  std::atomic<uint32_t> sources{0};
+  std::atomic<int64_t> detected_ns{0}, registered_ns{0}, error_observed_ns{0};
+  std::atomic<int64_t> attempted_ns{0}, completed_ns{0}, mode_stop_observed_ns{0};
+  std::atomic<SafetyResult> result{SafetyResult::kUnattempted};
+  std::atomic<bool> abandoned{false}, drain_timed_out{false};
+  std::atomic<uint64_t> requests{0};
+  // TX owns these fields; inspect/save only after TX join.
+  std::array<double, 3> position{};
+  std::array<uint8_t, 3> material{};  // 1=prepared, 2=snapshot, 4=valid, 8=finite
+  std::array<uint64_t, 3> feedback_sequence{};
+  std::array<int64_t, 3> feedback_received_ns{};
+  SafetyFailure failure = SafetyFailure::kNone;
+  int failure_axis = -1;
+  bool send_attempted = false, send_success = false, notification_failed = false;
+  StreamFault terminal_fault = StreamFault::kOwnerRequested;
+  uint64_t watchdog_sequence = 0;
+  int64_t watchdog_published_ns = 0;
+  void reset(uint64_t new_epoch, size_t count) noexcept {
+    epoch = new_epoch; axes = count;
+    sources = 0; detected_ns = 0; registered_ns = 0; error_observed_ns = 0;
+    attempted_ns = 0; completed_ns = 0; mode_stop_observed_ns = 0; result = SafetyResult::kUnattempted;
+    abandoned = false; drain_timed_out = false; requests = 0;
+    position = {}; material = {}; feedback_sequence = {}; feedback_received_ns = {};
+    failure = SafetyFailure::kNone; failure_axis = -1;
+    send_attempted = send_success = notification_failed = false;
+    terminal_fault = StreamFault::kOwnerRequested; watchdog_sequence = 0; watchdog_published_ns = 0;
+  }
+  bool request(uint64_t request_epoch, SafetySource source, int64_t detected, int64_t registered) noexcept {
+    if (request_epoch != epoch) {return false;}
+    ++requests;
+    int64_t zero = 0; detected_ns.compare_exchange_strong(zero, detected);
+    zero = 0; registered_ns.compare_exchange_strong(zero, registered);
+    sources.fetch_or(static_cast<uint32_t>(source));
+    return true;
+  }
+  void observeError(int64_t now) noexcept {
+    int64_t zero = 0; error_observed_ns.compare_exchange_strong(zero, now);
+  }
+  bool requested() const noexcept {return sources.load() != 0;}
+  bool ready() const noexcept {
+    return requested() && (!(sources.load() & static_cast<uint32_t>(SafetySource::kHwFault)) ||
+      error_observed_ns.load() != 0);
+  }
+  bool finished() const noexcept {
+    const auto value = result.load();
+    return value != SafetyResult::kUnattempted && value != SafetyResult::kProcessing;
+  }
+  bool save(const std::string & path) const;  // Non-RT, after join. False for missing/truncated/failed output.
+};
+
 struct StreamConfig
 {
+  GroupSafety * group_safety = nullptr;  // G only; owner outlives TX/RX join.
+  std::chrono::milliseconds safety_drain_timeout{100};
   int64_t activation_origin_ns = 0;  // G only; zero retains legacy armWrites origin.
   bool control_trace = false;
   bool write_triggered = false;
@@ -281,7 +344,7 @@ public:
     CanBus * tx_bus, CanBus * rx_bus, std::vector<BxiActuatorDriver *> drivers,
     StreamConfig config, CycleHook hook, std::atomic<bool> * stop_all,
     std::unique_ptr<WriteStreamStorage> storage = nullptr);
-  ~BxiBusStreamer();
+  virtual ~BxiBusStreamer();
   BxiBusStreamer(const BxiBusStreamer &) = delete;
   BxiBusStreamer & operator=(const BxiBusStreamer &) = delete;
 
@@ -324,7 +387,12 @@ public:
     const std::vector<std::pair<int, std::array<uint8_t, 8>>> & blocks, size_t block_count,
     const std::array<uint8_t, 8> & padding);
 
+protected:
+  virtual std::optional<std::array<uint8_t, 8>> encodeSafety(size_t axis, double position) const {
+    return drivers_[axis]->encodeControlBlock(position, 0, 0, 0, 0);
+  }
 private:
+  friend struct GroupSafetyTestAccess;
   struct ReplySlot
   {
     protocol::MitFeedback decoded;
@@ -338,6 +406,7 @@ private:
   void receiveLoop();
   void sendLoop();
   void sendWriteLoop();
+  void performGroupSafety();
   void fault(StreamFault kind, int axis);
 
   CanBus * tx_bus_;

@@ -60,6 +60,12 @@ bool BxiSystemInterface::configurePair()
     !bus->second.write_triggered || !bus->second.direct_feedback || can_hz_ != 1000 ||
     bus->second.stream_command_max_age_ms != 5.0 || bus->second.stream_feedback_max_age_ms != 3.0)
   {return false;}
+  const auto timeout = info_.hardware_parameters.find("pair_safety_drain_timeout_ms");
+  if (timeout != info_.hardware_parameters.end()) {
+    double value;
+    if (!number(timeout->second, value) || value < 1 || value > 60000 || std::floor(value) != value) {return false;}
+    pair_safety_drain_timeout_ = std::chrono::milliseconds(static_cast<int64_t>(value));
+  }
   PairCommit::Bounds bounds;
   for (size_t axis = 0; axis < n_joints_; ++axis) {
     const auto & joint = info_.joints[axis];
@@ -117,7 +123,12 @@ hardware_interface::return_type BxiSystemInterface::perform_command_mode_switch(
 {
   const auto result = prepare_command_mode_switch(start, stop);
   if (!pair_mode_ || result != hardware_interface::return_type::OK) {return result;}
-  if (!stop.empty()) {pair_claimed_ = false; pair_terminal_ = true; pair_commit_.latch();}
+  if (!stop.empty()) {
+    // This callback is the observed boundary, not an inferred controller ERROR timestamp.
+    pair_safety_.mode_stop_observed_ns = pairSteadyNow();
+    requestPairSafety(SafetySource::kModeStop, pairSteadyNow());
+    pair_claimed_ = false; pair_terminal_ = true; pair_commit_.latch();
+  }
   if (!start.empty()) {pair_claimed_ = true;}
   return result;
 }
@@ -173,8 +184,32 @@ hardware_interface::return_type BxiSystemInterface::writePair(int64_t now)
     }
     control.record_index = SIZE_MAX;
   }
-  // b-1 latches and ceases normal publication. ERROR/safety ordering belongs to b-2.
-  return hardware_interface::return_type::OK;
+  // Upper-limit-only rejection retains its original watchdog/OK behavior.
+  const bool abnormal = row.reason == PairCommit::Reason::kInvalidGeneration ||
+    row.reason == PairCommit::Reason::kRollback || row.reason == PairCommit::Reason::kGap ||
+    row.reason == PairCommit::Reason::kInvalidBatch || row.reason == PairCommit::Reason::kLatchedNonzero ||
+    row.reason == PairCommit::Reason::kStartupExpired || row.reason == PairCommit::Reason::kPublishFailed;
+  if (abnormal) {requestPairSafety(SafetySource::kHwFault, pairSteadyNow());}
+  return abnormal || (pair_safety_.sources.load() & static_cast<uint32_t>(SafetySource::kHwFault)) ?
+    hardware_interface::return_type::ERROR : hardware_interface::return_type::OK;
+}
+
+void BxiSystemInterface::notifyPairSafety()
+{
+  for (auto & control : control_streams_) {if (control.streamer) {control.streamer->notify();}}
+}
+void BxiSystemInterface::requestPairSafety(SafetySource source, int64_t detected)
+{
+  pair_safety_.request(pair_safety_.epoch, source, detected, pairSteadyNow());
+  notifyPairSafety();
+}
+hardware_interface::CallbackReturn BxiSystemInterface::on_error(const rclcpp_lifecycle::State & state)
+{
+  if (pair_mode_ && pair_safety_.requested()) {
+    // HC invokes this only after write's ERROR return; do not wait or release resources here.
+    pair_safety_.observeError(pairSteadyNow()); notifyPairSafety();
+  }
+  return hardware_interface::SystemInterface::on_error(state);
 }
 
 void BxiSystemInterface::savePairRecords()

@@ -8,10 +8,12 @@
 #include "hardware_interface/resource_manager.hpp"
 namespace bxi_hardware
 {
+struct PairCommitTestAccess {static void last(PairCommit & pair, uint64_t last) {pair.last_ = last;}};
 struct PairSystemTestAccess
 {
   static void arm(BxiSystemInterface & s) {
     s.pair_commit_.reset(1000000000, 20000000);
+    s.pair_safety_.reset(1, s.n_joints_);
     s.pair_records_.resize(2); s.pair_record_count_ = 0;
   }
   static void save(BxiSystemInterface & s, const std::string & directory) {
@@ -20,6 +22,8 @@ struct PairSystemTestAccess
     s.savePairRecords();
   }
   static void capacity(BxiSystemInterface & s, size_t capacity) {s.pair_records_.resize(capacity);}
+  static auto & safety(BxiSystemInterface & s) {return s.pair_safety_;}
+  static void last(BxiSystemInterface & s, uint64_t value) {PairCommitTestAccess::last(s.pair_commit_, value);}
   static auto write(BxiSystemInterface & s, int64_t now) {return s.writePair(now);}
   static auto reason(const BxiSystemInterface & s) {return s.pair_records_[0].reason;}
   static size_t count(const BxiSystemInterface & s) {return s.pair_record_count_;}
@@ -415,6 +419,64 @@ TEST(PairSystem, ResourceManagerRejectsDuplicateKeyAndReleasesLoan)
   }
   EXPECT_FALSE(manager.command_interface_is_claimed("bxi_pair/commit_generation"));
   EXPECT_NO_THROW(manager.claim_command_interface("bxi_pair/commit_generation"));
+}
+TEST(PairB2, FaultRegistersBeforeErrorAndObservationIsSeparate)
+{
+  for (size_t n : {2U, 3U}) {
+    for (double generation : {3., -1., 1.5, std::numeric_limits<double>::infinity(), 9007199254740992.}) {
+      PairHarness s; s.axes = n; ASSERT_EQ(s.on_init(info(true, true, n)), H::SUCCESS);
+      PairSystemTestAccess::arm(s); ASSERT_EQ(s.perform_command_mode_switch(keys(s), {}), Ret::OK);
+      auto commands = s.export_command_interfaces();
+      for (size_t i = 0; i < n * 5; ++i) {ASSERT_TRUE(commands[i].set_value(0.));}
+      ASSERT_TRUE(commands.back().set_value(generation));
+      EXPECT_EQ(PairSystemTestAccess::write(s, s.now), Ret::ERROR);
+      auto & pending = PairSystemTestAccess::safety(s);
+      EXPECT_TRUE(pending.requested()); EXPECT_FALSE(pending.ready());
+      EXPECT_EQ(pending.registered_ns, s.now); EXPECT_EQ(pending.error_observed_ns, 0);
+      ++s.now; s.on_error(rclcpp_lifecycle::State());
+      EXPECT_TRUE(pending.ready()); EXPECT_EQ(pending.error_observed_ns, s.now);
+    }
+  }
+}
+TEST(PairB2, UpperLimitAloneRetainsOkAndWatchdogWhileOtherFaultRetainsRequest)
+{
+  for (size_t n : {2U, 3U}) {
+    PairHarness s; s.axes = n; ASSERT_EQ(s.on_init(info(true, true, n)), H::SUCCESS);
+    PairSystemTestAccess::arm(s); ASSERT_EQ(s.perform_command_mode_switch(keys(s), {}), Ret::OK);
+    auto commands = s.export_command_interfaces();
+    for (size_t i = 0; i < n * 5; ++i) {ASSERT_TRUE(commands[i].set_value(0.));}
+    PairSystemTestAccess::last(s, PairCommit::kMaxGeneration);
+    ASSERT_TRUE(commands.back().set_value(9007199254740992.));
+    EXPECT_EQ(PairSystemTestAccess::write(s, s.now), Ret::OK);
+    EXPECT_FALSE(PairSystemTestAccess::safety(s).requested()); EXPECT_EQ(s.publications, 0U);
+    // A subsequent rollback is a separate error even after the upper-limit rejection.
+    ASSERT_TRUE(commands.back().set_value(0.));
+    EXPECT_EQ(PairSystemTestAccess::write(s, ++s.now), Ret::ERROR);
+    auto & pending = PairSystemTestAccess::safety(s); ASSERT_TRUE(pending.requested());
+    const auto registered = pending.registered_ns.load();
+    ASSERT_TRUE(commands.back().set_value(9007199254740992.));
+    EXPECT_EQ(PairSystemTestAccess::write(s, ++s.now), Ret::ERROR);
+    EXPECT_TRUE(pending.requested()); EXPECT_EQ(pending.registered_ns, registered);
+  }
+}
+TEST(PairB2, CompleteModeStopRequestsOnceAtObservedBoundary)
+{
+  for (size_t n : {2U, 3U}) {
+    PairHarness s; s.axes = n; ASSERT_EQ(s.on_init(info(true, true, n)), H::SUCCESS);
+    PairSystemTestAccess::arm(s); auto full = keys(s);
+    ASSERT_EQ(s.perform_command_mode_switch(full, {}), Ret::OK);
+    auto partial = full; partial.pop_back();
+    EXPECT_EQ(s.perform_command_mode_switch({}, partial), Ret::ERROR);
+    EXPECT_FALSE(PairSystemTestAccess::safety(s).requested());
+    EXPECT_EQ(s.perform_command_mode_switch({}, full), Ret::OK);
+    auto & pending = PairSystemTestAccess::safety(s);
+    EXPECT_TRUE(pending.ready()); EXPECT_EQ(pending.error_observed_ns, 0);
+    EXPECT_GT(pending.mode_stop_observed_ns, 0);
+    EXPECT_EQ(pending.sources, static_cast<uint32_t>(SafetySource::kModeStop));
+    EXPECT_EQ(pending.requests, 1U);
+    EXPECT_EQ(s.perform_command_mode_switch({}, full), Ret::ERROR);
+    EXPECT_EQ(pending.requests, 1U);
+  }
 }
 }  // namespace
 }  // namespace bxi_hardware
