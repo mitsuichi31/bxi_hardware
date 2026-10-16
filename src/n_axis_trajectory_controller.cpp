@@ -3,6 +3,9 @@
 #include <chrono>
 #include <cmath>
 #include <fstream>
+#include <filesystem>
+#include <cstdlib>
+#include <unistd.h>
 #include <iomanip>
 #include <limits>
 #include "pluginlib/class_list_macros.hpp"
@@ -27,6 +30,8 @@ CB NAxisTrajectoryController::on_init()
   auto_declare<std::vector<std::string>>("joints", {"joint1", "joint2"});
   auto_declare<int>("api_max_tries", 1);
   auto_declare<double>("record_seconds", 120.);
+  auto_declare<std::string>("output_dir", "");
+  auto_declare<double>("status_period", .05);
   auto_declare<double>("max_period", .005);
   auto_declare<double>("state_position_limit", .60);
   auto_declare<double>("max_torque", 5.);
@@ -83,6 +88,7 @@ CB NAxisTrajectoryController::on_configure(const rclcpp_lifecycle::State &)
     "G controller atomics must be lock-free");
   // Provisional: 1 kHz recording capacity, not a runtime performance claim.
   rows_.assign(static_cast<size_t>(std::ceil(seconds * 1000.)), Row{});
+  if (!configureRos()) {return CB::ERROR;}
   timing_.configure_out = steadyNow();
   return CB::SUCCESS;
 }
@@ -122,6 +128,10 @@ CB NAxisTrajectoryController::on_activate(const rclcpp_lifecycle::State &)
     const auto accepted = getState(n_*3);
     if (!finite(accepted) || *accepted != 0.) {terminal_ = true; return CB::ERROR;}
   } catch (...) {terminal_ = true; return CB::ERROR;}
+  {
+    std::lock_guard<std::mutex> lock(ros_mutex_);
+    ++ros_activation_; ros_activation_ns_ = steadyNow();
+  }
   ++activation_; state_ = State::kBoot; published_state_ = state_;
   active_ = true; timing_.activate_out = steadyNow();
   return CB::SUCCESS;
@@ -363,6 +373,69 @@ bool NAxisTrajectoryController::saveRecord(const std::string & path)
   const bool ok = out.good() && !dropped_ && !rows_.empty() && row_count_ != 0;
   if (!ok) {save_failed_ = true; terminal_ = true;}
   return ok;
+}
+bool NAxisTrajectoryController::configureRos()
+{
+  std::lock_guard<std::mutex> lock(ros_mutex_);
+  const auto node = get_node();
+  const auto dir = node->get_parameter("output_dir").as_string();
+  const double seconds = node->get_parameter("status_period").as_double();
+  std::error_code error;
+  const auto directory_status = std::filesystem::status(dir, error);
+  const auto permissions = directory_status.permissions();
+  const auto write_bits = std::filesystem::perms::owner_write |
+    std::filesystem::perms::group_write | std::filesystem::perms::others_write;
+  if (dir.empty() || error || !std::filesystem::is_directory(directory_status) ||
+    (permissions & write_bits) == std::filesystem::perms::none || ::access(dir.c_str(), W_OK | X_OK) != 0 ||
+    !std::isfinite(seconds) || seconds < .02 || seconds > .05) {return false;}
+  output_dir_ = std::filesystem::absolute(dir).string();
+  // Probe actual creation, not just mode bits; remove the probe immediately.
+  std::string probe = output_dir_ + "/.n_axis_probe_XXXXXX";
+  const int fd = ::mkstemp(probe.data());
+  if (fd < 0) {return false;}
+  ::close(fd); ::unlink(probe.c_str());
+  ros_group_ = node->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+  rclcpp::SubscriptionOptions options; options.callback_group = ros_group_;
+  heartbeat_sub_ = node->create_subscription<msg::NAxisKeepalive>("~/n_axis/keepalive",
+    rclcpp::QoS(1).reliable().durability_volatile(), [this](msg::NAxisKeepalive::ConstSharedPtr m) {
+      keepalive({m->nonce, m->id, m->sequence, m->sent_ns});
+    }, options);
+  start_service_ = node->create_service<srv::StartNAxis>("~/n_axis/start",
+    [this](const srv::StartNAxis::Request::SharedPtr m, srv::StartNAxis::Response::SharedPtr out) {
+      Request r; r.nonce = m->nonce; r.id = m->id; r.sent_ns = m->sent_ns; r.axes = m->axes;
+      r.amplitude = m->amplitude; r.frequency = m->frequency; r.cycles = m->cycles;
+      r.ramp_cycles = m->ramp_cycles; r.hold = m->hold; r.kp = m->kp; r.kd = m->kd; r.release = m->release;
+      out->accepted = requestStart(r); out->message = out->accepted ? "accepted" : "rejected (state, identity, time or profile)";
+      if (out->accepted) {std::lock_guard<std::mutex> lock(ros_mutex_); ros_nonce_ = r.nonce;}
+    }, rclcpp::ServicesQoS(), ros_group_);
+  finish_service_ = node->create_service<std_srvs::srv::Trigger>("~/n_axis/finish",
+    [this](const std_srvs::srv::Trigger::Request::SharedPtr, std_srvs::srv::Trigger::Response::SharedPtr out) {
+      out->success = requestFinish(); out->message = out->success ? "finish requested" : "not holding or terminal";
+    }, rclcpp::ServicesQoS(), ros_group_);
+  stop_service_ = node->create_service<std_srvs::srv::Trigger>("~/n_axis/stop",
+    [this](const std_srvs::srv::Trigger::Request::SharedPtr, std_srvs::srv::Trigger::Response::SharedPtr out) {
+      requestStop(); out->success = true; out->message = "stop requested";
+    }, rclcpp::ServicesQoS(), ros_group_);
+  status_pub_ = rclcpp::create_publisher<msg::NAxisStatus>(node, "~/n_axis/status",
+    rclcpp::QoS(1).reliable().durability_volatile());
+  status_timer_ = node->create_wall_timer(std::chrono::duration<double>(seconds),
+    [this] {publishRosStatus();}, ros_group_);
+  return true;
+}
+void NAxisTrajectoryController::publishRosStatus()
+{
+  std::lock_guard<std::mutex> lock(ros_mutex_);
+  msg::NAxisStatus status;
+  status.state = static_cast<uint8_t>(published_state_.load());
+  status.terminal = terminal_.load(); status.record_complete = recordComplete();
+  if (status.record_complete && !save_attempted_) {
+    save_attempted_ = true;
+    csv_path_ = output_dir_ + "/activation_" + std::to_string(ros_activation_) +
+      "_nonce_" + std::to_string(ros_nonce_) + "_steady_" + std::to_string(ros_activation_ns_) + ".csv";
+    record_state_ = saveRecord(csv_path_) ? 1 : 2;
+  }
+  status.record_state = save_failed_.load() ? 2 : record_state_;
+  status.csv_path = csv_path_; status_pub_->publish(status);
 }
 }  // namespace bxi_hardware
 PLUGINLIB_EXPORT_CLASS(bxi_hardware::NAxisTrajectoryController, controller_interface::ControllerInterface)

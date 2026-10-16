@@ -1,0 +1,16 @@
+uint8 BOOT=0
+uint8 IDLE=1
+uint8 ARMED=2
+uint8 RUNNING=3
+uint8 HOLDING=4
+uint8 RELEASED=5
+uint8 STOPPED=6
+uint8 ABORTED=7
+uint8 RECORD_NONE=0
+uint8 RECORD_WRITTEN=1
+uint8 RECORD_FAILED=2
+uint8 state
+bool terminal
+bool record_complete
+uint8 record_state
+string csv_path

@@ -64,6 +64,7 @@ protected:
   }
 };
 struct Rig {
+  std::string output_dir;
   size_t n;
   std::array<double,16> commands{};
   std::array<double,10> states{};
@@ -73,10 +74,14 @@ struct Rig {
   TestController c;
   explicit Rig(size_t axes, double seconds = 1., int mutation = -1, bool state_mutation = false,
     double initial = 0., unsigned tries = 1) : n(axes) {
+    std::string pattern = (std::filesystem::temp_directory_path() / "bxi_g14_XXXXXX").string();
+    const auto directory = ::mkdtemp(pattern.data());
+    if (!directory) {throw std::runtime_error("cannot create fixture output_dir");}
+    output_dir = directory;
     rclcpp::NodeOptions options;
     std::vector<std::string> names;
     for (size_t a=0;a<n;++a) {names.push_back("joint"+std::to_string(a+1));}
-    options.parameter_overrides({rclcpp::Parameter("joints", names), rclcpp::Parameter("record_seconds",seconds),
+    options.parameter_overrides({rclcpp::Parameter("output_dir", output_dir), rclcpp::Parameter("joints", names), rclcpp::Parameter("record_seconds",seconds),
       rclcpp::Parameter("api_max_tries", static_cast<int>(tries))});
     controller_interface::ControllerInterfaceParams p; p.controller_name="g_unit"; p.update_rate=1000; p.node_options=options;
     EXPECT_EQ(c.init(p),Ret::OK); EXPECT_EQ(c.on_configure(rclcpp_lifecycle::State()),CB::SUCCESS);
@@ -111,6 +116,7 @@ struct Rig {
     }
     c.assign_interfaces(std::move(cl),std::move(sl));
   }
+  ~Rig() {std::filesystem::remove_all(output_dir);}
   CB activate() {return c.on_activate(rclcpp_lifecycle::State());}
   Ret step(int64_t ns=1000000) {c.now+=ns; return c.update(rclcpp::Time(c.now),rclcpp::Duration::from_nanoseconds(ns));}
   void ack() {states[3*n]=commands[5*n];}

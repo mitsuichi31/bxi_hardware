@@ -1,0 +1,22 @@
+# 暫定G専用設定。CAN IDは明示引数からのみ展開する。
+active_can_buses: ['@CAN_BUS@']
+can_frame_format: {'@CAN_BUS@': fd_brs}
+can_transport:
+  '@CAN_BUS@':
+    rx_mode: separate
+    tx_frame: broadcast
+    tx_trigger: write
+    direct_feedback: true
+    stream_write_grace_ms: 0.20
+    stream_first_write_timeout_ms: 1000.0  # 暫定。spawner遅延との関係はG3で測定
+    stream_feedback_max_age_ms: 3.0
+    stream_command_max_age_ms: 5.0
+    send_thread_priority: 45
+    receive_thread_priority: 46
+    thread_cpus: [9]
+defaults:
+  control_timeout_ms: 10
+  maximum_consecutive_timeouts: 3
+  can_hz: 1000
+  temperature_sensor_fault_below_c: -20.0
+joints: '@JOINTS_FROM_EXPLICIT_IDS@'

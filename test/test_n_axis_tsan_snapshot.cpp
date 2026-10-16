@@ -2,6 +2,8 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <filesystem>
+#include <cstdlib>
 #include <iostream>
 #include <mutex>
 #include <thread>
@@ -83,6 +85,7 @@ protected:
 };
 struct Rig
 {
+  std::string output_dir;
   // Backing loans are bound before threads start, and outlive the controller.
   std::array<double, 16> command_backing{};
   std::array<double, 10> state_backing{};
@@ -94,8 +97,12 @@ struct Rig
     c.axes = n;
     std::vector<std::string> joints;
     for (size_t a = 0; a < n; ++a) {joints.push_back("joint" + std::to_string(a + 1));}
+    std::string pattern = (std::filesystem::temp_directory_path() / "bxi_g14_XXXXXX").string();
+    const auto directory = ::mkdtemp(pattern.data());
+    if (!directory) {throw std::runtime_error("cannot create fixture output_dir");}
+    output_dir = directory;
     rclcpp::NodeOptions options;
-    options.parameter_overrides({rclcpp::Parameter("joints", joints),
+    options.parameter_overrides({rclcpp::Parameter("output_dir", output_dir), rclcpp::Parameter("joints", joints),
       rclcpp::Parameter("record_seconds", 120.)});
     controller_interface::ControllerInterfaceParams params;
     params.controller_name = "g2a_snapshot"; params.update_rate = 1000; params.node_options = options;
@@ -119,6 +126,7 @@ struct Rig
     }
     c.assign_interfaces(std::move(cl), std::move(sl));
   }
+  ~Rig() {std::filesystem::remove_all(output_dir);}
   Ret step()
   {return c.update(rclcpp::Time(c.now.load()), rclcpp::Duration::from_nanoseconds(1000));}
   C::Request request() const

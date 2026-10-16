@@ -11,10 +11,14 @@
 #include "controller_interface/controller_interface.hpp"
 #include "bxi_hardware/atomic_snapshot.hpp"
 #include "bxi_hardware/hil_trajectory.hpp"
+#include "bxi_hardware/msg/n_axis_keepalive.hpp"
+#include "bxi_hardware/msg/n_axis_status.hpp"
+#include "bxi_hardware/srv/start_n_axis.hpp"
+#include "std_srvs/srv/trigger.hpp"
 
 namespace bxi_hardware
 {
-// G only. Internal non-RT entry points intentionally have no ROS transport (G1-4).
+// G only. ROS callbacks forward to the existing fixed non-RT entry points.
 class NAxisTrajectoryController : public controller_interface::ControllerInterface
 {
 public:
@@ -128,6 +132,20 @@ private:
   uint64_t dropped_ = 0;
   Row final_row_{};  // emergency final observation even if the bounded buffer is full
   Timing timing_{};
+  bool configureRos();  // non-RT only; update never accesses these members
+  void publishRosStatus();
+  std::mutex ros_mutex_;
+  std::string output_dir_, csv_path_;
+  uint64_t ros_activation_ = 0, ros_nonce_ = 0;
+  int64_t ros_activation_ns_ = 0;
+  uint8_t record_state_ = 0;
+  bool save_attempted_ = false;
+  rclcpp::CallbackGroup::SharedPtr ros_group_;
+  rclcpp::Subscription<msg::NAxisKeepalive>::SharedPtr heartbeat_sub_;
+  rclcpp::Service<srv::StartNAxis>::SharedPtr start_service_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr finish_service_, stop_service_;
+  rclcpp::Publisher<msg::NAxisStatus>::SharedPtr status_pub_;
+  rclcpp::TimerBase::SharedPtr status_timer_;
 };
 }  // namespace bxi_hardware
 #endif

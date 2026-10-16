@@ -1,0 +1,15 @@
+uint64 nonce
+uint64 id
+int64 sent_ns
+uint8 axes
+float64 amplitude
+float64 frequency
+float64 cycles
+float64 ramp_cycles
+float64 hold
+float64[3] kp
+float64[3] kd
+bool release
+---
+bool accepted
+string message

@@ -53,6 +53,9 @@ pluginlib_export_plugin_description_file(hardware_interface bxi_hardware.xml)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/HilTrajectoryStatus.msg"
   "srv/StartHilTrajectory.srv"
+  "msg/NAxisKeepalive.msg"
+  "msg/NAxisStatus.msg"
+  "srv/StartNAxis.srv"
 )
 rosidl_get_typesupport_target(bxi_interfaces_cpp ${PROJECT_NAME} rosidl_typesupport_cpp)
 add_library(bxi_hil_controllers SHARED src/hil_trajectory_controller.cpp)
@@ -77,8 +80,8 @@ add_library(bxi_n_axis_controllers SHARED src/n_axis_trajectory_controller.cpp)
 target_include_directories(bxi_n_axis_controllers PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
-ament_target_dependencies(bxi_n_axis_controllers controller_interface hardware_interface pluginlib rclcpp rclcpp_lifecycle)
-target_link_libraries(bxi_n_axis_controllers ${BXI_HW_LIB})
+ament_target_dependencies(bxi_n_axis_controllers controller_interface hardware_interface pluginlib rclcpp rclcpp_lifecycle std_srvs)
+target_link_libraries(bxi_n_axis_controllers ${BXI_HW_LIB} "${bxi_interfaces_cpp}")
 pluginlib_export_plugin_description_file(controller_interface bxi_n_axis_controllers.xml)
 
 # 試験専用の controller（vcan の故障経路：controller_manager の更新の停止）。本番の controller とは
@@ -170,6 +173,12 @@ if(BUILD_TESTING)
   ament_target_dependencies(test_n_axis_trajectory_controller controller_interface hardware_interface pluginlib rclcpp rclcpp_lifecycle)
   set_target_properties(test_n_axis_trajectory_controller PROPERTIES BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}")
 
+  ament_add_gtest(test_n_axis_ros test/test_n_axis_ros.cpp TIMEOUT 90)
+  target_link_libraries(test_n_axis_ros bxi_n_axis_controllers "${bxi_interfaces_cpp}")
+  ament_target_dependencies(test_n_axis_ros controller_interface hardware_interface rclcpp rclcpp_lifecycle std_srvs)
+  set_target_properties(test_n_axis_ros PROPERTIES BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}")
+  ament_add_pytest_test(test_n_axis_tools test/test_n_axis_tools.py TIMEOUT 90)
+
   ament_add_gtest(test_n_axis_tsan_snapshot test/test_n_axis_tsan_snapshot.cpp TIMEOUT 300)
   target_link_libraries(test_n_axis_tsan_snapshot bxi_n_axis_controllers)
   ament_target_dependencies(test_n_axis_tsan_snapshot controller_interface hardware_interface rclcpp rclcpp_lifecycle)
@@ -205,6 +214,11 @@ install(FILES hil/single_joint/single_joint_hil.launch.py
 install(PROGRAMS hil/single_joint/ramp_command.py hil/single_joint/sine_command.py
   hil/single_joint/hil_trajectory.py
   DESTINATION lib/${PROJECT_NAME})
+install(FILES hil/n_axis/n_axis_hil.launch.py DESTINATION share/${PROJECT_NAME}/hil/n_axis)
+install(PROGRAMS hil/n_axis/make_n_axis_config.py hil/n_axis/n_axis_check_config.py
+  hil/n_axis/n_axis_command.py hil/n_axis/n_axis_evaluate.py DESTINATION lib/${PROJECT_NAME})
+install(FILES hil/n_axis/make_n_axis_config.py hil/n_axis/n_axis_check_config.py
+  hil/n_axis/n_axis_command.py hil/n_axis/n_axis_evaluate.py DESTINATION share/${PROJECT_NAME}/hil/n_axis)
 install(TARGETS bxi_probe bxi_vcan_motor_emulator sine_command_cpp
   DESTINATION lib/${PROJECT_NAME})
 install(
