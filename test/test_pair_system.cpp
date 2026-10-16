@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include <fstream>
+#include <functional>
 #include <algorithm>
 #include <limits>
 #include <cstdlib>
@@ -27,6 +28,9 @@ struct PairSystemTestAccess
   static auto write(BxiSystemInterface & s, int64_t now) {return s.writePair(now);}
   static auto reason(const BxiSystemInterface & s) {return s.pair_records_[0].reason;}
   static size_t count(const BxiSystemInterface & s) {return s.pair_record_count_;}
+  static auto latestReason(const BxiSystemInterface & s) {return s.pair_records_[s.pair_record_count_ - 1].reason;}
+  static bool latched(const BxiSystemInterface & s) {return s.pair_commit_.latched();}
+  static double accepted(const BxiSystemInterface & s) {return s.pair_accepted_;}
   static uint64_t last(const BxiSystemInterface & s) {return s.pair_commit_.last();}
 };
 namespace
@@ -139,12 +143,13 @@ class PairHarness : public BxiSystemInterface
 {
 public:
   int64_t now = 1000000100;
+  std::function<void()> time_hook;
   unsigned publications = 0;
   std::array<PublishedCommand, PairCommit::kMaxAxes> last{};
   size_t axes = 2;
   CommandPublishResult result = CommandPublishResult::kSnapshotPublished;
 protected:
-  int64_t pairSteadyNow() const noexcept override {return now;}
+  int64_t pairSteadyNow() const noexcept override {if (time_hook) {time_hook();} return now;}
   CommandPublishResult publishPairBatch(const PublishedCommand * packets) override {
     ++publications; std::copy(packets, packets + axes, last.begin()); return result;
   }
@@ -479,4 +484,83 @@ TEST(PairB2, CompleteModeStopRequestsOnceAtObservedBoundary)
   }
 }
 }  // namespace
+TEST(PairSystem, FeedbackPendingFreezesGenerationWithoutEarlyErrorAndRejectsRestart)
+{
+  for (size_t n : {2U, 3U}) {
+    for (bool second_check : {false, true}) {
+      PairHarness s; s.axes = n; ASSERT_EQ(s.on_init(info(true, true, n)), H::SUCCESS);
+      PairSystemTestAccess::arm(s);
+      ASSERT_EQ(s.perform_command_mode_switch(keys(s), {}), Ret::OK);
+      auto commands = s.export_command_interfaces();
+      for (size_t i = 0; i < n * 5; ++i) {ASSERT_TRUE(commands[i].set_value(0.));}
+      ASSERT_TRUE(commands.back().set_value(1.));
+      auto & safety = PairSystemTestAccess::safety(s);
+      if (second_check) {
+        s.time_hook = [&] {safety.feedback_stopped = true; s.now += 20000000;};
+      }
+      else {safety.feedback_stopped = true;}
+      EXPECT_EQ(PairSystemTestAccess::write(s, s.now), Ret::OK);
+      EXPECT_EQ(PairSystemTestAccess::last(s), 0U); EXPECT_EQ(s.publications, 0U);
+      EXPECT_EQ(PairSystemTestAccess::reason(s), PairCommit::Reason::kFeedbackPending);
+      EXPECT_EQ(safety.sources.load(), 0U); // No synthetic HWIF ERROR requirement.
+      EXPECT_EQ(s.perform_command_mode_switch({}, keys(s)), Ret::OK);
+      EXPECT_EQ(s.prepare_command_mode_switch(keys(s), {}), Ret::ERROR);
+    }
+  }
+}
+TEST(PairSystem, FeedbackPendingDoesNotSuppressIndependentHwifFault)
+{
+  for (size_t n : {2U, 3U}) {
+    PairHarness s; s.axes = n; ASSERT_EQ(s.on_init(info(true, true, n)), H::SUCCESS);
+    PairSystemTestAccess::arm(s); ASSERT_EQ(s.perform_command_mode_switch(keys(s), {}), Ret::OK);
+    auto commands = s.export_command_interfaces();
+    for (size_t i = 0; i < n * 5; ++i) {ASSERT_TRUE(commands[i].set_value(0.));}
+    auto & safety = PairSystemTestAccess::safety(s);
+    // A genuinely independent gap must be detected BEFORE stale freezes L.
+    ASSERT_TRUE(commands.back().set_value(2.));
+    EXPECT_EQ(PairSystemTestAccess::write(s, s.now), Ret::ERROR);
+    EXPECT_EQ(safety.sources.load(), 1U); EXPECT_TRUE(PairSystemTestAccess::latched(s));
+    safety.feedback_stopped = true;
+    safety.request(1, SafetySource::kFeedbackStale, 1, 2);
+    ASSERT_TRUE(commands.back().set_value(3.));
+    EXPECT_EQ(PairSystemTestAccess::write(s, s.now), Ret::ERROR);
+    EXPECT_EQ(safety.sources.load(), 9U); EXPECT_FALSE(safety.ready());
+    EXPECT_EQ(safety.requests.load(), 2U); // No new HWIF request during feedback pending.
+    EXPECT_EQ(PairSystemTestAccess::latestReason(s), PairCommit::Reason::kFeedbackPending);
+    EXPECT_EQ(PairSystemTestAccess::last(s), 0U);
+  }
+}
+TEST(PairSystem, FeedbackPendingAdvancingControllerGenerationsNeverCreateGapError)
+{
+  for (size_t n : {2U, 3U}) {
+    for (bool already_committed : {false, true}) {
+      PairHarness s; s.axes = n; ASSERT_EQ(s.on_init(info(true, true, n)), H::SUCCESS);
+      PairSystemTestAccess::arm(s); PairSystemTestAccess::capacity(s, 64);
+      ASSERT_EQ(s.perform_command_mode_switch(keys(s), {}), Ret::OK);
+      auto commands = s.export_command_interfaces();
+      for (size_t i = 0; i < n * 5; ++i) {ASSERT_TRUE(commands[i].set_value(0.));}
+      if (already_committed) {
+        ASSERT_TRUE(commands.back().set_value(1.));
+        ASSERT_EQ(PairSystemTestAccess::write(s, s.now), Ret::OK);
+      }
+      const auto last = PairSystemTestAccess::last(s);
+      const auto accepted = PairSystemTestAccess::accepted(s);
+      const auto published = s.publications;
+      auto & safety = PairSystemTestAccess::safety(s);
+      safety.feedback_stopped = true; safety.request(1, SafetySource::kFeedbackStale, 1, 2);
+      for (uint64_t step = 1; step <= 16; ++step) {
+        ASSERT_TRUE(commands.back().set_value(static_cast<double>(last + step)));
+        // Also cross the initial commit deadline: inspect must not run even at L=0.
+        EXPECT_EQ(PairSystemTestAccess::write(s, s.now + step * 2000000), Ret::OK);
+        EXPECT_EQ(PairSystemTestAccess::latestReason(s), PairCommit::Reason::kFeedbackPending);
+        EXPECT_EQ(safety.sources.load(), 8U); EXPECT_EQ(safety.requests.load(), 1U);
+        EXPECT_EQ(PairSystemTestAccess::last(s), last);
+        EXPECT_EQ(PairSystemTestAccess::accepted(s), accepted);
+        EXPECT_EQ(s.publications, published); EXPECT_FALSE(PairSystemTestAccess::latched(s));
+      }
+      ASSERT_EQ(s.perform_command_mode_switch({}, keys(s)), Ret::OK);
+      EXPECT_EQ(s.prepare_command_mode_switch(keys(s), {}), Ret::ERROR);
+    }
+  }
+}
 }  // namespace bxi_hardware

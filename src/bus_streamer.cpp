@@ -988,6 +988,121 @@ bool BxiBusStreamer::controlUnavailable(size_t axis) const
          write_storage_->control_unavailable[axis].load();
 }
 
+FeedbackCapture BxiBusStreamer::captureFeedback(int64_t evaluated_ns)
+{
+  FeedbackCapture capture;
+  auto & storage = *write_storage_;
+  const size_t n = std::min(drivers_.size(), capture.received_ns.size());
+  for (size_t axis = 0; axis < n; ++axis) {
+    PublishedFeedback value;
+    const bool published = storage.feedback[axis]->version() != 0;
+    const bool read = !published || storage.feedback[axis]->tryRead(&value);
+    storage.material_read_failed[axis] = !read;
+    capture.read_failed[axis] = !read;
+    if (!published) {value = storage.tx_feedback[axis];}
+    const auto acquired = clock_type::now().time_since_epoch().count();
+    const bool eligible = !published || (storage.first_stream_send_ns &&
+      value.received_ns >= storage.first_stream_send_ns);
+    if (read && eligible && value.feedback.valid && std::isfinite(value.feedback.position)) {
+      storage.last_valid[axis] = value;
+      storage.has_last_valid[axis] = true;
+      storage.material_acquired_ns[axis] = acquired;
+    }
+    if (storage.has_last_valid[axis]) {
+      const auto & material = storage.last_valid[axis];
+      capture.position[axis] = material.feedback.position;
+      capture.sequence[axis] = material.sequence;
+      capture.material_received_ns[axis] = material.received_ns;
+      capture.acquired_ns[axis] = storage.material_acquired_ns[axis];
+      capture.material[axis] = (material.sequence ? 2 : 1) | 4 | 8;
+    }
+    capture.received_ns[axis] = storage.received_ns[axis].load();
+  }
+  capture.evaluated_ns = evaluated_ns ? evaluated_ns : clock_type::now().time_since_epoch().count();
+  const auto first = storage.first_stream_send_ns;
+  for (size_t axis = 0; axis < n; ++axis) {
+    const auto bit = uint32_t{1} << axis;
+    const auto received = capture.received_ns[axis];
+    capture.age_ns[axis] = -1; capture.wait_ns[axis] = -1;
+    const auto material_time = capture.material_received_ns[axis];
+    capture.material_unknown[axis] = !material_time || material_time > capture.evaluated_ns;
+    capture.material_age_ns[axis] = capture.material_unknown[axis] ? -1 : capture.evaluated_ns - material_time;
+    if (!first) {capture.missing_mask |= bit; continue;}
+    // Match waitForFirstFeedback: equality belongs to the stream epoch.
+    const bool received_in_stream = received != 0 && received >= first;
+    if (!received_in_stream) {capture.missing_mask |= bit;}
+    const auto base = received_in_stream ? received : first;
+    if (base > capture.evaluated_ns) {
+      capture.unknown_mask |= bit; capture.base[axis] = 3; continue;
+    }
+    capture.base[axis] = received_in_stream ? 1 : 2;
+    const auto age = capture.evaluated_ns - base;
+    if (received_in_stream) {capture.age_ns[axis] = age;} else {capture.wait_ns[axis] = age;}
+    if (age >= config_.max_feedback_age.count()) {capture.stale_mask |= bit;}
+  }
+  return capture;
+}
+
+void BxiBusStreamer::collectFeedbackStale(int64_t evaluated_ns)
+{
+  auto & safety = *config_.group_safety;
+  if (safety.finished()) {return;}
+  const auto capture = captureFeedback(evaluated_ns);
+  if (!capture.stale_mask || safety.feedback_stale.detected) {return;}
+  auto & record = safety.feedback_stale;
+  record.detected = true; record.detection = capture;
+  for (size_t axis = 0; axis < drivers_.size(); ++axis) {
+    if (capture.stale_mask & (uint32_t{1} << axis)) {record.primary_axis = axis; break;}
+  }
+  safety.feedback_stopped.store(true);
+  tx_stats_.feedback_stale_at_stop = true;
+  // Keep an existing terminal reason; command expiry is selected by sendWriteLoop.
+  if (!safety.requested()) {safety.terminal_fault = StreamFault::kFeedbackStale;}
+  safety.request(safety.epoch, SafetySource::kFeedbackStale, capture.evaluated_ns,
+    clock_type::now().time_since_epoch().count());
+}
+
+bool GroupSafety::saveFeedbackStale(const std::string & path) const
+{
+  const auto & r = feedback_stale;
+  std::ofstream out(path);
+  out << "#schema=pair_feedback_stale_v1\n#send_api_only=1;physical_receipt_application_stop=unknown\n#dropped=" << (r.detected && !r.capacity ? 1 : 0) << '\n';
+  out << "epoch,N,sources,detected,attempt_observed,primary_axis,detected_ns,registered_ns,error_observed_ns,attempted_ns,completed_ns,result,send_attempted,send_success,drain_timed_out";
+  for (const auto * phase : {"detect", "attempt"}) {
+    out << ',' << phase << "_eval_ns," << phase << "_stale_mask," << phase << "_missing_mask," << phase << "_unknown_mask";
+    for (size_t axis = 0; axis < axes; ++axis) {
+      out << ',' << phase << "_received_ns" << axis << ',' << phase << "_age_ns" << axis << ',' << phase << "_wait_ns" << axis << ',' << phase << "_base" << axis
+        << ',' << phase << "_position" << axis << ',' << phase << "_sequence" << axis
+        << ',' << phase << "_material_received_ns" << axis << ',' << phase << "_acquired_ns" << axis
+        << ',' << phase << "_material_age_ns" << axis << ',' << phase << "_material" << axis
+        << ',' << phase << "_read_failed" << axis << ',' << phase << "_material_unknown" << axis;
+    }
+  }
+  for (size_t axis = 0; axis < axes; ++axis) {
+    out << ",joint" << axis << ",id" << axis << ",position" << axis << ",material" << axis << ",sequence" << axis << ",material_received_ns" << axis << ",acquired_ns" << axis << ",material_age_ns" << axis << ",material_unknown" << axis << ",read_failed" << axis;
+  }
+  out << '\n' << std::setprecision(17);
+  if (r.detected && r.capacity) {
+    out << epoch << ',' << axes << ',' << sources.load() << ',' << r.detected << ',' << r.attempted << ',' << r.primary_axis << ',' << detected_ns.load() << ',' << registered_ns.load() << ',' << error_observed_ns.load() << ',' << attempted_ns.load() << ',' << completed_ns.load() << ',' << static_cast<unsigned>(drain_timed_out ? SafetyResult::kIncomplete : result.load()) << ',' << send_attempted << ',' << send_success << ',' << drain_timed_out.load();
+    for (const auto * c : {&r.detection, &r.attempt}) {
+      out << ',' << c->evaluated_ns << ',' << c->stale_mask << ',' << c->missing_mask << ',' << c->unknown_mask;
+      for (size_t axis = 0; axis < axes; ++axis) {
+        out << ',' << c->received_ns[axis] << ',' << c->age_ns[axis] << ',' << c->wait_ns[axis] << ',' << static_cast<unsigned>(c->base[axis])
+          << ',' << c->position[axis] << ',' << c->sequence[axis]
+          << ',' << c->material_received_ns[axis] << ',' << c->acquired_ns[axis]
+          << ',' << c->material_age_ns[axis] << ',' << static_cast<unsigned>(c->material[axis])
+          << ',' << static_cast<unsigned>(c->read_failed[axis]) << ',' << static_cast<unsigned>(c->material_unknown[axis]);
+      }
+    }
+    for (size_t axis = 0; axis < axes; ++axis) {
+      out << ",joint" << axis + 1 << ',' << axis + 1 << ',' << position[axis] << ',' << static_cast<unsigned>(material[axis]) << ',' << feedback_sequence[axis] << ',' << feedback_received_ns[axis] << ',' << r.acquired_ns[axis] << ',' << r.material_age_ns[axis] << ',' << static_cast<unsigned>(r.material_unknown[axis]) << ',' << static_cast<unsigned>(r.read_failed[axis]);
+    }
+    out << '\n';
+  }
+  out.flush();
+  return out.good() && r.detected && r.capacity && finished() && !drain_timed_out;
+}
+
 void BxiBusStreamer::performGroupSafety()
 {
   auto & safety = *config_.group_safety;
@@ -1002,6 +1117,10 @@ void BxiBusStreamer::performGroupSafety()
   if (!safety.ready()) {return;}
   auto expected = SafetyResult::kUnattempted;
   if (!safety.result.compare_exchange_strong(expected, SafetyResult::kProcessing)) {return;}
+  if (safety.feedback_stale.detected) {
+    safety.feedback_stale.attempt = captureFeedback();
+    safety.feedback_stale.attempted = true;
+  }
   safety.attempted_ns = now();
   StreamCycleRecord * row = nullptr;
   if (safety.sources.load() & static_cast<uint32_t>(SafetySource::kWatchdog)) {
@@ -1036,10 +1155,28 @@ void BxiBusStreamer::performGroupSafety()
     PublishedFeedback feedback;
     if (storage.feedback[axis]->version()) {
       if (!storage.feedback[axis]->tryRead(&feedback)) {
+        safety.feedback_stale.read_failed[axis] = 1;
         finish(SafetyResult::kCannotGenerate, SafetyFailure::kFeedbackRead, static_cast<int>(axis)); return;
       }
       safety.material[axis] = 2;
     } else {feedback = storage.tx_feedback[axis]; safety.material[axis] = 1;}
+    if (safety.feedback_stale.detected) {
+      if ((!feedback.sequence || feedback.received_ns >= storage.first_stream_send_ns) &&
+        feedback.feedback.valid && std::isfinite(feedback.feedback.position)) {
+        storage.last_valid[axis] = feedback; storage.has_last_valid[axis] = true;
+        storage.material_acquired_ns[axis] = now();
+      }
+      if (storage.has_last_valid[axis]) {feedback = storage.last_valid[axis];}
+      else if (feedback.sequence && feedback.received_ns < storage.first_stream_send_ns) {
+        feedback.feedback.valid = false;
+      }
+      safety.material[axis] = feedback.sequence ? 2 : 1;
+      auto & record = safety.feedback_stale;
+      record.acquired_ns[axis] = storage.material_acquired_ns[axis];
+      record.material_unknown[axis] = !feedback.received_ns || feedback.received_ns > safety.attempted_ns;
+      record.material_age_ns[axis] = record.material_unknown[axis] ? -1 :
+        safety.attempted_ns.load() - feedback.received_ns;
+    }
     safety.position[axis] = feedback.feedback.position;
     safety.feedback_sequence[axis] = feedback.sequence;
     safety.feedback_received_ns[axis] = feedback.received_ns;
@@ -1091,14 +1228,35 @@ void BxiBusStreamer::sendWriteLoop()
   uint64_t observed_version = 0;
   int last_send_kind = 0;
   bool snapshot_failed = false;
+  if (config_.group_safety) {
+    for (size_t axis = 0; axis < n; ++axis) {
+      const auto & initial = storage.tx_feedback[axis];
+      if (initial.feedback.valid && std::isfinite(initial.feedback.position)) {
+        storage.last_valid[axis] = initial;
+        storage.has_last_valid[axis] = true;
+        storage.material_acquired_ns[axis] = ns_now();
+      }
+    }
+  }
   tx_state_ = kReady;
   while (true) {
     // G requests are handled before ordinary stop flags, without another HWIF write.
     auto * safety = config_.group_safety;
     if (safety && safety->requested()) {
+      collectFeedbackStale();
+      if (schedule.sequence && ns_now() >= schedule.published_ns + config_.max_command_age.count() &&
+        !(safety->sources.load() & static_cast<uint32_t>(SafetySource::kWatchdog))) {
+        safety->watchdog_sequence = schedule.sequence;
+        safety->watchdog_published_ns = schedule.published_ns;
+        safety->request(safety->epoch, SafetySource::kWatchdog, ns_now(), ns_now());
+      }
       performGroupSafety();
       if (safety->finished()) {
-        fault(safety->terminal_fault, -1); break;
+        if (safety->feedback_stale.detected) {
+          for (auto * driver : drivers_) {driver->latchCommunicationFault(false);}
+        }
+        fault(safety->terminal_fault, safety->terminal_fault == StreamFault::kFeedbackStale ?
+          safety->feedback_stale.primary_axis : -1); break;
       }
       // A registered HWIF fault must wait for the post-ERROR observation boundary.
       // Finite poll timeout also permits progress if eventfd notification failed.
@@ -1162,7 +1320,7 @@ void BxiBusStreamer::sendWriteLoop()
       if (base) {
         feedback_due = std::min(feedback_due, base + config_.max_feedback_age.count());
         tx_stats_.max_age_ms[i] = std::max(tx_stats_.max_age_ms[i], (now - base) / 1.e6);
-        if (now >= base + config_.max_feedback_age.count()) {
+        if (!config_.group_safety && now >= base + config_.max_feedback_age.count()) {
           tx_stats_.feedback_stale_at_stop = true;
           if (stop_reason == StreamFault::kNone) {
             stop_reason = StreamFault::kFeedbackStale; stop_axis = static_cast<int>(i);
@@ -1174,6 +1332,16 @@ void BxiBusStreamer::sendWriteLoop()
     if (active) {
       tx_stats_.max_command_age_ms = std::max(tx_stats_.max_command_age_ms,
         (now - schedule.published_ns) / 1.e6);
+    }
+    if (config_.group_safety && (stop_reason == StreamFault::kNone ||
+      stop_reason == StreamFault::kCommandStale ||
+      stop_reason == StreamFault::kCommandSnapshotUnavailable ||
+      stop_reason == StreamFault::kStartupTimeout)) {
+      // Capture after material reads. Keep command/independent fault precedence.
+      collectFeedbackStale();
+      if (config_.group_safety->feedback_stale.detected && stop_reason == StreamFault::kNone) {
+        continue;
+      }
     }
     const bool zero_stop = stop_reason == StreamFault::kCommandStale ||
       stop_reason == StreamFault::kCommandSnapshotUnavailable ||
@@ -1297,7 +1465,10 @@ void BxiBusStreamer::sendWriteLoop()
         row->outcome = sent == frames ? StreamCycleOutcome::kSent : StreamCycleOutcome::kPartial;
       }
       if (sent) {
-        if (!first_send) {first_send = send_at; first_send_ns_ = send_at;}
+        if (!first_send) {
+          first_send = send_at; first_send_ns_ = send_at;
+          storage.first_stream_send_ns = send_at;
+        }
         schedule.sent(send_at, resend);
         last_send_kind = zero_stop ? 4 : !active ? 1 : resend ? 3 : 2;
         bootstrap_due = send_at + config_.period.count();

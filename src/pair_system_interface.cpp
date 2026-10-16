@@ -113,7 +113,7 @@ hardware_interface::return_type BxiSystemInterface::prepare_command_mode_switch(
   if (!pair_mode_) {return hardware_interface::return_type::OK;}
   if (!complete(start, pair_keys_, pair_commit_.valueCount() + 1) ||
     !complete(stop, pair_keys_, pair_commit_.valueCount() + 1) ||
-    (!start.empty() && (pair_terminal_ || pair_claimed_ || !stop.empty())) ||
+    (!start.empty() && (pair_terminal_ || pair_safety_.feedback_stopped || pair_claimed_ || !stop.empty())) ||
     (!stop.empty() && !pair_claimed_))
   {return hardware_interface::return_type::ERROR;}
   return hardware_interface::return_type::OK;
@@ -146,8 +146,14 @@ hardware_interface::return_type BxiSystemInterface::writePair(int64_t now)
     row.values[i + 4] = cmd_eff_[axis];
   }
   // Stage is untrusted even when unclaimed; it never supplies bootstrap values.
-  row.reason = pair_claimed_ ? pair_commit_.inspect(pair_generation_, row.values, now) :
+  // A frozen L must not turn the controller's advancing g into a new HWIF fault.
+  // Preserve already registered HWIF ERROR below, but never inspect while stopped.
+  row.reason = pair_safety_.feedback_stopped ? PairCommit::Reason::kFeedbackPending :
+    pair_claimed_ ? pair_commit_.inspect(pair_generation_, row.values, now) :
     PairCommit::Reason::kNotClaimed;
+  if (pair_safety_.feedback_stopped && row.reason == PairCommit::Reason::kAccepted) {
+    row.reason = PairCommit::Reason::kFeedbackPending;
+  }
   if (row.reason == PairCommit::Reason::kAccepted) {
     std::array<PublishedCommand, PairCommit::kMaxAxes> packets{};
     for (size_t axis = 0; axis < n_joints_; ++axis) {
@@ -159,7 +165,11 @@ hardware_interface::return_type BxiSystemInterface::writePair(int64_t now)
     row.published_ns = pairSteadyNow();
     for (size_t axis = 0; axis < n_joints_; ++axis) {packets[axis].published_ns = row.published_ns;}
     // Recheck the fixed initial deadline at batch completion, not only at write entry.
-    row.reason = pair_commit_.inspect(pair_generation_, row.values, row.published_ns);
+    row.reason = pair_safety_.feedback_stopped ? PairCommit::Reason::kFeedbackPending :
+      pair_commit_.inspect(pair_generation_, row.values, row.published_ns);
+    if (pair_safety_.feedback_stopped && row.reason == PairCommit::Reason::kAccepted) {
+      row.reason = PairCommit::Reason::kFeedbackPending;
+    }
     if (row.reason == PairCommit::Reason::kAccepted) {
       row.accepted_ns = row.published_ns;
       pair_commit_.accept(pair_generation_);

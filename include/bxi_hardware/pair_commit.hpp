@@ -26,7 +26,7 @@ public:
   enum class Reason : uint8_t
   {
     kBootWait, kUnchanged, kAccepted, kInvalidGeneration, kRollback, kGap,
-    kInvalidBatch, kLatchedNonzero, kStartupExpired, kUpperLimit, kPublishFailed, kNotClaimed
+    kInvalidBatch, kLatchedNonzero, kStartupExpired, kUpperLimit, kPublishFailed, kNotClaimed, kFeedbackPending
   };
   struct Bounds {Values lower{}, upper{};};
   void reset(int64_t activation_ns, int64_t timeout_ns) noexcept

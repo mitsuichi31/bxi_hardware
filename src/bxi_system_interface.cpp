@@ -904,6 +904,11 @@ void BxiSystemInterface::releaseResources()
     (worker_timing_dir_.empty() || !pair_safety_.save(worker_timing_dir_ + "/pair_safety.csv"))) {
     RCLCPP_ERROR(logger(), "group safety record incomplete, missing, or save failed");
   }
+  if (pair_mode_ && pair_safety_.feedback_stale.detected &&
+    (worker_timing_dir_.empty() || !pair_safety_.saveFeedbackStale(
+      worker_timing_dir_ + "/pair_feedback_stale.csv"))) {
+    RCLCPP_ERROR(logger(), "feedback stale record incomplete, missing, or save failed");
+  }
   control_streams_.clear();
   prepared_write_storage_.clear();
   streamers_.clear();

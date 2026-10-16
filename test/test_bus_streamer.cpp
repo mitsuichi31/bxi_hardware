@@ -42,6 +42,8 @@ struct GroupSafetyTestAccess
     for (auto * driver : s.drivers_) {s.can_ids_.push_back(driver->canId());}
   }
   static void perform(BxiBusStreamer & s) {s.performGroupSafety();}
+  static auto capture(BxiBusStreamer & s, int64_t now) {return s.captureFeedback(now);}
+  static void collect(BxiBusStreamer & s, int64_t now) {s.collectFeedbackStale(now);}
 };
 struct PairSystemTestAccess
 {
@@ -2069,6 +2071,275 @@ TEST(GroupSafetyLifetime, HardwareDeactivateShutdownAndDestructionDrainBeforeClo
         std::ifstream saved(output + "/pair_safety.csv"); EXPECT_TRUE(saved.good());
       }
     }
+  }
+}
+TEST_P(GroupSafetyAxes, FeedbackEveryMaskAndNanosecondBoundary)
+{
+  const size_t n = GetParam();
+  for (uint32_t mask = 1; mask < (1U << n); ++mask) {
+    for (int64_t delta : {-1, 0, 1}) {
+      Rig rig(n == 2 ? std::vector<int>{1, 2} : std::vector<int>{1, 2, 3});
+      GroupSafety safety; safety.reset(31, n); auto c = writeConfig();
+      c.group_safety = &safety; c.max_feedback_age = 3ms; c.period = 1ms; c.write_grace = 200us;
+      auto storage = safetyStorage(n); auto * raw = storage.get();
+      raw->first_stream_send_ns = 100;
+      for (size_t axis = 0; axis < n; ++axis) {
+        raw->received_ns[axis] = mask & (1U << axis) ? 1000 : 2000;
+      }
+      auto streamer = rig.makeStreamer(c, nullptr, std::move(storage));
+      GroupSafetyTestAccess::prepare(*streamer);
+      auto captured = GroupSafetyTestAccess::capture(*streamer, 3001000 + delta);
+      EXPECT_EQ(captured.stale_mask, delta < 0 ? 0U : mask);
+      EXPECT_EQ(captured.missing_mask, 0U);
+      EXPECT_EQ(captured.unknown_mask, 0U);
+      GroupSafetyTestAccess::collect(*streamer, 3001000 + delta);
+      EXPECT_EQ(safety.feedback_stopped.load(), delta >= 0);
+      if (delta >= 0) {
+        EXPECT_EQ(safety.sources.load(), 8U);
+        int primary = 0; while (!(mask & (1U << primary))) {++primary;}
+        EXPECT_EQ(safety.feedback_stale.primary_axis, primary);
+        EXPECT_EQ(safety.feedback_stale.detection.evaluated_ns, 3001000 + delta);
+        EXPECT_EQ(safety.result, SafetyResult::kUnattempted);
+      }
+    }
+  }
+}
+TEST_P(GroupSafetyAxes, FeedbackInitialWaitPreparedAndFutureTimestamps)
+{
+  const size_t n = GetParam(); Rig rig(n == 2 ? std::vector<int>{1, 2} : std::vector<int>{1, 2, 3});
+  GroupSafety safety; safety.reset(32, n); auto c = writeConfig(); c.group_safety = &safety; c.max_feedback_age = 3ms; c.period = 1ms; c.write_grace = 200us;
+  auto storage = safetyStorage(n); auto * raw = storage.get();
+  auto streamer = rig.makeStreamer(c, nullptr, std::move(storage)); GroupSafetyTestAccess::prepare(*streamer);
+  EXPECT_EQ(GroupSafetyTestAccess::capture(*streamer, 9999999).stale_mask, 0U);
+  raw->first_stream_send_ns = 1000;
+  raw->received_ns[0] = 999;  // Before first successful stream send, not an initial reply.
+  auto before = GroupSafetyTestAccess::capture(*streamer, 3000999);
+  EXPECT_EQ(before.stale_mask, 0U); EXPECT_EQ(before.missing_mask, (1U << n) - 1);
+  auto equal = GroupSafetyTestAccess::capture(*streamer, 3001000);
+  EXPECT_EQ(equal.stale_mask, (1U << n) - 1);
+  for (size_t axis = 0; axis < n; ++axis) {
+    EXPECT_EQ(equal.age_ns[axis], -1); EXPECT_EQ(equal.wait_ns[axis], 3000000);
+    EXPECT_EQ(equal.base[axis], 2U);
+  }
+  raw->received_ns[0] = 3002000;
+  auto future = GroupSafetyTestAccess::capture(*streamer, 3001000);
+  EXPECT_EQ(future.unknown_mask, 1U); EXPECT_EQ(future.base[0], 3U);
+  EXPECT_EQ(future.age_ns[0], -1); EXPECT_EQ(future.stale_mask & 1, 0U);
+  raw->received_ns[0] = 1000; // Match the existing activation waiter at equality.
+  EXPECT_EQ(GroupSafetyTestAccess::capture(*streamer, 1000).missing_mask & 1, 0U);
+}
+TEST_P(GroupSafetyAxes, FeedbackPendingGateLateReplyAndOneAttempt)
+{
+  const size_t n = GetParam(); Rig rig(n == 2 ? std::vector<int>{1, 2} : std::vector<int>{1, 2, 3});
+  GroupSafety safety; safety.reset(33, n); auto c = writeConfig(); c.group_safety = &safety; c.max_feedback_age = 3ms; c.period = 1ms; c.write_grace = 200us;
+  auto storage = safetyStorage(n); auto * raw = storage.get(); raw->first_stream_send_ns = 1000;
+  auto streamer = rig.makeStreamer(c, nullptr, std::move(storage)); GroupSafetyTestAccess::prepare(*streamer);
+  safety.request(33, SafetySource::kHwFault, 2000, 2001);
+  GroupSafetyTestAccess::collect(*streamer, 3001000);
+  EXPECT_EQ(safety.sources.load(), 9U); EXPECT_FALSE(safety.ready());
+  const auto count = rig.link.sent().size();
+  GroupSafetyTestAccess::perform(*streamer); EXPECT_EQ(rig.link.sent().size(), count);
+  // A late fresh reply cannot erase the first stale/missing capture.
+  const auto stamp = clock_type::now().time_since_epoch().count();
+  for (size_t axis = 0; axis < n; ++axis) {
+    PublishedFeedback value; value.feedback.valid = true; value.feedback.position = .2;
+    value.sequence = 1; value.received_ns = stamp;
+    raw->feedback[axis]->publish(&value); raw->received_ns[axis] = stamp;
+  }
+  safety.request(33, SafetySource::kWatchdog, 3001000, 3001001);
+  safety.request(33, SafetySource::kModeStop, 3001002, 3001003);
+  safety.observeError(stamp);
+  GroupSafetyTestAccess::perform(*streamer);
+  EXPECT_EQ(safety.sources.load(), 15U); EXPECT_EQ(safety.result, SafetyResult::kSucceeded);
+  EXPECT_EQ(rig.link.sent().size(), count + 1);
+  EXPECT_EQ(safety.feedback_stale.detection.stale_mask, (1U << n) - 1);
+  EXPECT_EQ(safety.feedback_stale.attempt.stale_mask, 0U);
+  EXPECT_TRUE(safety.feedback_stopped); EXPECT_EQ(safety.feedback_stale.attempt.missing_mask, 0U);
+  GroupSafetyTestAccess::perform(*streamer); EXPECT_EQ(rig.link.sent().size(), count + 1);
+}
+TEST_P(GroupSafetyAxes, FeedbackLastValidPositionDoesNotHideSnapshotReadFailure)
+{
+  const size_t n = GetParam();
+  for (size_t bad = 0; bad < n; ++bad) {
+    Rig rig(n == 2 ? std::vector<int>{1, 2} : std::vector<int>{1, 2, 3});
+    GroupSafety safety; safety.reset(34, n); auto c = writeConfig(); c.group_safety = &safety; c.max_feedback_age = 3ms; c.period = 1ms; c.write_grace = 200us;
+    auto storage = safetyStorage(n); auto * raw = storage.get(); raw->first_stream_send_ns = 1;
+    PublishedFeedback good; good.feedback.valid = true; good.feedback.position = .3;
+    good.sequence = 19; good.received_ns = 100;
+    for (size_t axis = 0; axis < n; ++axis) {raw->feedback[axis]->publish(&good); raw->received_ns[axis] = 100;}
+    auto streamer = rig.makeStreamer(c, nullptr, std::move(storage)); GroupSafetyTestAccess::prepare(*streamer);
+    GroupSafetyTestAccess::collect(*streamer, 3000100);
+    PublishedFeedback invalid; invalid.sequence = 20; invalid.received_ns = 200;
+    invalid.feedback.position = std::numeric_limits<double>::quiet_NaN();
+    raw->feedback[bad]->publish(&invalid);
+    GroupSafetyTestAccess::perform(*streamer);
+    EXPECT_EQ(safety.result, SafetyResult::kSucceeded);
+    EXPECT_EQ(safety.feedback_sequence[bad], 19U); EXPECT_EQ(safety.feedback_received_ns[bad], 100);
+    EXPECT_DOUBLE_EQ(safety.position[bad], .3);
+    // A new epoch, same valid material, but failed snapshot read must not use that cache.
+    safety.reset(35, n); GroupSafetyTestAccess::collect(*streamer, 3000100);
+    AtomicSnapshotTestAccess::pauseWriter(*raw->feedback[bad]);
+    GroupSafetyTestAccess::perform(*streamer);
+    EXPECT_EQ(safety.result, SafetyResult::kCannotGenerate);
+    EXPECT_EQ(safety.failure, SafetyFailure::kFeedbackRead); EXPECT_EQ(safety.failure_axis, bad);
+    EXPECT_FALSE(safety.send_attempted); EXPECT_EQ(safety.feedback_stale.read_failed[bad], 1U);
+  }
+}
+TEST_P(GroupSafetyAxes, FeedbackLiveStaleAttemptsBeforeDriverFaultAndError)
+{
+  const size_t n = GetParam(); Rig rig(n == 2 ? std::vector<int>{1, 2} : std::vector<int>{1, 2, 3});
+  GroupSafety safety; safety.reset(36, n); auto c = writeConfig(); c.group_safety = &safety;
+  c.max_feedback_age = 3ms; c.period = 1ms; c.write_grace = 200us; c.max_command_age = 5ms;
+  c.first_write_timeout = 1000ms;
+  auto streamer = rig.makeStreamer(c, nullptr, safetyStorage(n));
+  ASSERT_TRUE(streamer->start()); ASSERT_TRUE(streamer->waitForFirstFeedback(100ms));
+  streamer->armWrites();
+  rig.link.setRespondingIds(n == 2 ? std::set<int>{1} : std::set<int>{1, 2});
+  for (uint64_t g = 1; g < 500 && !rig.stop_all; ++g) {
+    std::array<PublishedCommand, 3> packets{};
+    const auto stamp = clock_type::now().time_since_epoch().count();
+    for (size_t axis = 0; axis < n; ++axis) {packets[axis].sequence = g; packets[axis].published_ns = stamp;}
+    streamer->publishCommandBatch(packets.data());
+    std::this_thread::sleep_for(200us);
+  }
+  ASSERT_TRUE(rig.waitForStop(100ms).has_value()); streamer->stop();
+  EXPECT_EQ(safety.result, SafetyResult::kSucceeded); EXPECT_EQ(safety.sources.load(), 8U);
+  EXPECT_TRUE(safety.feedback_stopped); EXPECT_TRUE(safety.send_success);
+  EXPECT_GE(safety.completed_ns, safety.attempted_ns);
+  for (const auto & driver : rig.drivers) {EXPECT_EQ(driver->state(), ActuatorState::kSafeStopped);}
+  EXPECT_EQ(streamer->stats().fault, StreamFault::kFeedbackStale);
+  auto frames = rig.link.sent();
+  auto frame = std::find_if(frames.rbegin(), frames.rend(), [n](const auto & f) {return f.id == 0x7FF && f.dlc == 8 * n;});
+  ASSERT_NE(frame, frames.rend());
+  // Independent MIT bit unpacking: v=0 is midpoint quantized, gains and effort zero encoded.
+  for (size_t axis = 0; axis < n; ++axis) {
+    const auto * block = frame->data.data() + 8 * axis;
+    EXPECT_EQ(((block[3] & 0x0f) << 8) | block[4], 0); // Kp
+    EXPECT_EQ((block[5] << 4) | (block[6] >> 4), 0); // Kd
+    const auto & limits = rig.drivers[axis]->limits();
+    const auto decode = [](unsigned value, double low, double high) {
+        return low + value * (high - low) / 4095.;
+      };
+    const unsigned v = (block[2] << 4) | (block[3] >> 4);
+    const unsigned effort = ((block[6] & 0xf) << 8) | block[7];
+    EXPECT_NEAR(decode(v, limits.v_min, limits.v_max), 0., (limits.v_max - limits.v_min) / 4095.);
+    EXPECT_NEAR(decode(effort, limits.torque_min, limits.torque_max), 0., (limits.torque_max - limits.torque_min) / 4095.);
+  }
+  const char * base = std::getenv("BXI_N_AXIS_OUTPUT_DIR");
+  const auto directory = (base ? std::string(base) : ::testing::TempDir()) + "/feedback_result_" + std::to_string(n);
+  std::filesystem::create_directories(directory);
+  const auto path = directory + "/pair_feedback_stale.csv";
+  EXPECT_TRUE(safety.saveFeedbackStale(path)); EXPECT_TRUE(safety.save(directory + "/pair_safety.csv"));
+  safety.feedback_stale.capacity = 0; EXPECT_FALSE(safety.saveFeedbackStale(path + ".zero"));
+  std::ifstream in(path + ".zero"); std::string text((std::istreambuf_iterator<char>(in)), {});
+  EXPECT_NE(text.find("#dropped=1"), std::string::npos);
+  safety.feedback_stale.capacity = 1;
+  EXPECT_FALSE(safety.saveFeedbackStale("/unavailable/feedback.csv"));
+  safety.drain_timed_out = true; EXPECT_FALSE(safety.saveFeedbackStale(path + ".incomplete"));
+}
+TEST_P(GroupSafetyAxes, FeedbackNoInitialReplyUsesPreparedPositionAndFixedFirstSend)
+{
+  const size_t n = GetParam(); Rig rig(n == 2 ? std::vector<int>{1, 2} : std::vector<int>{1, 2, 3});
+  GroupSafety safety; safety.reset(37, n); auto c = writeConfig(); c.group_safety = &safety;
+  c.period = 1ms; c.write_grace = 200us; c.max_feedback_age = 3ms;
+  c.max_command_age = 5ms; c.first_write_timeout = 1000ms;
+  auto storage = safetyStorage(n); auto * raw = storage.get();
+  rig.link.setRespondingIds({});
+  auto streamer = rig.makeStreamer(c, nullptr, std::move(storage));
+  ASSERT_TRUE(streamer->start()); ASSERT_TRUE(rig.waitForStop(100ms).has_value()); streamer->stop();
+  EXPECT_GT(raw->first_stream_send_ns, 0);
+  EXPECT_EQ(safety.result, SafetyResult::kSucceeded);
+  EXPECT_EQ(safety.feedback_stale.detection.missing_mask, (1U << n) - 1);
+  EXPECT_GE(safety.feedback_stale.detection.evaluated_ns - raw->first_stream_send_ns, 3000000);
+  for (size_t axis = 0; axis < n; ++axis) {
+    EXPECT_EQ(safety.material[axis], 13U); EXPECT_EQ(safety.feedback_received_ns[axis], 0);
+    EXPECT_EQ(safety.feedback_stale.detection.age_ns[axis], -1);
+    EXPECT_GE(safety.feedback_stale.detection.wait_ns[axis], 3000000);
+  }
+}
+TEST_P(GroupSafetyAxes, FeedbackFailedFirstSendDoesNotStartDeadline)
+{
+  const size_t n = GetParam(); Rig rig(n == 2 ? std::vector<int>{1, 2} : std::vector<int>{1, 2, 3});
+  GroupSafety safety; safety.reset(38, n); auto c = writeConfig(); c.group_safety = &safety;
+  auto storage = safetyStorage(n); auto * raw = storage.get(); rig.link.send_ok = false;
+  auto streamer = rig.makeStreamer(c, nullptr, std::move(storage));
+  ASSERT_TRUE(streamer->start()); ASSERT_TRUE(rig.waitForStop(100ms).has_value()); streamer->stop();
+  EXPECT_EQ(raw->first_stream_send_ns, 0); EXPECT_EQ(safety.sources.load(), 0U);
+  EXPECT_EQ(streamer->stats().fault, StreamFault::kSendFailed);
+}
+TEST(GroupSafetyLifetime, FeedbackPendingDiagnosticsSurviveAllLifecycleStops)
+{
+  for (size_t n : {2U, 3U}) {
+    for (int ending = 0; ending < 4; ++ending) {
+      Rig rig(n == 2 ? std::vector<int>{1, 2} : std::vector<int>{1, 2, 3});
+      auto system = std::make_unique<BxiSystemInterface>(); auto & safety = PairSystemTestAccess::safety(*system);
+      safety.reset(39, n);
+      auto tx = std::make_shared<SafetyLifetimeBus>(rig.link, safety);
+      auto rx = std::make_shared<SafetyLifetimeBus>(rig.link, safety);
+      auto c = writeConfig(); c.group_safety = &safety; c.safety_drain_timeout = 10ms;
+      c.period = 1ms; c.write_grace = 200us; c.max_feedback_age = 3ms;
+      std::vector<BxiActuatorDriver *> drivers; for (auto & d : rig.drivers) {drivers.push_back(d.get());}
+      auto streamer = std::make_unique<BxiBusStreamer>(tx.get(), rx.get(), drivers, c,
+        [](const auto &, auto &) {return true;}, &rig.stop_all, safetyStorage(n));
+      ASSERT_TRUE(streamer->start()); ASSERT_TRUE(streamer->waitForFirstFeedback(100ms));
+      const char * base = std::getenv("BXI_N_AXIS_OUTPUT_DIR");
+      const auto output = (base ? std::string(base) : ::testing::TempDir()) + "/feedback_lifetime_" +
+        std::to_string(n) + "_" + std::to_string(ending);
+      PairSystemTestAccess::attach(*system, n, std::move(streamer), tx, rx, rig.drivers, output);
+      rig.link.setRespondingIds({}); PairSystemTestAccess::request(*system, false);
+      if (ending == 0) {system->on_deactivate(rclcpp_lifecycle::State());}
+      if (ending == 1) {system->on_shutdown(rclcpp_lifecycle::State());}
+      if (ending == 2) {system->on_cleanup(rclcpp_lifecycle::State());}
+      system.reset();
+      EXPECT_FALSE(tx->closed_before_result); EXPECT_FALSE(rx->closed_before_result);
+      EXPECT_EQ(tx->result_at_close, SafetyResult::kIncomplete);
+      std::ifstream saved(output + "/pair_feedback_stale.csv"); ASSERT_TRUE(saved.good());
+      std::string text((std::istreambuf_iterator<char>(saved)), {});
+      EXPECT_NE(text.find("39," + std::to_string(n) + ",9,1,0,"), std::string::npos);
+    }
+  }
+}
+TEST_P(GroupSafetyAxes, FeedbackWatchdogAndModeStopAggregateInEitherOrderWithoutGate)
+{
+  const size_t n = GetParam();
+  for (auto source : {SafetySource::kWatchdog, SafetySource::kModeStop}) {
+    for (bool first : {false, true}) {
+      Rig rig(n == 2 ? std::vector<int>{1, 2} : std::vector<int>{1, 2, 3});
+      GroupSafety safety; safety.reset(40, n); auto c = writeConfig(); c.group_safety = &safety;
+      c.period = 1ms; c.write_grace = 200us; c.max_feedback_age = 3ms;
+      auto storage = safetyStorage(n); storage->first_stream_send_ns = 100;
+      auto streamer = rig.makeStreamer(c, nullptr, std::move(storage)); GroupSafetyTestAccess::prepare(*streamer);
+      if (first) {safety.request(40, source, 1, 2);}
+      GroupSafetyTestAccess::collect(*streamer, 3000100);
+      if (!first) {safety.request(40, source, 3000100, 3000101);}
+      EXPECT_TRUE(safety.ready()); EXPECT_EQ(safety.sources.load(), 8U | static_cast<unsigned>(source));
+      const auto count = rig.link.sent().size();
+      GroupSafetyTestAccess::perform(*streamer);
+      EXPECT_EQ(safety.result, SafetyResult::kSucceeded); EXPECT_EQ(rig.link.sent().size(), count + 1);
+      GroupSafetyTestAccess::collect(*streamer, 9000000);
+      GroupSafetyTestAccess::perform(*streamer); EXPECT_EQ(rig.link.sent().size(), count + 1);
+    }
+  }
+}
+TEST_P(GroupSafetyAxes, FeedbackPreFirstSendSnapshotCannotReplacePreparedMaterial)
+{
+  const size_t n = GetParam(); Rig rig(n == 2 ? std::vector<int>{1, 2} : std::vector<int>{1, 2, 3});
+  GroupSafety safety; safety.reset(41, n); auto c = writeConfig(); c.group_safety = &safety;
+  c.period = 1ms; c.write_grace = 200us; c.max_feedback_age = 3ms;
+  auto storage = safetyStorage(n); auto * raw = storage.get(); raw->first_stream_send_ns = 1000;
+  for (size_t axis = 0; axis < n; ++axis) {
+    raw->last_valid[axis] = raw->tx_feedback[axis]; raw->has_last_valid[axis] = true;
+    PublishedFeedback pre; pre.feedback.valid = true; pre.feedback.position = .4;
+    pre.sequence = 20; pre.received_ns = 999;
+    raw->feedback[axis]->publish(&pre); raw->received_ns[axis] = 999;
+  }
+  auto streamer = rig.makeStreamer(c, nullptr, std::move(storage)); GroupSafetyTestAccess::prepare(*streamer);
+  GroupSafetyTestAccess::collect(*streamer, 3001000); GroupSafetyTestAccess::perform(*streamer);
+  EXPECT_EQ(safety.result, SafetyResult::kSucceeded);
+  EXPECT_EQ(safety.feedback_stale.detection.missing_mask, (1U << n) - 1);
+  for (size_t axis = 0; axis < n; ++axis) {
+    EXPECT_EQ(safety.material[axis], 13U); EXPECT_EQ(safety.feedback_sequence[axis], 0U);
+    EXPECT_EQ(safety.feedback_received_ns[axis], 0); EXPECT_DOUBLE_EQ(safety.position[axis], .1 * axis);
   }
 }
 INSTANTIATE_TEST_SUITE_P(TwoAndThree, GroupSafetyAxes, ::testing::Values(2U, 3U));

@@ -63,6 +63,11 @@ struct WriteStreamStorage
   std::vector<FeedbackTransform> transforms;
   std::vector<StreamCommand> tx_commands;
   std::vector<std::pair<int, std::array<uint8_t, 8>>> tx_blocks;
+  // TX-only last valid material. Snapshot read failure never authorizes fallback.
+  std::array<PublishedFeedback, 3> last_valid{};
+  std::array<int64_t, 3> material_acquired_ns{};
+  std::array<bool, 3> has_last_valid{}, material_read_failed{};
+  int64_t first_stream_send_ns = 0;
   int event_fd = -1, timer_fd = -1;
 };
 
@@ -99,9 +104,30 @@ enum class CommandPublishResult {kNotPublished, kSnapshotPublished, kSnapshotPub
 
 // One activation-owned request, independent of the normal command snapshot.
 // Metadata is atomic because the control thread, error callback and TX may interleave.
-enum class SafetySource : uint32_t {kHwFault = 1, kModeStop = 2, kWatchdog = 4};
+enum class SafetySource : uint32_t {kHwFault = 1, kModeStop = 2, kWatchdog = 4, kFeedbackStale = 8};
 enum class SafetyResult : uint32_t {kUnattempted, kProcessing, kCannotGenerate, kSendFailed, kSucceeded, kIncomplete};
 enum class SafetyFailure : uint32_t {kNone, kFeedbackRead, kInvalidFeedback, kPosition, kDriver, kEncode, kFrame, kNoErrorObservation, kDrainTimeout};
+// Immutable captures are TX-owned and saved only after join. Unknown is explicit.
+struct FeedbackCapture
+{
+  int64_t evaluated_ns = 0;
+  uint32_t stale_mask = 0, missing_mask = 0, unknown_mask = 0;
+  std::array<int64_t, 3> received_ns{}, age_ns{}, wait_ns{};
+  std::array<double, 3> position{};
+  std::array<uint64_t, 3> sequence{};
+  std::array<int64_t, 3> material_received_ns{}, acquired_ns{}, material_age_ns{};
+  std::array<uint8_t, 3> material{}, read_failed{}, material_unknown{};
+  std::array<uint8_t, 3> base{};  // 0=not started, 1=RX, 2=first-send wait, 3=unknown
+};
+struct FeedbackStaleRecord
+{
+  size_t capacity = 1;
+  bool detected = false, attempted = false;
+  FeedbackCapture detection{}, attempt{};
+  int primary_axis = -1;
+  std::array<int64_t, 3> acquired_ns{}, material_age_ns{{-1, -1, -1}};
+  std::array<uint8_t, 3> material_unknown{{1, 1, 1}}, read_failed{};
+};
 struct GroupSafety
 {
   static_assert(std::atomic<int64_t>::is_always_lock_free && std::atomic<uint32_t>::is_always_lock_free &&
@@ -123,6 +149,10 @@ struct GroupSafety
   int failure_axis = -1;
   bool send_attempted = false, send_success = false, notification_failed = false;
   StreamFault terminal_fault = StreamFault::kOwnerRequested;
+  // TX writes the cause record; RT writers only observe this admission latch.
+  std::atomic<bool> feedback_stopped{false};
+  FeedbackStaleRecord feedback_stale;
+  bool saveFeedbackStale(const std::string & path) const;
   uint64_t watchdog_sequence = 0;
   int64_t watchdog_published_ns = 0;
   void reset(uint64_t new_epoch, size_t count) noexcept {
@@ -133,6 +163,9 @@ struct GroupSafety
     position = {}; material = {}; feedback_sequence = {}; feedback_received_ns = {};
     failure = SafetyFailure::kNone; failure_axis = -1;
     send_attempted = send_success = notification_failed = false;
+    feedback_stopped = false;
+    const auto capacity = feedback_stale.capacity;
+    feedback_stale = {}; feedback_stale.capacity = capacity;
     terminal_fault = StreamFault::kOwnerRequested; watchdog_sequence = 0; watchdog_published_ns = 0;
   }
   bool request(uint64_t request_epoch, SafetySource source, int64_t detected, int64_t registered) noexcept {
@@ -407,6 +440,8 @@ private:
   void sendLoop();
   void sendWriteLoop();
   void performGroupSafety();
+  FeedbackCapture captureFeedback(int64_t evaluated_ns = 0);
+  void collectFeedbackStale(int64_t evaluated_ns = 0);
   void fault(StreamFault kind, int axis);
 
   CanBus * tx_bus_;
