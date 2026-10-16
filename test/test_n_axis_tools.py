@@ -267,3 +267,82 @@ def test_entry_scripts_are_executable_and_run_directly(tool):
         result = subprocess.run([str(entry), '--help'], capture_output=True, text=True, timeout=10)
         assert result.returncode == 0, result.stdout + result.stderr
         assert 'usage:' in result.stdout.lower(), result.stdout
+
+
+@pytest.fixture
+def generated_bounds_files(tmp_path):
+    def generate(n):
+        d = make.generate(n, list(range(1, n + 1)), tmp_path / 'bounds_config', tmp_path)
+        import xacro
+        urdf = tmp_path / 'bounds.urdf'
+        urdf.write_text(xacro.process_file(str(HERE / 'n_axis.urdf.xacro'), mappings={
+            'axes': str(n), 'config_file': str(d / 'hardware.yaml'),
+            'spec_dir': str(ROOT / 'config/specs')}).toxml())
+        assert check.check(d, urdf) == []
+        return d, urdf
+    return generate
+
+
+@pytest.mark.parametrize('n', [2, 3])
+def test_generated_profile_has_all_5n_bounds(generated_bounds_files, n):
+    d, urdf = generated_bounds_files(n)
+    expected = {'position': [-math.pi / 6, math.pi / 6], 'velocity': [-.70, .70],
+                'kp': [0., 20.], 'kd': [0., 1.], 'effort': [0., 0.]}
+    assert make.profile_bounds() == expected
+    hw = yaml.safe_load((d / 'hardware.yaml').read_text())
+    joints = ET.parse(urdf).getroot().findall('ros2_control/joint')
+    assert len(joints) == n
+    for joint in joints:
+        commands = joint.findall('command_interface')
+        assert len(commands) == 5
+        for command_interface in commands:
+            values = [float(command_interface.findtext(f"param[@name='{key}']"))
+                      for key in ('min', 'max')]
+            assert values == expected[command_interface.get('name')]
+        runtime = hw['joints'][joint.get('name')]
+        assert [runtime['lower'], runtime['upper']] == expected['position']
+
+
+@pytest.mark.parametrize('n', [2, 3])
+@pytest.mark.parametrize('field', ['position', 'velocity', 'kp', 'kd', 'effort'])
+@pytest.mark.parametrize('key', ['min', 'max'])
+@pytest.mark.parametrize('mutation', ['missing', 'nonnumeric', 'nonfinite', 'mismatch', 'duplicate'])
+def test_checker_rejects_bad_command_bounds(generated_bounds_files, n, field, key, mutation):
+    d, urdf = generated_bounds_files(n)
+    tree = ET.parse(urdf)
+    # Include the final axis, so N=3 cannot accidentally validate only two joints.
+    command_interface = tree.getroot().findall('ros2_control/joint')[-1].find(
+        f"command_interface[@name='{field}']")
+    param = command_interface.find(f"param[@name='{key}']")
+    if mutation == 'missing':
+        command_interface.remove(param)
+    elif mutation == 'duplicate':
+        ET.SubElement(command_interface, 'param', name=key).text = param.text
+    else:
+        param.text = {'nonnumeric': 'invalid', 'nonfinite': 'nan',
+                      'mismatch': str(float(param.text) + .01)}[mutation]
+    tree.write(urdf)
+    assert check.check(d, urdf)
+
+
+@pytest.mark.parametrize('n', [2, 3])
+@pytest.mark.parametrize('key', ['lower', 'upper'])
+def test_checker_rejects_hwif_position_mismatch(generated_bounds_files, n, key):
+    d, urdf = generated_bounds_files(n)
+    path = d / 'hardware.yaml'
+    hw = yaml.safe_load(path.read_text())
+    hw['joints'][f'joint{n}'][key] += .01
+    path.write_text(yaml.safe_dump(hw))
+    assert check.check(d, urdf)
+
+
+@pytest.mark.parametrize('n', [2, 3])
+def test_checker_rejects_nonzero_effort_upper_separately(generated_bounds_files, n):
+    d, urdf = generated_bounds_files(n)
+    tree = ET.parse(urdf)
+    for joint in tree.getroot().findall('ros2_control/joint'):
+        joint.find("command_interface[@name='effort']/param[@name='max']").text = '1'
+    tree.write(urdf)
+    errors = check.check(d, urdf)
+    assert sum('/effort: G bounds mismatch' in error for error in errors) == n
+    # This is the strict G declaration check, not an on_init rejection requirement.

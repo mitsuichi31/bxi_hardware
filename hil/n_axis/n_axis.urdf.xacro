@@ -4,18 +4,28 @@
   <xacro:arg name="config_file" default=""/>
   <xacro:arg name="spec_dir" default=""/>
   <xacro:property name="n" value="${int('$(arg axes)')}"/>
+  <!-- Provisional G profile: controller lower_/upper_ = +/-pi/6 (binary64 below),
+       validRequest kp<=20, kd<=1, velocityUpperBound<=0.70; command effort is zero.
+       Generator and checker read this single literal property; do not round position. -->
+  <xacro:property name="g_command_bounds" value="${dict(position=[-0.5235987755982988, 0.5235987755982988], velocity=[-0.70, 0.70], kp=[0.0, 20.0], kd=[0.0, 1.0], effort=[0.0, 0.0])}"/>
   <link name="base_link"/>
   <xacro:macro name="physical_joint" params="i">
     <link name="output${i}"/>
     <joint name="joint${i}" type="revolute">
       <parent link="base_link"/><child link="output${i}"/><axis xyz="0 0 1"/>
-      <limit lower="-${pi/6}" upper="${pi/6}" effort="5" velocity="0.70"/>
+      <limit lower="${g_command_bounds['position'][0]}" upper="${g_command_bounds['position'][1]}" effort="5" velocity="${g_command_bounds['velocity'][1]}"/>
     </joint>
+  </xacro:macro>
+  <xacro:macro name="bounded_command" params="name">
+    <command_interface name="${name}">
+      <param name="min">${g_command_bounds[name][0]}</param>
+      <param name="max">${g_command_bounds[name][1]}</param>
+    </command_interface>
   </xacro:macro>
   <xacro:macro name="control_joint" params="i">
     <joint name="joint${i}">
-      <command_interface name="position"/><command_interface name="velocity"/>
-      <command_interface name="kp"/><command_interface name="kd"/><command_interface name="effort"/>
+      <xacro:bounded_command name="position"/><xacro:bounded_command name="velocity"/>
+      <xacro:bounded_command name="kp"/><xacro:bounded_command name="kd"/><xacro:bounded_command name="effort"/>
       <state_interface name="position"/><state_interface name="velocity"/>
       <state_interface name="effort"/><state_interface name="temperature"/>
     </joint>

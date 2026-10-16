@@ -564,3 +564,144 @@ TEST(PairSystem, FeedbackPendingAdvancingControllerGenerationsNeverCreateGapErro
   }
 }
 }  // namespace bxi_hardware
+
+// Generated-file acceptance: parser -> real on_init, without activation or CAN I/O.
+#include <spawn.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <fcntl.h>
+#include "hardware_interface/component_parser.hpp"
+extern char ** environ;
+namespace bxi_hardware
+{
+namespace
+{
+class GeneratedBoundsHwif : public BxiSystemInterface
+{
+public:
+  unsigned bus_requests = 0;
+protected:
+  std::shared_ptr<CanBus> makeBus(CanFrameFormat) override
+  {
+    ++bus_requests;
+    throw std::runtime_error("on_init unexpectedly requested CAN bus construction");
+  }
+};
+struct GeneratedBoundsInput
+{
+  std::filesystem::path directory;
+  bool preserve = false;
+  hardware_interface::HardwareInfo hardware;
+  static void command(std::vector<std::string> arguments, const std::string & output = "")
+  {
+    std::vector<char *> argv;
+    for (auto & argument : arguments) {argv.push_back(argument.data());}
+    argv.push_back(nullptr);
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    if (!output.empty()) {
+      posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, output.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    }
+    pid_t pid;
+    const auto spawned = posix_spawnp(&pid, argv[0], &actions, nullptr, argv.data(), environ);
+    posix_spawn_file_actions_destroy(&actions);
+    if (spawned != 0) {throw std::runtime_error("cannot spawn " + arguments[0]);}
+    int status = 0;
+    if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+      throw std::runtime_error("generated-file command failed: " + arguments[0]);
+    }
+  }
+  explicit GeneratedBoundsInput(size_t n)
+  {
+    const char * out = std::getenv("BXI_N_AXIS_BOUNDS_OUTPUT_DIR");
+    const auto base = out ? std::filesystem::path(out) : std::filesystem::temp_directory_path();
+    std::filesystem::create_directories(base);
+    auto pattern = (base / ("bounds_n" + std::to_string(n) + "_XXXXXX")).string();
+    if (!::mkdtemp(pattern.data())) {throw std::runtime_error("mkdtemp failed");}
+    directory = pattern; preserve = out != nullptr;
+    const std::string root = BXI_TEST_SOURCE_DIR;
+    const auto config = (directory / "config").string();
+    std::vector<std::string> generate{root + "/hil/n_axis/make_n_axis_config.py", "--axes", std::to_string(n), "--ids"};
+    for (size_t i = 1; i <= n; ++i) {generate.push_back(std::to_string(i));}
+    generate.insert(generate.end(), {"--can-bus", "can0", "--destination", config, "--output-dir", directory.string()});
+    command(generate);
+    const auto urdf = (directory / "robot.urdf").string();
+    command({"xacro", root + "/hil/n_axis/n_axis.urdf.xacro", "axes:=" + std::to_string(n),
+      "config_file:=" + config + "/hardware.yaml", "spec_dir:=" + root + "/config/specs"}, urdf);
+    command({root + "/hil/n_axis/n_axis_check_config.py", config, urdf}, (directory / "check.json").string());
+    std::ifstream in(urdf);
+    const std::string xml((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    const auto parsed = hardware_interface::parse_control_resources_from_urdf(xml);
+    if (parsed.size() != 1) {throw std::runtime_error("expected one hardware system");}
+    hardware = parsed.front();
+  }
+  ~GeneratedBoundsInput()
+  {
+    if (!preserve) {std::error_code error; std::filesystem::remove_all(directory, error);}
+  }
+};
+class GeneratedBoundsAcceptance : public ::testing::TestWithParam<size_t> {};
+TEST_P(GeneratedBoundsAcceptance, GeneratedUrdfIsAcceptedWithoutBusConstruction)
+{
+  const auto n = GetParam();
+  GeneratedBoundsInput input(n);
+  ASSERT_EQ(input.hardware.joints.size(), n);
+  const double pi = 3.14159265358979323846;
+  const std::array<std::array<double, 2>, 5> expected{{{{-pi/6., pi/6.}}, {{-.70, .70}}, {{0., 20.}}, {{0., 1.}}, {{0., 0.}}}};
+  const std::array<std::string, 5> fields{{"position", "velocity", "kp", "kd", "effort"}};
+  for (const auto & joint : input.hardware.joints) {
+    ASSERT_EQ(joint.command_interfaces.size(), fields.size());
+    for (size_t i = 0; i < fields.size(); ++i) {
+      const auto found = std::find_if(joint.command_interfaces.begin(), joint.command_interfaces.end(),
+        [&](const auto & value) {return value.name == fields[i];});
+      ASSERT_NE(found, joint.command_interfaces.end());
+      EXPECT_DOUBLE_EQ(std::stod(found->min), expected[i][0]);
+      EXPECT_DOUBLE_EQ(std::stod(found->max), expected[i][1]);
+    }
+  }
+  GeneratedBoundsHwif hwif;
+  EXPECT_EQ(hwif.on_init(input.hardware), hardware_interface::CallbackReturn::SUCCESS);
+  EXPECT_EQ(hwif.bus_requests, 0U);
+}
+TEST_P(GeneratedBoundsAcceptance, ExistingHwifRejectsInvalidBounds)
+{
+  GeneratedBoundsInput input(GetParam());
+  // Mutate parsed InterfaceInfo to isolate on_init's rejection, rather than parser errors.
+  // Every copy starts from the same accepted generated-file baseline.
+  GeneratedBoundsHwif baseline;
+  ASSERT_EQ(baseline.on_init(input.hardware), hardware_interface::CallbackReturn::SUCCESS);
+  for (size_t axis = 0; axis < GetParam(); ++axis) {
+    for (size_t field = 0; field < 5; ++field) {
+      for (const auto mutation : {"missing_min", "missing_max", "nonnumeric_min", "nonnumeric_max", "inverted"}) {
+        SCOPED_TRACE(std::to_string(axis) + "/" + std::to_string(field) + "/" + mutation);
+        auto info = input.hardware;
+        auto & value = info.joints[axis].command_interfaces[field];
+        if (std::string(mutation) == "missing_min") {value.min.clear();}
+        else if (std::string(mutation) == "missing_max") {value.max.clear();}
+        else if (std::string(mutation) == "nonnumeric_min") {value.min = "not-a-number";}
+        else if (std::string(mutation) == "nonnumeric_max") {value.max = "not-a-number";}
+        else {value.min = "1"; value.max = "0";}
+        GeneratedBoundsHwif hwif;
+        EXPECT_EQ(hwif.on_init(info), hardware_interface::CallbackReturn::ERROR);
+        EXPECT_EQ(hwif.bus_requests, 0U);
+      }
+    }
+    for (const auto mutation : {"position_low", "position_high", "codec_low", "codec_high", "zero_below", "zero_above"}) {
+      SCOPED_TRACE(std::to_string(axis) + "/" + mutation);
+      auto info = input.hardware;
+      auto & values = info.joints[axis].command_interfaces;
+      if (std::string(mutation) == "position_low") {values[0].min = "-0.6";}
+      else if (std::string(mutation) == "position_high") {values[0].max = "0.6";}
+      else if (std::string(mutation) == "codec_low") {values[1].min = "-46";}
+      else if (std::string(mutation) == "codec_high") {values[1].max = "46";}
+      else if (std::string(mutation) == "zero_below") {values[1].min = "0.1";}
+      else {values[1].max = "-0.1";}
+      GeneratedBoundsHwif hwif;
+      EXPECT_EQ(hwif.on_init(info), hardware_interface::CallbackReturn::ERROR);
+      EXPECT_EQ(hwif.bus_requests, 0U);
+    }
+  }
+}
+INSTANTIATE_TEST_SUITE_P(TwoAndThree, GeneratedBoundsAcceptance, ::testing::Values(2U, 3U));
+}  // namespace
+}  // namespace bxi_hardware

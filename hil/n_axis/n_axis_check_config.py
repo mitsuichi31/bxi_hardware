@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Small consistency check; cannot detect arbitrary plugins, ownership or physical wiring."""
 import argparse
+import importlib.util
+import math
 import json
 from pathlib import Path
 import xml.etree.ElementTree as ET
@@ -8,6 +10,15 @@ import yaml
 
 LIMITATION = '任意の他plugin・所有者・実配線は検知できず、完全な構成検査の代替ではありません。'
 COMMANDS = {'position', 'velocity', 'kp', 'kd', 'effort'}
+
+def profile_bounds():
+    # Resolve both source and installed copies without relying on sys.path.
+    path = Path(__file__).resolve().with_name('make_n_axis_config.py')
+    spec = importlib.util.spec_from_file_location('bxi_n_axis_generator_bounds', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.profile_bounds()
+
 
 def check(directory, urdf):
     errors = []
@@ -17,6 +28,7 @@ def check(directory, urdf):
         hw = yaml.safe_load((d/'hardware.yaml').read_text())
         ctrl = yaml.safe_load((d/'controllers.yaml').read_text())
         tree = ET.parse(urdf).getroot()
+        bounds = profile_bounds()
         n = m['axes']; names = [f'joint{i+1}' for i in range(n)]
         if n not in (2, 3) or m.get('source') != 'explicit_cli_arguments':
             errors.append('N or explicit-ID provenance missing')
@@ -45,6 +57,27 @@ def check(directory, urdf):
             commands = j.findall('command_interface'); states = j.findall('state_interface')
             if len(commands) != 5 or {x.get('name') for x in commands} != COMMANDS:
                 errors.append('command set mismatch')
+            for command in commands:
+                field = command.get('name')
+                if field not in bounds:
+                    continue
+                values = []
+                for key in ('min', 'max'):
+                    entries = command.findall(f"param[@name='{key}']")
+                    if len(entries) != 1:
+                        errors.append(f"{j.get('name')}/{field}: one {key} required")
+                        break
+                    try:
+                        value = float(entries[0].text)
+                    except (ValueError, TypeError):
+                        errors.append(f"{j.get('name')}/{field}: nonnumeric {key}")
+                        break
+                    values.append(value)
+                if len(values) == 2 and (not all(math.isfinite(v) for v in values) or values != bounds[field]):
+                    errors.append(f"{j.get('name')}/{field}: G bounds mismatch")
+            runtime = hw['joints'].get(j.get('name'), {})
+            if [runtime.get('lower'), runtime.get('upper')] != bounds['position']:
+                errors.append(f"{j.get('name')}: HWIF position bounds mismatch")
             if len(states) != 4 or {x.get('name') for x in states} != {'position', 'velocity', 'effort', 'temperature'}:
                 errors.append('state set mismatch (3 controller states plus temperature)')
         gpios = system.findall('gpio')
