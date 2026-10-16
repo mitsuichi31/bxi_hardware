@@ -170,6 +170,11 @@ if(BUILD_TESTING)
   ament_target_dependencies(test_n_axis_trajectory_controller controller_interface hardware_interface pluginlib rclcpp rclcpp_lifecycle)
   set_target_properties(test_n_axis_trajectory_controller PROPERTIES BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}")
 
+  ament_add_gtest(test_n_axis_tsan_snapshot test/test_n_axis_tsan_snapshot.cpp TIMEOUT 300)
+  target_link_libraries(test_n_axis_tsan_snapshot bxi_n_axis_controllers)
+  ament_target_dependencies(test_n_axis_tsan_snapshot controller_interface hardware_interface rclcpp rclcpp_lifecycle)
+  set_target_properties(test_n_axis_tsan_snapshot PROPERTIES BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}")
+
   ament_add_gtest(test_hil_trajectory_controller test/test_hil_trajectory_controller.cpp)
   target_link_libraries(test_hil_trajectory_controller bxi_hil_controllers)
   set_target_properties(test_hil_trajectory_controller PROPERTIES BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}")
