@@ -518,6 +518,7 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_activate(
   if (pair_mode_) {
     pair_activation_ns_ = activation_start.time_since_epoch().count();
     pair_safety_.reset(pair_safety_.epoch + 1, n_joints_);
+    pair_safety_saved_ = pair_feedback_stale_saved_ = false;
     const auto & transport = bus_transport_.at(joints_[0].can_bus);
     pair_commit_.reset(pair_activation_ns_, static_cast<int64_t>(transport.first_write_timeout_ms * 1.e6));
     pair_generation_ = pair_accepted_ = 0;
@@ -580,7 +581,9 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_activate(
       }
       const auto & first = *bus_joints.begin();
       const auto & transport = bus_transport_.at(first.first);
-      if (first.second.size() != 1 || !transport.separate || !transport.broadcast) {
+      // Legacy keeps the 1-axis limit. The pair (G) mode records N axes: every trace container is
+      // already sized by the axis count, and the CSV writers emit per-axis columns.
+      if ((first.second.size() != 1 && !pair_mode_) || !transport.separate || !transport.broadcast) {
         throw std::invalid_argument("expanded trace requires 1-axis separate broadcast");
       }
     }
@@ -900,14 +903,23 @@ void BxiSystemInterface::releaseResources()
   }
   writeControlTiming();
   savePairRecords();
-  if (pair_mode_ && pair_safety_.requested() &&
-    (worker_timing_dir_.empty() || !pair_safety_.save(worker_timing_dir_ + "/pair_safety.csv"))) {
-    RCLCPP_ERROR(logger(), "group safety record incomplete, missing, or save failed");
+  // releaseResources() runs from on_deactivate and again from the destructor. A record that was
+  // saved by the first call must not be reported missing by the second (worker_timing_dir_ is
+  // already cleared); a failed or impossible save stays unsaved and is reported every time.
+  if (pair_mode_ && pair_safety_.requested() && !pair_safety_saved_) {
+    if (worker_timing_dir_.empty() || !pair_safety_.save(worker_timing_dir_ + "/pair_safety.csv")) {
+      RCLCPP_ERROR(logger(), "group safety record incomplete, missing, or save failed");
+    } else {
+      pair_safety_saved_ = true;
+    }
   }
-  if (pair_mode_ && pair_safety_.feedback_stale.detected &&
-    (worker_timing_dir_.empty() || !pair_safety_.saveFeedbackStale(
-      worker_timing_dir_ + "/pair_feedback_stale.csv"))) {
-    RCLCPP_ERROR(logger(), "feedback stale record incomplete, missing, or save failed");
+  if (pair_mode_ && pair_safety_.feedback_stale.detected && !pair_feedback_stale_saved_) {
+    if (worker_timing_dir_.empty() || !pair_safety_.saveFeedbackStale(
+        worker_timing_dir_ + "/pair_feedback_stale.csv")) {
+      RCLCPP_ERROR(logger(), "feedback stale record incomplete, missing, or save failed");
+    } else {
+      pair_feedback_stale_saved_ = true;
+    }
   }
   control_streams_.clear();
   prepared_write_storage_.clear();
@@ -1067,6 +1079,7 @@ bool BxiSystemInterface::startStream(
   if (!worker_timing_dir_.empty()) {
     config.trace_cycles = stream_trace_cycles_;
     config.trace_extended = stream_trace_extended_;
+    config.trace_extended_multi_axis = pair_mode_;
   }
   std::vector<uint32_t> reply_ids;
   std::vector<BxiActuatorDriver *> drivers;

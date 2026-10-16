@@ -431,6 +431,34 @@ BxiBusStreamer::CycleHook gainHook()
          };
 }
 
+TEST(BusStreamer, ExpandedTraceForSeveralAxesNeedsTheExplicitGroupModeFlag)
+{
+  // H1: the legacy limit (expanded trace = 1-axis broadcast) is unchanged; the group (G) mode opts
+  // in explicitly so the same trace containers are used for N axes.
+  for (std::vector<int> ids : {std::vector<int>{1}, std::vector<int>{1, 2}, std::vector<int>{1, 2, 3}}) {
+    for (bool flag : {false, true}) {
+      Rig rig(ids);
+      auto c = config(1ms, true);
+      c.trace_cycles = 25000; c.trace_extended = true; c.trace_extended_multi_axis = flag;
+      auto streamer = rig.makeStreamer(c, gainHook());
+      const bool expected = ids.size() == 1 || flag;
+      EXPECT_EQ(streamer->start(), expected) << ids.size() << " axes, flag=" << flag;
+      if (expected) {
+        std::this_thread::sleep_for(20ms); streamer->stop();
+        EXPECT_EQ(streamer->trace().cycles.size(), 25000U);
+        EXPECT_EQ(streamer->trace().axes, ids.size());
+      } else {
+        EXPECT_EQ(streamer->error(), "expanded trace requires 1-axis broadcast");
+      }
+    }
+  }
+  Rig rig({1, 2});
+  auto c = config(1ms, true);   // not a broadcast stream: refused even with the flag
+  c.broadcast = false; c.trace_cycles = 25000; c.trace_extended = true; c.trace_extended_multi_axis = true;
+  auto streamer = rig.makeStreamer(c, gainHook());
+  EXPECT_FALSE(streamer->start());
+}
+
 TEST(BusStreamer, CommandAgeIsNotCheckedBeforeTheFirstWrite)
 {
   Rig rig({1});

@@ -185,7 +185,9 @@ bool BxiBusStreamer::validate()
     error_ = "incomplete stream setup";
     return false;
   }
-  if (config_.trace_extended && (!config_.broadcast || drivers_.size() != 1)) {
+  if (config_.trace_extended && (!config_.broadcast ||
+    (drivers_.size() != 1 && !config_.trace_extended_multi_axis)))
+  {
     error_ = "expanded trace requires 1-axis broadcast";
     return false;
   }

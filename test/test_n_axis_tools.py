@@ -26,7 +26,24 @@ def test_generate_validate_xacro_and_launch_static(tmp_path,n):
     assert check.check(d,xml)==[]
     spec=importlib.util.spec_from_file_location('g_launch',HERE/'n_axis_hil.launch.py');m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
     description=m.generate_launch_description() # No launch execution, CM or CAN.
-    assert len(description.entities)==3
+    assert len(description.entities)==4
+    # trace_cycles is a launch argument with the provisional default.
+    assert [e.name for e in description.entities if hasattr(e,'name')][-1]=='trace_cycles'
+    env=m.hwif_environment(tmp_path/'worker','100000')
+    assert env['BXI_STREAM_TRACE_CYCLES']=='100000' and env['BXI_WORKER_TIMING_DIR']==str(tmp_path/'worker')
+    assert env['LD_BIND_NOW']=='1'
+
+
+@pytest.mark.parametrize('value',['20000','620001','','abc','-1','1e5','100000.0'])
+def test_launch_rejects_trace_cycles_outside_hwif_range(tmp_path,value):
+    spec=importlib.util.spec_from_file_location('g_launch',HERE/'n_axis_hil.launch.py');m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
+    with pytest.raises(ValueError):m.hwif_environment(tmp_path,value)
+
+
+@pytest.mark.parametrize('value',['20001','100000','620000'])
+def test_launch_accepts_trace_cycles_inside_hwif_range(tmp_path,value):
+    spec=importlib.util.spec_from_file_location('g_launch',HERE/'n_axis_hil.launch.py');m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
+    assert m.hwif_environment(tmp_path,value)['BXI_STREAM_TRACE_CYCLES']==value
 
 @pytest.mark.parametrize('ids', [[],[1],[1,1],[0,2],[1,16],[2,3]])
 def test_ids_required_unique_in_range_and_broadcast_order(tmp_path,ids):

@@ -190,6 +190,10 @@ private:
   std::vector<PairRecord> pair_records_;
   size_t pair_record_count_ = 0;
   bool pair_records_saved_ = true;
+  // Saved-once flags for pair_safety.csv / pair_feedback_stale.csv (see releaseResources()).
+  // "false" is the conservative default: a record that is requested but not yet saved is saved
+  // (or reported) by releaseResources(), whatever path armed it. on_activate also resets them.
+  bool pair_safety_saved_ = false, pair_feedback_stale_saved_ = false;
 
   bool startStream(const std::string & bus_name, const std::vector<size_t> & indices);
   // Runs on the send thread of a streamed bus once per cycle.

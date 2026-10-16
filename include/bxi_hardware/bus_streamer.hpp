@@ -233,6 +233,8 @@ struct StreamConfig
   // per axis.
   size_t trace_cycles = 0;
   bool trace_extended = false;
+  // Pair (G) mode only: allow the expanded trace for N axes. Legacy keeps the 1-axis limit.
+  bool trace_extended_multi_axis = false;
   // SCHED_FIFO priority (1-98) of each thread; 0 selects SCHED_OTHER even if the thread calling
   // start() runs under SCHED_FIFO. Each thread applies its own setting as it starts, and start()
   // fails if that is refused.

@@ -4,6 +4,12 @@
 #include <algorithm>
 #include <limits>
 #include <cstdlib>
+#include <cstdarg>
+#include <cstdio>
+#include <iostream>
+#include <optional>
+#include "rcutils/logging.h"
+#include "bxi_hardware/stream_trace_io.hpp"
 #include <filesystem>
 #include "bxi_hardware/bxi_system_interface.hpp"
 #include "hardware_interface/resource_manager.hpp"
@@ -32,6 +38,31 @@ struct PairSystemTestAccess
   static bool latched(const BxiSystemInterface & s) {return s.pair_commit_.latched();}
   static double accepted(const BxiSystemInterface & s) {return s.pair_accepted_;}
   static uint64_t last(const BxiSystemInterface & s) {return s.pair_commit_.last();}
+  // H1: release/save bookkeeping and trace capacity.
+  static void release(BxiSystemInterface & s) {s.releaseResources();}
+  static void seedSafety(BxiSystemInterface & s, const std::string & directory, bool complete, bool stale) {
+    s.worker_timing_dir_ = directory;
+    s.pair_safety_.reset(1, s.n_joints_);
+    s.pair_safety_saved_ = s.pair_feedback_stale_saved_ = false;
+    s.pair_records_saved_ = true;  // pair_commits.csv is not under test here
+    if (complete) {
+      s.pair_safety_.request(1, SafetySource::kModeStop, 10, 20);
+      s.pair_safety_.result = SafetyResult::kSucceeded;
+      s.pair_safety_.send_attempted = s.pair_safety_.send_success = true;
+    } else {
+      s.pair_safety_.request(1, SafetySource::kModeStop, 10, 20);  // never attempted: unfinished
+    }
+    if (stale) {
+      s.pair_safety_.feedback_stale.detected = true;
+      s.pair_safety_.feedback_stale.capacity = 1;
+      if (!complete) {s.pair_safety_.result = SafetyResult::kUnattempted;}
+    }
+  }
+  static bool safetySaved(const BxiSystemInterface & s) {return s.pair_safety_saved_;}
+  static bool staleSaved(const BxiSystemInterface & s) {return s.pair_feedback_stale_saved_;}
+  static size_t recordCapacity(const BxiSystemInterface & s) {return s.pair_records_.size();}
+  static size_t sizeofPairRecord() {return sizeof(BxiSystemInterface::PairRecord);}
+  static size_t sizeofControlRecord() {return sizeof(BxiSystemInterface::ControlRecord);}
 };
 namespace
 {
@@ -703,5 +734,191 @@ TEST_P(GeneratedBoundsAcceptance, ExistingHwifRejectsInvalidBounds)
   }
 }
 INSTANTIATE_TEST_SUITE_P(TwoAndThree, GeneratedBoundsAcceptance, ::testing::Values(2U, 3U));
+
+// ---------------------------------------------------------------------------------------------
+// H1: releaseResources() runs from on_deactivate and from the destructor. A safety record saved by
+// the first call must not be reported missing by the second; real failures must stay reported.
+// ---------------------------------------------------------------------------------------------
+struct LogCapture
+{
+  static inline int safety_errors = 0, stale_errors = 0;
+  rcutils_logging_output_handler_t previous = rcutils_logging_get_output_handler();
+  LogCapture() {safety_errors = stale_errors = 0; rcutils_logging_set_output_handler(&LogCapture::handle);}
+  ~LogCapture() {rcutils_logging_set_output_handler(previous);}
+  static void handle(const rcutils_log_location_t *, int severity, const char *, rcutils_time_point_value_t,
+    const char * format, va_list * args)
+  {
+    if (severity < RCUTILS_LOG_SEVERITY_ERROR) {return;}
+    char text[512];
+    va_list copy; va_copy(copy, *args); vsnprintf(text, sizeof(text), format, copy); va_end(copy);
+    const std::string message(text);
+    if (message.find("group safety record") != std::string::npos) {++safety_errors;}
+    if (message.find("feedback stale record") != std::string::npos) {++stale_errors;}
+  }
+};
+std::string freshDirectory(const std::string & name)
+{
+  const auto path = std::filesystem::path(::testing::TempDir()) / name;
+  std::filesystem::remove_all(path); std::filesystem::create_directories(path);
+  return path.string();
+}
+class PairReleaseOnce : public ::testing::TestWithParam<size_t> {};
+TEST_P(PairReleaseOnce, SavedSafetyRecordIsNotReportedMissingByTheSecondRelease)
+{
+  const size_t n = GetParam();
+  PairHarness s; ASSERT_EQ(s.on_init(info(true, true, n)), H::SUCCESS);
+  const auto directory = freshDirectory("h1_saved_" + std::to_string(n));
+  PairSystemTestAccess::seedSafety(s, directory, true, false);
+  LogCapture log;
+  PairSystemTestAccess::release(s);   // on_deactivate
+  EXPECT_EQ(LogCapture::safety_errors, 0);
+  EXPECT_TRUE(PairSystemTestAccess::safetySaved(s));
+  EXPECT_TRUE(std::filesystem::exists(directory + "/pair_safety.csv"));
+  PairSystemTestAccess::release(s);   // destructor
+  EXPECT_EQ(LogCapture::safety_errors, 0);
+  EXPECT_EQ(LogCapture::stale_errors, 0);
+}
+TEST_P(PairReleaseOnce, SavedStaleRecordIsNotReportedMissingByTheSecondRelease)
+{
+  const size_t n = GetParam();
+  PairHarness s; ASSERT_EQ(s.on_init(info(true, true, n)), H::SUCCESS);
+  const auto directory = freshDirectory("h1_stale_" + std::to_string(n));
+  PairSystemTestAccess::seedSafety(s, directory, true, true);
+  LogCapture log;
+  PairSystemTestAccess::release(s);
+  EXPECT_EQ(LogCapture::stale_errors, 0);
+  EXPECT_TRUE(PairSystemTestAccess::staleSaved(s));
+  EXPECT_TRUE(std::filesystem::exists(directory + "/pair_feedback_stale.csv"));
+  PairSystemTestAccess::release(s);
+  EXPECT_EQ(LogCapture::stale_errors, 0);
+  EXPECT_EQ(LogCapture::safety_errors, 0);
+}
+TEST_P(PairReleaseOnce, GenuineFailuresStayReportedAndAreNeverMarkedSaved)
+{
+  const size_t n = GetParam();
+  // (a) no timing directory, (b) directory that cannot be written, (c) unfinished safety attempt.
+  const std::string missing = (std::filesystem::path(::testing::TempDir()) / "h1_no_such_dir" / "x").string();
+  struct Case {std::string directory; bool complete;};
+  for (const auto & c : {Case{"", true}, Case{missing, true},
+      Case{freshDirectory("h1_unfinished_" + std::to_string(n)), false}}) {
+    PairHarness s; ASSERT_EQ(s.on_init(info(true, true, n)), H::SUCCESS);
+    PairSystemTestAccess::seedSafety(s, c.directory, c.complete, false);
+    LogCapture log;
+    PairSystemTestAccess::release(s);
+    EXPECT_EQ(LogCapture::safety_errors, 1) << c.directory;
+    EXPECT_FALSE(PairSystemTestAccess::safetySaved(s)) << c.directory;
+    PairSystemTestAccess::release(s);  // still unsaved: reported again, not hidden
+    EXPECT_EQ(LogCapture::safety_errors, 2) << c.directory;
+    EXPECT_FALSE(PairSystemTestAccess::safetySaved(s));
+  }
+}
+TEST_P(PairReleaseOnce, NoRequestMeansNoRecordAndNoError)
+{
+  const size_t n = GetParam();
+  PairHarness s; ASSERT_EQ(s.on_init(info(true, true, n)), H::SUCCESS);
+  PairSystemTestAccess::seedSafety(s, freshDirectory("h1_none_" + std::to_string(n)), true, false);
+  PairSystemTestAccess::safety(s).reset(1, n);   // nothing requested in this epoch
+  LogCapture log;
+  PairSystemTestAccess::release(s); PairSystemTestAccess::release(s);
+  EXPECT_EQ(LogCapture::safety_errors, 0);
+  EXPECT_EQ(LogCapture::stale_errors, 0);
+}
+INSTANTIATE_TEST_SUITE_P(TwoAndThree, PairReleaseOnce, ::testing::Values(2U, 3U));
+TEST(PairReleaseOnce, LegacyModeNeverTouchesPairRecords)
+{
+  PairHarness s; ASSERT_EQ(s.on_init(info(false, false, 2)), H::SUCCESS);
+  LogCapture log;
+  PairSystemTestAccess::release(s); PairSystemTestAccess::release(s);
+  EXPECT_EQ(LogCapture::safety_errors, 0);
+  EXPECT_EQ(LogCapture::stale_errors, 0);
+}
+
+// ---------------------------------------------------------------------------------------------
+// H1: BXI_STREAM_TRACE_CYCLES for the pair mode (N=2/3, separate, broadcast).
+// ---------------------------------------------------------------------------------------------
+struct EnvGuard
+{
+  std::string key; std::optional<std::string> old;
+  EnvGuard(const char * name, const char * value) : key(name)
+  {
+    if (const char * current = std::getenv(name)) {old = current;}
+    if (value) {setenv(name, value, 1);} else {unsetenv(name);}
+  }
+  ~EnvGuard() {if (old) {setenv(key.c_str(), old->c_str(), 1);} else {unsetenv(key.c_str());}}
+};
+// Stops right where the CAN bus would be opened: reaching it proves every preparation and
+// validation before the first CAN access (guards, memory budget) accepted the setting.
+class PairActivationProbe : public BxiSystemInterface
+{
+public:
+  bool reached_bus = false;
+protected:
+  std::shared_ptr<CanBus> makeBus(CanFrameFormat) override
+  {
+    reached_bus = true;
+    throw std::runtime_error("test stops before the first CAN open");
+  }
+};
+struct ActivationOutcome {bool reached_bus; H result; size_t capacity;};
+ActivationOutcome activate(bool pair, size_t n, const char * cycles)
+{
+  EnvGuard dir("BXI_WORKER_TIMING_DIR", freshDirectory("h1_activation").c_str());
+  EnvGuard count("BXI_STREAM_TRACE_CYCLES", cycles);
+  PairActivationProbe s;
+  EXPECT_EQ(s.on_init(info(pair, pair, n)), H::SUCCESS);
+  const auto result = s.on_activate(rclcpp_lifecycle::State());
+  return {s.reached_bus, result, PairSystemTestAccess::recordCapacity(s)};
+}
+class PairTraceCycles : public ::testing::TestWithParam<size_t> {};
+TEST_P(PairTraceCycles, DefaultStaysAtTwentyThousand)
+{
+  const auto outcome = activate(true, GetParam(), nullptr);
+  EXPECT_TRUE(outcome.reached_bus);
+  EXPECT_EQ(outcome.result, H::ERROR);   // the probe aborts at the CAN open
+  EXPECT_EQ(outcome.capacity, 20000U);
+}
+TEST_P(PairTraceCycles, ExtendedCapacityIsAcceptedForTheGroupMode)
+{
+  for (const char * value : {"20001", "25000", "100000"}) {
+    const auto outcome = activate(true, GetParam(), value);
+    EXPECT_TRUE(outcome.reached_bus) << value;
+    EXPECT_EQ(outcome.capacity, static_cast<size_t>(std::stoul(value))) << value;
+  }
+}
+TEST_P(PairTraceCycles, OutOfRangeAndNonNumericAreStillRefusedBeforeAnyCanAccess)
+{
+  for (const char * value : {"20000", "0", "620001", "abc", "", "-5", "1e5", "100000.0"}) {
+    const auto outcome = activate(true, GetParam(), value);
+    EXPECT_FALSE(outcome.reached_bus) << value;
+    EXPECT_EQ(outcome.result, H::ERROR) << value;
+  }
+}
+TEST_P(PairTraceCycles, LegacyMultiAxisKeepsItsOneAxisLimit)
+{
+  const auto outcome = activate(false, GetParam(), "25000");
+  EXPECT_FALSE(outcome.reached_bus);
+  EXPECT_EQ(outcome.result, H::ERROR);
+}
+INSTANTIATE_TEST_SUITE_P(TwoAndThree, PairTraceCycles, ::testing::Values(2U, 3U));
+// Memory report for the review (not an assertion about the limit): prints the budget per setting.
+TEST(PairTraceCycles, MemoryBudgetReport)
+{
+  std::cout << "[H1] sizeof(StreamCycleRecord)=" << sizeof(StreamCycleRecord) << " sizeof(StreamRxRecord)="
+    << sizeof(StreamRxRecord) << " sizeof(ControlRecord)=" << PairSystemTestAccess::sizeofControlRecord()
+    << " sizeof(PairRecord)=" << PairSystemTestAccess::sizeofPairRecord() << " limit=" << kStreamTraceMemoryLimit << '\n';
+  for (size_t n : {2U, 3U}) {
+    for (size_t cycles : {20000U, 100000U, 620000U}) {
+      size_t stream = 0; bool stream_ok = true;
+      try {stream = streamTracePayloadBytes(cycles, n);} catch (const std::exception &) {stream_ok = false;}
+      const size_t control = cycles * n * PairSystemTestAccess::sizeofControlRecord();
+      const size_t pair = cycles * PairSystemTestAccess::sizeofPairRecord();
+      const std::string setting = std::to_string(cycles);
+      const auto outcome = activate(true, n, cycles == 20000U ? nullptr : setting.c_str());
+      std::cout << "[H1] N=" << n << " cycles=" << cycles << " stream=" << stream << (stream_ok ? "" : "(over limit)")
+        << " control=" << control << " pair=" << pair << " total=" << (stream + control + pair)
+        << " activation_reached_bus=" << outcome.reached_bus << '\n';
+    }
+  }
+}
 }  // namespace
 }  // namespace bxi_hardware
