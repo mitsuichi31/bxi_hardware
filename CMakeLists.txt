@@ -72,6 +72,15 @@ ament_target_dependencies(bxi_hil_controllers
 target_link_libraries(bxi_hil_controllers ${BXI_HW_LIB} "${bxi_interfaces_cpp}")
 pluginlib_export_plugin_description_file(controller_interface bxi_hil_controllers.xml)
 
+# G N-axis plugin. Keep the legacy plugin, interfaces and tests independent.
+add_library(bxi_n_axis_controllers SHARED src/n_axis_trajectory_controller.cpp)
+target_include_directories(bxi_n_axis_controllers PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
+ament_target_dependencies(bxi_n_axis_controllers controller_interface hardware_interface pluginlib rclcpp rclcpp_lifecycle)
+target_link_libraries(bxi_n_axis_controllers ${BXI_HW_LIB})
+pluginlib_export_plugin_description_file(controller_interface bxi_n_axis_controllers.xml)
+
 # 試験専用の controller（vcan の故障経路：controller_manager の更新の停止）。本番の controller とは
 # 別のライブラリにする。BXI_ALLOW_TEST_FAULTS=1 のときだけ設定できる。
 add_library(bxi_hil_test_controllers SHARED src/hil_update_stall_controller.cpp)
@@ -156,6 +165,11 @@ if(BUILD_TESTING)
   ament_add_pytest_test(test_sine_trajectory test/test_sine_trajectory.py)
   ament_add_pytest_test(test_trajectory_reference test/test_trajectory_reference.py)
   ament_add_pytest_test(test_hil_trajectory_command test/test_hil_trajectory_command.py TIMEOUT 45)
+  ament_add_gtest(test_n_axis_trajectory_controller test/test_n_axis_trajectory_controller.cpp)
+  target_link_libraries(test_n_axis_trajectory_controller bxi_n_axis_controllers)
+  ament_target_dependencies(test_n_axis_trajectory_controller controller_interface hardware_interface pluginlib rclcpp rclcpp_lifecycle)
+  set_target_properties(test_n_axis_trajectory_controller PROPERTIES BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}")
+
   ament_add_gtest(test_hil_trajectory_controller test/test_hil_trajectory_controller.cpp)
   target_link_libraries(test_hil_trajectory_controller bxi_hil_controllers)
   set_target_properties(test_hil_trajectory_controller PROPERTIES BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}")
@@ -189,7 +203,7 @@ install(PROGRAMS hil/single_joint/ramp_command.py hil/single_joint/sine_command.
 install(TARGETS bxi_probe bxi_vcan_motor_emulator sine_command_cpp
   DESTINATION lib/${PROJECT_NAME})
 install(
-  TARGETS ${BXI_HW_LIB} bxi_hil_controllers bxi_hil_test_controllers
+  TARGETS ${BXI_HW_LIB} bxi_hil_controllers bxi_hil_test_controllers bxi_n_axis_controllers
   EXPORT export_${PROJECT_NAME}
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib

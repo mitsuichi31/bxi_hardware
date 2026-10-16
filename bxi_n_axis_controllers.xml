@@ -1,0 +1,7 @@
+<library path="bxi_n_axis_controllers">
+  <class name="bxi_hardware/NAxisTrajectoryController"
+         type="bxi_hardware::NAxisTrajectoryController"
+         base_class_type="controller_interface::ControllerInterface">
+    <description>G N-axis synchronous trajectory controller; internal fixed requests, provisional policies.</description>
+  </class>
+</library>
