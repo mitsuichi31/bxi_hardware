@@ -47,6 +47,8 @@ ros2 run bxi_hardware n_axis_evaluate.py "$CONTROLLER_CSV" --json "$RESULT_JSON"
 
 HWIFファイルがある場合は採用gの被覆・欠落と安全／stale原本の内容を要約します。gだけではHWIF epoch／controller run対応を証明できないため、HWIF全体項目はNOT_EVALUATEDのままです。内容要約はsend結果の合格判定ではありません。readbackはHWIFのackではなく、物理安全・モータ適用・24バイト通信の成立を評価しません。
 
-暫定設定：first_write timeout1000ms、feedback3ms、command5ms、write grace0.20ms、controller1kHz・優先度50／CPU11、TX45／RX46／CPU9、API試行1、record120秒。spawnerの起動遅延とfirst_write timeoutの関係、RT配置・負荷、最終保存までのexecutor寿命はG3で測定します。これらは物理停止時間や50µs達成の保証ではありません。
+暫定設定：first_write timeout1000ms、feedback3ms、command5ms、write grace0.20ms、controller1kHz・優先度50／CPU11、TX45／RX46／CPU9、API試行1、record120秒。launchは単一spawnerに`n_axis`、`joint_state_broadcaster`の順で渡します。使用中のros2_controlのspawnerは各controllerのload・configure・activateを終えてから次へ進むため、n_axisのactivateが先になります。joint_state_broadcasterの起動失敗・遅延を先に待つ構成にはしません。
+
+従来の並列spawnerでのvcan起動20試行では、起動順とA0からの初回世代採用の遅延が対応し、初回write timeoutも1回発生しました。遅延の因果は未確定です。単一spawnerでも1000msの起動期限に常に収まる保証はなく、起動余裕の分布、RT配置・負荷、最終保存までのexecutor寿命はG3で評価します。これらは物理停止時間や50µs達成の保証ではなく、実機での効果も未評価です。
 
 実行前は[CHECKLIST.md](CHECKLIST.md)を確認し、独立した実機実施承認を得てください。

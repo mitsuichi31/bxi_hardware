@@ -18,7 +18,7 @@ def module(name):
 make=module('make_n_axis_config'); check=module('n_axis_check_config'); evaluate=module('n_axis_evaluate'); command=module('n_axis_command')
 
 @pytest.mark.parametrize('n',[2,3])
-def test_generate_validate_xacro_and_launch_static(tmp_path,n):
+def test_generate_validate_xacro_and_launch_static(tmp_path,n,monkeypatch):
     output=tmp_path/'run';output.mkdir();d=make.generate(n,list(range(1,n+1)),tmp_path/'config',output)
     subprocess.run([sys.executable,str(ROOT/'scripts/validate_config.py'),str(d/'hardware.yaml'),'--schema',str(ROOT/'config/bxi_hardware.schema.json'),'--spec-dir',str(ROOT/'config/specs')],check=True,capture_output=True)
     xml=tmp_path/'robot.xml'
@@ -32,6 +32,16 @@ def test_generate_validate_xacro_and_launch_static(tmp_path,n):
     env=m.hwif_environment(tmp_path/'worker','100000')
     assert env['BXI_STREAM_TRACE_CYCLES']=='100000' and env['BXI_WORKER_TIMING_DIR']==str(tmp_path/'worker')
     assert env['LD_BIND_NOW']=='1'
+    # Inspect setup without launching processes. The single spawner activates in argument order.
+    from launch import LaunchContext
+    context=LaunchContext()
+    context.launch_configurations.update(config_dir=str(d),axes=str(n),trace_cycles='100000')
+    monkeypatch.setattr(m,'Node',lambda **kwargs:kwargs)
+    actions=m.setup(context)
+    assert len(actions)==3
+    spawners=[a for a in actions if a['executable']=='spawner']
+    assert len(spawners)==1
+    assert spawners[0]['arguments']==['n_axis','joint_state_broadcaster']
 
 
 @pytest.mark.parametrize('value',['20000','620001','','abc','-1','1e5','100000.0'])

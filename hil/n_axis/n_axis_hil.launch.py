@@ -35,8 +35,7 @@ def setup(context):
         Node(package='robot_state_publisher', executable='robot_state_publisher', parameters=[{'robot_description': description}]),
         Node(package='controller_manager', executable='ros2_control_node', output='screen',
              parameters=[str(directory/'controllers.yaml')], remappings=[('~/robot_description','/robot_description')], additional_env=hwif_environment(worker, LaunchConfiguration('trace_cycles').perform(context))),
-        Node(package='controller_manager', executable='spawner', arguments=['joint_state_broadcaster']),
-        Node(package='controller_manager', executable='spawner', arguments=['n_axis']),
+        Node(package='controller_manager', executable='spawner', arguments=['n_axis', 'joint_state_broadcaster']),
     ]
 
 def generate_launch_description():
