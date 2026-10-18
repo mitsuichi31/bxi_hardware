@@ -1,4 +1,6 @@
 #include <gtest/gtest.h>
+#include <deque>
+#include <sstream>
 #include <fstream>
 #include <functional>
 #include <algorithm>
@@ -741,9 +743,9 @@ INSTANTIATE_TEST_SUITE_P(TwoAndThree, GeneratedBoundsAcceptance, ::testing::Valu
 // ---------------------------------------------------------------------------------------------
 struct LogCapture
 {
-  static inline int safety_errors = 0, stale_errors = 0;
+  static inline int safety_errors = 0, stale_errors = 0, activation_trace_errors = 0;
   rcutils_logging_output_handler_t previous = rcutils_logging_get_output_handler();
-  LogCapture() {safety_errors = stale_errors = 0; rcutils_logging_set_output_handler(&LogCapture::handle);}
+  LogCapture() {safety_errors = stale_errors = activation_trace_errors = 0; rcutils_logging_set_output_handler(&LogCapture::handle);}
   ~LogCapture() {rcutils_logging_set_output_handler(previous);}
   static void handle(const rcutils_log_location_t *, int severity, const char *, rcutils_time_point_value_t,
     const char * format, va_list * args)
@@ -752,8 +754,12 @@ struct LogCapture
     char text[512];
     va_list copy; va_copy(copy, *args); vsnprintf(text, sizeof(text), format, copy); va_end(copy);
     const std::string message(text);
+    std::cout << "captured ERROR: " << message << '\n';
     if (message.find("group safety record") != std::string::npos) {++safety_errors;}
     if (message.find("feedback stale record") != std::string::npos) {++stale_errors;}
+    if (message.find("activation trace save failed") != std::string::npos) {
+      ++activation_trace_errors;
+    }
   }
 };
 std::string freshDirectory(const std::string & name)
@@ -918,6 +924,210 @@ TEST(PairTraceCycles, MemoryBudgetReport)
         << " control=" << control << " pair=" << pair << " total=" << (stream + control + pair)
         << " activation_reached_bus=" << outcome.reached_bus << '\n';
     }
+  }
+}
+
+// Stops before stream startup; this probe measures the activation unicast path only.
+// Uses a real steady clock; empty recv returns false immediately, not after a real 10 ms wait.
+// The separate policy tests inject startup waits/deadline clocks, never transact's clock.
+class ActivationWindowBus : public CanBus
+{
+public:
+  bool opened = false;
+  std::string bus_name;
+  std::deque<CanFrame> replies;
+  std::map<uint32_t, std::chrono::steady_clock::time_point> ready;
+  std::vector<CanFrame> sent;
+  unsigned accepted_controls = 0;
+  unsigned axes = 3;
+  uint32_t unresponsive_id = 0;
+  uint32_t delayed_enable_id = 0;
+  bool enable_delay_pending = false;
+  std::map<uint32_t, unsigned> controls;
+  bool open(const std::string & name) override {bus_name = name; return opened = true;}
+  void close() override {opened = false;}
+  bool isOpen() const override {return opened;}
+  const std::string & name() const override {return bus_name;}
+  void flushRx() override {replies.clear();}
+  bool send(const CanFrame & frame) override
+  {
+    sent.push_back(frame);
+    const bool enable = frame.data8() == protocol::encodeSpecialCommand(protocol::SpecialCommand::kEnable);
+    const bool disable = frame.data8() == protocol::encodeSpecialCommand(protocol::SpecialCommand::kDisable);
+    const auto now = std::chrono::steady_clock::now();
+    if (enable) {ready[frame.id] = now + std::chrono::milliseconds(4);}
+    if (enable && frame.id == delayed_enable_id) {enable_delay_pending = true;}
+    if (!enable && !disable) {
+      ++controls[frame.id];
+      if (frame.id == unresponsive_id) {return true;}
+      if (now < ready.at(frame.id)) {return true;}
+      ++accepted_controls;
+      if (accepted_controls == axes) {
+        throw std::runtime_error("test probe: all initial controls accepted; stop before stream");
+      }
+    }
+    CanFrame reply;
+    reply.id = protocol::defaultMasterId(frame.id); reply.extended = false; reply.dlc = 8;
+    reply.data = {{static_cast<uint8_t>(frame.id), 0x7F, 0xFF, 0x7F, 0xF7, 0xFF, 0x55, 0x5A}};
+    replies.push_back(reply);
+    return true;
+  }
+  bool recv(CanFrame & frame, int) override
+  {
+    if (replies.empty()) {return false;}
+    // Only this fake bus waits in real time. The production driver's clock is not injected.
+    if (enable_delay_pending) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(2)); enable_delay_pending = false;
+    }
+    frame = replies.front(); replies.pop_front(); return true;
+  }
+};
+TEST(ActivationRace, FourMillisecondWindowAcceptsAllInitialControls)
+{
+  class System : public BxiSystemInterface {
+  public:
+    std::shared_ptr<ActivationWindowBus> bus = std::make_shared<ActivationWindowBus>();
+  protected:
+    std::shared_ptr<CanBus> makeBus(CanFrameFormat) override {return bus;}
+  } system;
+  const auto directory = freshDirectory("activation_race");
+  EnvGuard dir("BXI_WORKER_TIMING_DIR", directory.c_str());
+  EnvGuard cycles("BXI_STREAM_TRACE_CYCLES", nullptr);
+  GeneratedBoundsInput input(3);
+  ASSERT_EQ(system.on_init(input.hardware), H::SUCCESS);
+  // ERROR is intentional at the probe's final throw, never a full-activation PASS.
+  EXPECT_EQ(system.on_activate(rclcpp_lifecycle::State()), H::ERROR);
+  EXPECT_EQ(system.bus->accepted_controls, 3U);
+  std::ifstream trace(directory + "/activation_trace.csv");
+  std::string line; unsigned summaries = 0;
+  while (std::getline(trace, line)) {
+    EXPECT_EQ(std::count(line.begin(), line.end(), ','), 22);
+    if (line.find("\"summary\"") != std::string::npos) {++summaries;}
+  }
+  EXPECT_EQ(summaries, 3U);
+  for (uint32_t id : {1U, 2U, 3U}) {
+    EXPECT_TRUE(std::any_of(system.bus->sent.begin(), system.bus->sent.end(), [&](const CanFrame & f) {
+      return f.id == id && f.data8() == protocol::encodeSpecialCommand(protocol::SpecialCommand::kDisable);
+    }));
+  }
+}
+
+TEST(ActivationRace, FailureOnSecondOrThirdAxisDisablesAllAndSkipsFollowingAxes)
+{
+  for (unsigned axes : {2U, 3U}) {
+    for (uint32_t fail_id = 2; fail_id <= axes; ++fail_id) {
+      class System : public BxiSystemInterface {
+      public:
+        std::shared_ptr<ActivationWindowBus> bus = std::make_shared<ActivationWindowBus>();
+      protected:
+        std::shared_ptr<CanBus> makeBus(CanFrameFormat) override {return bus;}
+      } system;
+      system.bus->axes = axes; system.bus->unresponsive_id = fail_id;
+      const auto directory = freshDirectory("activation_failure_" + std::to_string(axes) + "_" + std::to_string(fail_id));
+      EnvGuard dir("BXI_WORKER_TIMING_DIR", directory.c_str());
+      EnvGuard cycles("BXI_STREAM_TRACE_CYCLES", nullptr);
+      GeneratedBoundsInput input(axes);
+      ASSERT_EQ(system.on_init(input.hardware), H::SUCCESS);
+      EXPECT_EQ(system.on_activate(rclcpp_lifecycle::State()), H::ERROR);
+      EXPECT_EQ(system.bus->controls[fail_id], 2U);
+      for (uint32_t id = 1; id <= axes; ++id) {
+        if (id < fail_id) {EXPECT_EQ(system.bus->controls[id], 1U);}
+        if (id > fail_id) {EXPECT_EQ(system.bus->controls[id], 0U);}
+        EXPECT_TRUE(std::any_of(system.bus->sent.begin(), system.bus->sent.end(), [&](const CanFrame & f) {
+          return f.id == id && f.data8() == protocol::encodeSpecialCommand(protocol::SpecialCommand::kDisable);
+        }));
+      }
+      std::ifstream trace(directory + "/activation_trace.csv"); std::string line; unsigned summaries = 0;
+      while (std::getline(trace, line)) {
+        EXPECT_EQ(std::count(line.begin(), line.end(), ','), 22);
+        if (line.find("\"summary\"") != std::string::npos) {++summaries;}
+        if (fail_id < axes && line.find("\"not_attempted\"") != std::string::npos) {
+          EXPECT_NE(line.find("\"" + std::to_string(axes) + "\""), std::string::npos);
+        }
+      }
+      EXPECT_EQ(summaries, axes);
+    }
+  }
+}
+
+std::vector<std::vector<std::string>> activationCsv(const std::string & directory)
+{
+  std::ifstream file(directory + "/activation_trace.csv");
+  std::string line; std::getline(file, line); std::vector<std::vector<std::string>> rows;
+  while (std::getline(file, line)) {
+    std::stringstream stream(line); std::string field; std::vector<std::string> row;
+    while (std::getline(stream, field, ',')) {
+      if (field.size() >= 2 && field.front() == '"' && field.back() == '"') {field = field.substr(1, field.size() - 2);}
+      row.push_back(field);
+    }
+    rows.push_back(row);
+  }
+  return rows;
+}
+
+TEST(ActivationRemaining, DelayedEnableAnchorsSettleAndHonorsOriginalDeadline)
+{
+  for (bool expired : {false, true}) {
+    class System : public BxiSystemInterface {
+    public:
+      bool expire = false;
+      std::shared_ptr<ActivationWindowBus> bus = std::make_shared<ActivationWindowBus>();
+    protected:
+      std::shared_ptr<CanBus> makeBus(CanFrameFormat) override {return bus;}
+      int64_t activationNow() const override {
+        return BxiSystemInterface::activationNow() + (expire ? 2000000000LL : 0);
+      }
+    } system;
+    system.expire = expired; system.bus->delayed_enable_id = 3;
+    const auto directory = freshDirectory(expired ? "delayed_enable_expired" : "delayed_enable");
+    EnvGuard dir("BXI_WORKER_TIMING_DIR", directory.c_str());
+    EnvGuard cycles("BXI_STREAM_TRACE_CYCLES", nullptr);
+    GeneratedBoundsInput input(3);
+    ASSERT_EQ(system.on_init(input.hardware), H::SUCCESS);
+    EXPECT_EQ(system.on_activate(rclcpp_lifecycle::State()), H::ERROR);  // probe or injected deadline
+    const auto rows = activationCsv(directory);
+    int64_t enable_dequeue = 0;
+    for (const auto & row : rows) {
+      ASSERT_EQ(row.size(), 23U);
+      if (row[1] == "3" && row[2] == "enable") {
+        enable_dequeue = std::stoll(row[11]);
+        EXPECT_GE(enable_dequeue - std::stoll(row[9]), 2000000);
+      }
+    }
+    ASSERT_GT(enable_dequeue, 0);
+    EXPECT_EQ(system.bus->accepted_controls, expired ? 0U : 3U);
+    for (const auto & row : rows) {
+      if (!expired && row[2] == "initial_control") {
+        EXPECT_GE(std::stoll(row[9]) - enable_dequeue, 10000000);
+      }
+      if (expired && row[2] == "summary") {EXPECT_EQ(row[22], "deadline");}
+    }
+  }
+}
+
+TEST(ActivationRemaining, TraceSaveFailureDoesNotChangeSuccessfulActivation)
+{
+  // Run only inside the verified, isolated vcan fixture with its dedicated emulator.
+  const char * root = std::getenv("BXI_ACTIVATION_TRACE_FAILURE_ROOT");
+  if (!root || std::string(std::getenv("BXI_ALLOW_TEST_FAULTS") ?
+      std::getenv("BXI_ALLOW_TEST_FAULTS") : "") != "1")
+  {GTEST_SKIP() << "isolated activation trace failure fixture not configured";}
+  for (bool blocked : {false, true}) {
+    const auto directory = (std::filesystem::path(root) / (blocked ? "blocked" : "writable")).string();
+    std::filesystem::create_directories(directory);
+    if (blocked) {std::filesystem::create_directory(directory + "/activation_trace.csv");}
+    EnvGuard dir("BXI_WORKER_TIMING_DIR", directory.c_str());
+    EnvGuard cycles("BXI_STREAM_TRACE_CYCLES", nullptr);
+    GeneratedBoundsInput input(3); BxiSystemInterface system;
+    ASSERT_EQ(system.on_init(input.hardware), H::SUCCESS);
+    LogCapture log;
+    const auto result = system.on_activate(rclcpp_lifecycle::State());
+    EXPECT_EQ(result, H::SUCCESS);
+    EXPECT_EQ(LogCapture::activation_trace_errors, blocked ? 1 : 0);
+    std::cout << "trace_save_blocked=" << blocked << " activation_success=" << (result == H::SUCCESS)
+      << " trace_error_count=" << LogCapture::activation_trace_errors << '\n';
+    system.on_deactivate(rclcpp_lifecycle::State());
+    EXPECT_EQ(std::filesystem::is_regular_file(directory + "/activation_trace.csv"), !blocked);
   }
 }
 }  // namespace

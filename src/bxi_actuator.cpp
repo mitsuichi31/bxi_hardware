@@ -64,11 +64,20 @@ protocol::MitLimits BxiActuatorDriver::limits() const
   return value;
 }
 
-ActuatorFeedback BxiActuatorDriver::transact(const CanFrame & request)
+ActuatorFeedback BxiActuatorDriver::transact(
+  const CanFrame & request, TransactionObservation * observation)
 {
+  if (observation) {*observation = {};}
   ActuatorFeedback result;
   if (state_ == ActuatorState::kSafeStopped) {
     return result;
+  }
+  if (observation) {
+    observation->tx_call_steady_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+    observation->tx_call_realtime_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::system_clock::now().time_since_epoch()).count();
+    observation->result = "send_failed";
   }
   if (!bus_->send(request)) {
     latchSafeStop();
@@ -84,9 +93,16 @@ ActuatorFeedback BxiActuatorDriver::transact(const CanFrame & request)
       break;
     }
     const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(deadline - now);
-    if (!bus_->recv(response, static_cast<int>(remaining.count())) ||
-      clock::now() >= deadline)
-    {
+    const bool received = bus_->recv(response, static_cast<int>(remaining.count()));
+    // This is also the original post-recv deadline check. Allocate observations only after
+    // sampling it, so allocation cannot change whether this particular frame met the deadline.
+    const auto dequeued_at = received ? clock::now() : clock::time_point{};
+    if (observation && received) {
+      observation->replies.push_back({std::chrono::duration_cast<std::chrono::nanoseconds>(
+        dequeued_at.time_since_epoch()).count(), response.rx_kernel_realtime_ns, false,
+        response.id, response.dlc});
+    }
+    if (!received || dequeued_at >= deadline) {
       break;
     }
     const auto decoded = decodeMotorReply(response, can_id_, limits());
@@ -95,15 +111,23 @@ ActuatorFeedback BxiActuatorDriver::transact(const CanFrame & request)
     }
     consecutive_timeouts_ = 0;
     result = applyFeedback(*decoded);
+    if (observation) {
+      observation->replies.back().accepted = true;
+      observation->result = std::isfinite(result.temperature) ? "ok" : "temperature_fault";
+    }
     result.rx_kernel_realtime_ns = response.rx_kernel_realtime_ns;
     result.rx_userspace_realtime_ns = response.rx_userspace_realtime_ns;
     return result;
   }
 
   ++consecutive_timeouts_;
+  if (observation) {
+    observation->result = "timeout";
+  }
   result.consecutive_timeouts = consecutive_timeouts_;
   if (consecutive_timeouts_ >= maximum_consecutive_timeouts_) {
     latchSafeStop();
+    if (observation) {observation->result = "safe_stop";}
     RCLCPP_ERROR(
       logger(), "motor id=%d entered safe-stop after %u consecutive timeouts", can_id_,
       consecutive_timeouts_);
@@ -189,16 +213,17 @@ void BxiActuatorDriver::updateTemperature(
 }
 
 ActuatorFeedback BxiActuatorDriver::sendSpecial(
-  protocol::SpecialCommand command, bool enables_motor)
+  protocol::SpecialCommand command, bool enables_motor, TransactionObservation * observation)
 {
   if (state_ == ActuatorState::kSafeStopped && enables_motor) {
+    if (observation) {*observation = {};}
     return {};
   }
   CanFrame frame;
   frame.id = static_cast<uint32_t>(can_id_);
   frame.extended = false;
   frame.setData(protocol::encodeSpecialCommand(command));
-  auto feedback = transact(frame);
+  auto feedback = transact(frame, observation);
   if (feedback.valid) {
     state_ = enables_motor ? ActuatorState::kEnabled : ActuatorState::kDisabled;
   }
@@ -208,6 +233,23 @@ ActuatorFeedback BxiActuatorDriver::sendSpecial(
 ActuatorFeedback BxiActuatorDriver::enable()
 {
   return sendSpecial(protocol::SpecialCommand::kEnable, true);
+}
+
+ActuatorFeedback BxiActuatorDriver::enableObserved(TransactionObservation & observation)
+{
+  return sendSpecial(protocol::SpecialCommand::kEnable, true, &observation);
+}
+
+ActuatorFeedback BxiActuatorDriver::initialControlObserved(TransactionObservation & observation)
+{
+  observation = {};
+  const auto encoded = encodeControlBlock(0, 0, 0, 0, 0);
+  if (!encoded) {return {};}
+  CanFrame frame;
+  frame.id = static_cast<uint32_t>(can_id_);
+  frame.extended = false;
+  frame.setData(*encoded);
+  return transact(frame, &observation);
 }
 
 ActuatorFeedback BxiActuatorDriver::disable()

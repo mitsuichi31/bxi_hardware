@@ -1,5 +1,6 @@
 // mevius2_hardware/RobstrideSystemInterface を雛形に BXI MIT protocol用へ改修。
 #include "bxi_hardware/bxi_system_interface.hpp"
+#include "bxi_hardware/activation_startup.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -27,6 +28,101 @@ namespace bxi_hardware
 
 static rclcpp::Logger logger() { return rclcpp::get_logger("BxiSystemInterface"); }
 static constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
+
+namespace
+{
+struct ActivationAxisTrace
+{
+  std::string bus;
+  int id;
+  int64_t enable_dequeue = 0;
+  int64_t last_enable = 0;
+  int64_t settle_end = 0;
+  int64_t settle_wait = 0;
+  std::vector<InitialAttempt> enables;
+  std::vector<InitialAttempt> controls;
+  const char * reason = "not_attempted";
+};
+struct ActivationTrace
+{
+  bool enabled;
+  int64_t origin;
+  std::string directory;
+  std::vector<ActivationAxisTrace> axes;
+  ~ActivationTrace() noexcept
+  {
+    if (!enabled) {return;}
+    try {
+      if (directory.empty()) {
+        RCLCPP_WARN(logger(), "activation trace disabled: BXI_WORKER_TIMING_DIR is unset"); return;
+      }
+      const auto path = std::filesystem::path(directory) / "activation_trace.csv";
+      if (std::filesystem::exists(path)) {throw std::runtime_error("activation_trace.csv already exists");}
+      std::ofstream out(path);
+      out.exceptions(std::ios::failbit | std::ios::badbit);
+      out << "bus,id,stage,attempt,enable_dequeue_a0_ns,last_enable_dequeue_a0_ns,settle_end_a0_ns,"
+        "settle_wait_ns,retry_used,tx_call_steady_a0_ns,tx_call_realtime_ns,"
+        "rx_dequeue_steady_a0_ns,rx_kernel_realtime_ns,send_to_dequeue_ns,first_send_to_dequeue_ns,"
+        "kernel_vs_current_send,accepted,can_id,dlc,received_frames,rejected_frames,result,reason\n";
+      auto ns = [&](int64_t value, bool relative) -> std::string {
+        return value ? std::to_string(relative ? value - origin : value) : "";
+      };
+      auto write = [&](const std::vector<std::string> & fields) {
+        for (size_t i = 0; i < fields.size(); ++i) {
+          if (i) {out << ',';}
+          out << '"';
+          for (char c : fields[i]) {if (c == '"') {out << '"';} out << c;}
+          out << '"';
+        }
+        out << '\n';
+      };
+      for (const auto & axis : axes) {
+        auto base = [&]() {
+          std::vector<std::string> fields(23);
+          fields[0] = axis.bus; fields[1] = std::to_string(axis.id);
+          fields[4] = ns(axis.enable_dequeue, true); fields[5] = ns(axis.last_enable, true);
+          fields[6] = ns(axis.settle_end, true); fields[7] = std::to_string(axis.settle_wait);
+          fields[8] = axis.controls.size() > 1 ? "1" : "0";
+          return fields;
+        };
+        auto rows = [&](const char * stage, const std::vector<InitialAttempt> & attempts) {
+          for (const auto & attempt : attempts) {
+            const auto & o = attempt.observation;
+            const auto rejected = std::count_if(o.replies.begin(), o.replies.end(),
+              [](const auto & r) {return !r.accepted;});
+            for (size_t j = 0; j < std::max<size_t>(1, o.replies.size()); ++j) {
+              auto fields = base(); fields[2] = stage; fields[3] = std::to_string(attempt.number);
+              fields[9] = ns(o.tx_call_steady_ns, true); fields[10] = ns(o.tx_call_realtime_ns, false);
+              fields[15] = "NOT_EVALUATED";
+              if (j < o.replies.size()) {
+                const auto & reply = o.replies[j];
+                fields[11] = ns(reply.rx_dequeue_steady_ns, true);
+                fields[12] = ns(reply.rx_kernel_realtime_ns, false);
+                if (o.tx_call_steady_ns) {
+                  fields[13] = std::to_string(reply.rx_dequeue_steady_ns - o.tx_call_steady_ns);
+                }
+                if (!attempts.empty() && attempts.front().observation.tx_call_steady_ns) {
+                  fields[14] = std::to_string(reply.rx_dequeue_steady_ns - attempts.front().observation.tx_call_steady_ns);
+                }
+                fields[15] = kernelVsSend(reply.rx_kernel_realtime_ns, o.tx_call_realtime_ns);
+                fields[16] = reply.accepted ? "1" : "0";
+                fields[17] = std::to_string(reply.can_id); fields[18] = std::to_string(reply.dlc);
+              }
+              fields[19] = std::to_string(o.replies.size()); fields[20] = std::to_string(rejected);
+              fields[21] = o.result; fields[22] = attempt.reason; write(fields);
+            }
+          }
+        };
+        rows("enable", axis.enables); rows("initial_control", axis.controls);
+        auto fields = base(); fields[2] = "summary"; fields[22] = axis.reason; write(fields);
+      }
+      out.close();
+    } catch (const std::exception & e) {
+      RCLCPP_ERROR(logger(), "activation trace save failed (activation result unchanged): %s", e.what());
+    }
+  }
+};
+}  // namespace
 
 static constexpr char HW_IF_KP[] = "kp";
 static constexpr char HW_IF_KD[] = "kd";
@@ -515,6 +611,8 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_activate(
   const rclcpp_lifecycle::State & /*previous_state*/)
 {
   const auto activation_start = std::chrono::steady_clock::now();
+  ActivationTrace activation_trace{pair_mode_, std::chrono::duration_cast<std::chrono::nanoseconds>(
+      activation_start.time_since_epoch()).count(), "", {}};
   if (pair_mode_) {
     pair_activation_ns_ = activation_start.time_since_epoch().count();
     pair_safety_.reset(pair_safety_.epoch + 1, n_joints_);
@@ -564,6 +662,13 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_activate(
   try {
     const char * timing_dir = std::getenv("BXI_WORKER_TIMING_DIR");
     worker_timing_dir_ = timing_dir == nullptr ? "" : timing_dir;
+    activation_trace.directory = worker_timing_dir_;
+    if (pair_mode_) {
+      RCLCPP_INFO(logger(), "pair activation policy: settle_ns=%lld attempts=%d retry_interval_ns=%lld budget_ns=%lld",
+        static_cast<long long>(ActivationPolicy::settle_ns), ActivationPolicy::attempts,
+        static_cast<long long>(ActivationPolicy::retry_interval_ns),
+        static_cast<long long>(ActivationPolicy::budget_ns));
+    }
     if (!worker_timing_dir_.empty() &&
       (!std::filesystem::is_directory(worker_timing_dir_) ||
       ::access(worker_timing_dir_.c_str(), W_OK) != 0))
@@ -717,6 +822,8 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_activate(
       constexpr int kEnableRetries = 3;
       std::map<size_t, double> enable_pos;
       std::vector<size_t> live;
+      const size_t trace_begin = activation_trace.axes.size();
+      int64_t last_enable_dequeue = 0;
 
       for (size_t i : indices) {
         if (!loadSpec(joints_[i].motor_type)) {
@@ -730,8 +837,18 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_activate(
           temperature_sensor_fault_below_c_);
 
         ActuatorFeedback fb;
+        if (pair_mode_) {activation_trace.axes.push_back({bus_name, joints_[i].can_id, 0, 0, 0, 0, {}, {}, "not_attempted"});}
         for (int attempt = 0; attempt < kEnableRetries; ++attempt) {
-          fb = joints_[i].actuator->enable();
+          if (pair_mode_) {
+            auto & axis_trace = activation_trace.axes.back();
+            axis_trace.enables.push_back({attempt + 1, {}, "exception"});
+            auto & record = axis_trace.enables.back();
+            fb = static_cast<BxiActuatorDriver *>(joints_[i].actuator.get())->enableObserved(record.observation);
+            record.reason = record.observation.result;
+            if (fb.valid && !record.observation.replies.empty()) {
+              axis_trace.enable_dequeue = last_enable_dequeue = record.observation.replies.back().rx_dequeue_steady_ns;
+            }
+          } else {fb = joints_[i].actuator->enable();}
           if (fb.valid) {
             break;
           }
@@ -774,8 +891,46 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_activate(
 
       // G profiles must remain within the codec after the startup offset adjustment.
       if (pair_mode_ && !configurePair()) {return fail_activation();}
+      ActivationStartup startup{{[this]() {return activationNow();},
+          [this](int64_t ns) {activationWaitUntil(ns);}},
+        pair_mode_ ? std::min(last_enable_dequeue + ActivationPolicy::budget_ns,
+          pair_activation_ns_ + static_cast<int64_t>(bus_transport_.at(bus_name).first_write_timeout_ms * 1.e6)) : 0,
+        static_cast<int64_t>(control_timeout_ms_) * 1000000};
+      if (pair_mode_) {
+        const bool settled = startup.settle(last_enable_dequeue);
+        for (size_t j = trace_begin; j < activation_trace.axes.size(); ++j) {
+          auto & trace = activation_trace.axes[j];
+          trace.last_enable = last_enable_dequeue; trace.settle_end = startup.settle_end;
+          trace.settle_wait = startup.settle_wait;
+          if (!settled) {trace.reason = "deadline";}
+        }
+        if (!settled) {
+          RCLCPP_ERROR(logger(), "[%s] pair activation settle deadline", bus_name.c_str());
+          return fail_activation();
+        }
+      }
+      size_t trace_index = trace_begin;
       for (size_t i : live) {
-        auto fb = joints_[i].actuator->sendControl(0, 0, 0, 0, 0);
+        ActuatorFeedback fb;
+        if (pair_mode_) {
+          auto * driver = static_cast<BxiActuatorDriver *>(joints_[i].actuator.get());
+          auto & trace = activation_trace.axes[trace_index++];
+          bool success = false;
+          try {
+            success = startup.initial([&](TransactionObservation & o) {return driver->initialControlObserved(o);},
+              [&]() {return !safe_stopped_ && driver->state() == ActuatorState::kEnabled;}, fb, trace.controls);
+          } catch (...) {trace.reason = "exception"; throw;}
+          trace.reason = startup.reason;
+          if (trace.controls.size() > 1) {
+            RCLCPP_WARN(logger(), "[%s] id=%d initial control retry used (feedback request attribution unknown)",
+              bus_name.c_str(), joints_[i].can_id);
+          }
+          if (!success) {
+            RCLCPP_ERROR(logger(), "[%s] id=%d pair initial control failed: %s",
+              bus_name.c_str(), joints_[i].can_id, startup.reason);
+            return fail_activation();
+          }
+        } else {fb = joints_[i].actuator->sendControl(0, 0, 0, 0, 0);}
         if (!fb.valid) {
           RCLCPP_ERROR(logger(), "[%s] %s 初期フィードバック取得失敗", bus_name.c_str(),
             joints_[i].name.c_str());

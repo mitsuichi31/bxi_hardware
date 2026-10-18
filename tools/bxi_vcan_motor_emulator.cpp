@@ -24,6 +24,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <cstring>
 
 #include "bxi_hardware/can/socketcan_bus.hpp"
 #include "bxi_hardware/protocol/mit_protocol.hpp"
@@ -49,6 +50,10 @@ struct Options
   int replies_per_command = 1;
   bool follow = false;
   double follow_time_constant_ms = 50.0;
+  std::map<int, int> startup_window_ms;
+  bool startup_delay = false;
+  bool mode_text = false;
+  std::set<int> silent_control_ids;
 };
 
 // Emulated joint state for --follow (under the shared mutex).
@@ -64,6 +69,8 @@ void usage()
   std::printf(
     "usage: bxi_vcan_motor_emulator [--iface vcan0] [--ids 1,2,3] [--delay-us 300]"
     " [--replies-per-command 1] [--follow 0|1] [--follow-time-constant-ms 50]\n"
+    " [--startup-window-ms 1:4,2:20,3:0] [--startup-action drop|delay]"
+    " [--mode-text 0|1] [--silent-control-ids 1,2,3]\n"
     "  vcan interfaces only. Stop with Ctrl+C; counts are printed on exit.\n");
 }
 
@@ -74,6 +81,35 @@ bool parse(int argc, char ** argv, Options & o)
     const std::string value = argv[i + 1];
     if (key == "--iface") {
       o.iface = value;
+    } else if (key == "--startup-window-ms") {
+      std::stringstream list(value);
+      for (std::string item; std::getline(list, item, ','); ) {
+        const auto colon = item.find(':');
+        if (colon == std::string::npos) {return false;}
+        try {
+          size_t used_id = 0, used_ms = 0;
+          const int id = std::stoi(item.substr(0, colon), &used_id);
+          const int ms = std::stoi(item.substr(colon + 1), &used_ms);
+          if (used_id != colon || used_ms != item.size() - colon - 1 ||
+            id < 1 || id > int(protocol::kMaxSupportedMotorCanId) || ms < 0 || ms > 60000) {return false;}
+          o.startup_window_ms[id] = ms;
+        } catch (const std::exception &) {return false;}
+      }
+    } else if (key == "--startup-action") {
+      if (value != "drop" && value != "delay") {return false;}
+      o.startup_delay = value == "delay";
+    } else if (key == "--mode-text") {
+      if (value != "0" && value != "1") {return false;}
+      o.mode_text = value == "1";
+    } else if (key == "--silent-control-ids") {
+      std::stringstream list(value);
+      for (std::string item; std::getline(list, item, ','); ) {
+        try {
+          size_t used = 0; const int id = std::stoi(item, &used);
+          if (used != item.size() || id < 1 || id > int(protocol::kMaxSupportedMotorCanId)) {return false;}
+          o.silent_control_ids.insert(id);
+        } catch (const std::exception &) {return false;}
+      }
     } else if (key == "--ids") {
       o.ids.clear();
       std::stringstream list(value);
@@ -184,6 +220,9 @@ int main(int argc, char ** argv)
   std::atomic<long> unicast_frames{0};
   std::atomic<long> broadcast_frames{0};
   std::atomic<long> replies_sent{0};
+  // Receiver-thread-only readiness; no new thread, lock or shared queue is introduced.
+  std::map<int, clock_type::time_point> ready;
+  unsigned long dropped_controls = 0;
 
   std::thread sender([&]() {
       std::unique_lock<std::mutex> lock(mutex);
@@ -199,7 +238,16 @@ int main(int argc, char ** argv)
         }
         const int id = pending.begin()->second;
         pending.erase(pending.begin());
-        const CanFrame reply = feedbackFrame(id, options.follow ? &joints[id] : nullptr);
+        CanFrame reply;
+        if (id < 0) {
+          // Existing pending queue also carries immutable text chunks encoded as negative IDs.
+          const int code = -id - 1, motor_id = code / 16, chunk = code % 16;
+          static constexpr char text[] = "STATE : 02 MOTOR\r\nEnter Motor Mode\r\n";
+          reply.id = 0x7F0U + static_cast<uint32_t>(motor_id); reply.extended = false;
+          reply.dlc = 8;
+          const size_t offset = static_cast<size_t>(chunk) * 8;
+          std::memcpy(reply.data.data(), text + offset, std::min<size_t>(8, sizeof(text) - 1 - offset));
+        } else {reply = feedbackFrame(id, options.follow ? &joints[id] : nullptr);}
         lock.unlock();
         if (tx_bus.send(reply)) {
           ++replies_sent;
@@ -221,8 +269,27 @@ int main(int argc, char ** argv)
     std::lock_guard<std::mutex> lock(mutex);
     if (options.ids.count(id) != 0 && frame.dlc == 8) {
       ++unicast_frames;
+      const bool enable = frame.data8() == protocol::encodeSpecialCommand(protocol::SpecialCommand::kEnable);
+      const bool disable = frame.data8() == protocol::encodeSpecialCommand(protocol::SpecialCommand::kDisable);
+      if (enable) {
+        const auto window = options.startup_window_ms.find(id);
+        ready[id] = now + std::chrono::milliseconds(window == options.startup_window_ms.end() ? 0 : window->second);
+        if (options.mode_text) {
+          constexpr size_t text_size = sizeof("STATE : 02 MOTOR\r\nEnter Motor Mode\r\n") - 1;
+          for (size_t chunk = 0; chunk < (text_size + 7) / 8; ++chunk) {
+            pending.emplace(now + std::chrono::microseconds(800 + chunk * 500),
+              -(id * 16 + static_cast<int>(chunk) + 1));
+          }
+        }
+      }
+      if (!enable && !disable && options.silent_control_ids.count(id)) {++dropped_controls; continue;}
+      auto due = now;
+      if (!enable && !disable && ready.count(id) && now < ready[id]) {
+        if (!options.startup_delay) {++dropped_controls; continue;}
+        due = ready[id];
+      }
       for (int r = 0; r < options.replies_per_command; ++r) {
-        pending.emplace(now, id);
+        pending.emplace(due, id);
       }
     } else if (frame.id == 0x7FFU) {
       ++broadcast_frames;
@@ -230,6 +297,7 @@ int main(int argc, char ** argv)
         if (options.ids.count(block + 1) == 0) {
           continue;
         }
+        if (options.silent_control_ids.count(block + 1)) {++dropped_controls; continue;}
         if (options.follow) {
           follow(joints[block + 1], &frame.data[static_cast<size_t>(block) * 8], now,
             options.follow_time_constant_ms / 1000.0);
@@ -245,6 +313,8 @@ int main(int argc, char ** argv)
   sender.join();
   std::printf("unicast frames=%ld broadcast frames=%ld replies sent=%ld\n",
     unicast_frames.load(), broadcast_frames.load(), replies_sent.load());
+  std::printf("startup_action=%s mode_text=%d dropped_controls=%lu\n",
+    options.startup_delay ? "delay" : "drop", options.mode_text ? 1 : 0, dropped_controls);
   rx_bus.close();
   tx_bus.close();
   return 0;

@@ -7,6 +7,7 @@
 #include <optional>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "bxi_hardware/actuator/actuator_driver.hpp"
 #include "bxi_hardware/can/can_bus.hpp"
@@ -50,6 +51,23 @@ enum class ActuatorState
   kSafeStopped,
 };
 
+// Caller-owned, activation-only observations. No clocks are converted between domains.
+struct TransactionObservation
+{
+  struct Reply
+  {
+    int64_t rx_dequeue_steady_ns = 0;
+    int64_t rx_kernel_realtime_ns = 0;
+    bool accepted = false;
+    uint32_t can_id = 0;
+    uint8_t dlc = 0;
+  };
+  int64_t tx_call_steady_ns = 0;
+  int64_t tx_call_realtime_ns = 0;
+  const char * result = "safe_stop";
+  std::vector<Reply> replies;
+};
+
 class BxiActuatorDriver : public ActuatorDriver
 {
 public:
@@ -72,6 +90,8 @@ public:
   static constexpr double kDefaultTemperatureSensorFaultBelowC = -20.0;
 
   ActuatorFeedback enable() override;
+  ActuatorFeedback enableObserved(TransactionObservation & observation);
+  ActuatorFeedback initialControlObserved(TransactionObservation & observation);
   ActuatorFeedback disable() override;
   bool setRunMode() override;
   ActuatorFeedback setZero() override;
@@ -108,8 +128,9 @@ public:
   bool motorTemperatureSensorFault() const {return motor_sensor_fault_;}
 
 private:
-  ActuatorFeedback sendSpecial(protocol::SpecialCommand command, bool enables_motor);
-  ActuatorFeedback transact(const CanFrame & request);
+  ActuatorFeedback sendSpecial(protocol::SpecialCommand command, bool enables_motor,
+    TransactionObservation * observation = nullptr);
+  ActuatorFeedback transact(const CanFrame & request, TransactionObservation * observation = nullptr);
   void latchSafeStop(bool report_disable_failure = true);
   void trySendDisable(bool report_failure = true);
   void updateTemperature(const protocol::MitFeedback & decoded, ActuatorFeedback & result);

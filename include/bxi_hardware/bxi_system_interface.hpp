@@ -78,6 +78,14 @@ public:
     const std::vector<std::string> & start, const std::vector<std::string> & stop) override;
 
 protected:
+  // Activation-only clock seams; transact retains its existing real-time timeout clock.
+  virtual int64_t activationNow() const {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+  }
+  virtual void activationWaitUntil(int64_t ns) {
+    std::this_thread::sleep_until(std::chrono::steady_clock::time_point(std::chrono::nanoseconds(ns)));
+  }
   virtual int64_t pairSteadyNow() const noexcept {
     return std::chrono::steady_clock::now().time_since_epoch().count();
   }
