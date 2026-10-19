@@ -1,0 +1,1 @@
+<library path="bxi_pair_mock"><class name="bxi_hardware/BxiPairMockSystem" type="bxi_hardware::BxiPairMockSystem" base_class_type="hardware_interface::SystemInterface"><description>TEST ONLY / 試験専用. No CAN I/O or safety-batch emulation.</description></class></library>

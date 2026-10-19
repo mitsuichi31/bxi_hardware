@@ -14,6 +14,13 @@ inline const char * kernelVsSend(int64_t kernel_realtime, int64_t send_realtime)
   return !kernel_realtime || !send_realtime ? "NOT_EVALUATED" :
          (kernel_realtime < send_realtime ? "before" : "at_or_after");
 }
+
+inline bool initialPositionAllowed(double p, double lo, double hi) noexcept
+{
+  return std::isfinite(p) && std::isfinite(lo) && std::isfinite(hi) && lo <= hi && p >= lo &&
+         p <= hi;
+}
+
 // All provisional startup policy values live here. Never used by the RT paths.
 struct ActivationPolicy
 {
@@ -49,16 +56,20 @@ struct ActivationStartup
     return now < deadline && wait <= deadline - now &&
            response_timeout <= deadline - now - wait;
   }
+
   bool settle(int64_t last_enable)
   {
     const auto before = clock.now();
     const auto target = last_enable + ActivationPolicy::settle_ns;
     if (!room(std::max<int64_t>(0, target - before))) {return false;}
     if (before < target) {clock.wait_until(target);}
-    settle_end = clock.now(); settle_wait = settle_end - before;
+    settle_end = clock.now();
+    settle_wait = settle_end - before;
     return settle_end >= target && room();
   }
-  bool initial(const std::function<ActuatorFeedback(TransactionObservation &)> & send,
+
+  bool initial(
+    const std::function<ActuatorFeedback(TransactionObservation &)> & send,
     const std::function<bool()> & enabled, ActuatorFeedback & feedback,
     std::vector<InitialAttempt> & records)
   {
@@ -73,19 +84,25 @@ struct ActivationStartup
       if (clock.now() >= deadline) {record.reason = reason = "deadline"; return false;}
       if (feedback.valid) {
         if (!std::isfinite(feedback.temperature)) {
-          record.reason = reason = "temperature_fault"; return false;
+          record.reason = reason = "temperature_fault";
+          return false;
         }
-        record.reason = reason = "ok"; return true;
+        record.reason = reason = "ok";
+        return true;
       }
       if (!enabled() || std::string(record.observation.result) == "send_failed") {
-        reason = std::string(record.observation.result) == "send_failed" ? "send_failed" : "safe_stop";
-        record.reason = reason; return false;
+        reason = std::string(record.observation.result) ==
+          "send_failed" ? "send_failed" : "safe_stop";
+        record.reason = reason;
+        return false;
       }
       if (std::string(record.observation.result) != "timeout") {
-        record.reason = reason = record.observation.result; return false;
+        record.reason = reason = record.observation.result;
+        return false;
       }
       if (attempt == ActivationPolicy::attempts) {
-        record.reason = reason = "attempt_limit"; return false;
+        record.reason = reason = "attempt_limit";
+        return false;
       }
       if (!room(ActivationPolicy::retry_interval_ns)) {reason = "deadline"; return false;}
       const auto target = clock.now() + ActivationPolicy::retry_interval_ns;
@@ -94,6 +111,7 @@ struct ActivationStartup
     }
     return false;
   }
+
 };
 }  // namespace bxi_hardware
 #endif

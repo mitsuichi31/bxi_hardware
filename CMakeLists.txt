@@ -84,6 +84,16 @@ ament_target_dependencies(bxi_n_axis_controllers controller_interface hardware_i
 target_link_libraries(bxi_n_axis_controllers ${BXI_HW_LIB} "${bxi_interfaces_cpp}")
 pluginlib_export_plugin_description_file(controller_interface bxi_n_axis_controllers.xml)
 
+add_library(bxi_pair_adapter SHARED src/bxi_pair_adapter.cpp)
+target_include_directories(bxi_pair_adapter PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:include>)
+ament_target_dependencies(bxi_pair_adapter controller_interface hardware_interface pluginlib rclcpp rclcpp_lifecycle)
+pluginlib_export_plugin_description_file(controller_interface bxi_pair_adapter.xml)
+add_library(bxi_pair_mock SHARED src/bxi_pair_mock_system.cpp)
+target_include_directories(bxi_pair_mock PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:include>)
+ament_target_dependencies(bxi_pair_mock hardware_interface pluginlib rclcpp rclcpp_lifecycle)
+pluginlib_export_plugin_description_file(hardware_interface bxi_pair_mock.xml)
+install(TARGETS bxi_pair_adapter bxi_pair_mock EXPORT export_${PROJECT_NAME} LIBRARY DESTINATION lib)
+
 # 試験専用の controller（vcan の故障経路：controller_manager の更新の停止）。本番の controller とは
 # 別のライブラリにする。BXI_ALLOW_TEST_FAULTS=1 のときだけ設定できる。
 add_library(bxi_hil_test_controllers SHARED src/hil_update_stall_controller.cpp)
@@ -119,6 +129,13 @@ if(BUILD_TESTING)
   pluginlib_export_plugin_description_file(hardware_interface bxi_hil_trace_test.xml)
   install(TARGETS bxi_hil_trace_test LIBRARY DESTINATION lib)
   find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_bxi_pair_mock_system test/test_bxi_pair_mock_system.cpp)
+  target_link_libraries(test_bxi_pair_mock_system bxi_pair_mock)
+  ament_target_dependencies(test_bxi_pair_mock_system hardware_interface rclcpp rclcpp_lifecycle)
+  ament_add_gtest(test_bxi_pair_adapter test/test_bxi_pair_adapter.cpp)
+  target_link_libraries(test_bxi_pair_adapter bxi_pair_adapter)
+  ament_target_dependencies(test_bxi_pair_adapter controller_interface hardware_interface rclcpp rclcpp_lifecycle)
+
   find_package(ament_cmake_pytest REQUIRED)
   ament_add_gtest(test_hil_trace_benchmark_guard test/test_hil_trace_benchmark_guard.cpp)
   target_link_libraries(test_hil_trace_benchmark_guard ${BXI_HW_LIB})
@@ -177,6 +194,7 @@ if(BUILD_TESTING)
   target_link_libraries(test_n_axis_ros bxi_n_axis_controllers "${bxi_interfaces_cpp}")
   ament_target_dependencies(test_n_axis_ros controller_interface hardware_interface rclcpp rclcpp_lifecycle std_srvs)
   set_target_properties(test_n_axis_ros PROPERTIES BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}")
+  ament_add_pytest_test(test_bxi_adapter_config test/test_bxi_adapter_config.py TIMEOUT 90)
   ament_add_pytest_test(test_n_axis_tools test/test_n_axis_tools.py TIMEOUT 90)
 
   ament_add_gtest(test_n_axis_tsan_snapshot test/test_n_axis_tsan_snapshot.cpp TIMEOUT 300)

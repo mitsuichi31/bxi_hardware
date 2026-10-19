@@ -11,6 +11,8 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <iomanip>
+#include <sstream>
 #include <set>
 
 #include <pthread.h>
@@ -26,7 +28,11 @@
 namespace bxi_hardware
 {
 
-static rclcpp::Logger logger() { return rclcpp::get_logger("BxiSystemInterface"); }
+static rclcpp::Logger logger()
+{
+  return rclcpp::get_logger("BxiSystemInterface");
+}
+
 static constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
 
 namespace
@@ -42,6 +48,9 @@ struct ActivationAxisTrace
   std::vector<InitialAttempt> enables;
   std::vector<InitialAttempt> controls;
   const char * reason = "not_attempted";
+  std::string joint_name;
+  double startup_position = kNaN, position_min = kNaN, position_max = kNaN;
+  const char * position_check = "NOT_EVALUATED";
 };
 struct ActivationTrace
 {
@@ -54,73 +63,103 @@ struct ActivationTrace
     if (!enabled) {return;}
     try {
       if (directory.empty()) {
-        RCLCPP_WARN(logger(), "activation trace disabled: BXI_WORKER_TIMING_DIR is unset"); return;
+        RCLCPP_WARN(logger(), "activation trace disabled: BXI_WORKER_TIMING_DIR is unset");
+        return;
       }
       const auto path = std::filesystem::path(directory) / "activation_trace.csv";
-      if (std::filesystem::exists(path)) {throw std::runtime_error("activation_trace.csv already exists");}
+      if (std::filesystem::exists(path)) {
+        throw std::runtime_error("activation_trace.csv already exists");
+      }
       std::ofstream out(path);
       out.exceptions(std::ios::failbit | std::ios::badbit);
       out << "bus,id,stage,attempt,enable_dequeue_a0_ns,last_enable_dequeue_a0_ns,settle_end_a0_ns,"
         "settle_wait_ns,retry_used,tx_call_steady_a0_ns,tx_call_realtime_ns,"
         "rx_dequeue_steady_a0_ns,rx_kernel_realtime_ns,send_to_dequeue_ns,first_send_to_dequeue_ns,"
-        "kernel_vs_current_send,accepted,can_id,dlc,received_frames,rejected_frames,result,reason\n";
+        "kernel_vs_current_send,accepted,can_id,dlc,received_frames,rejected_frames,result,reason,joint_name,startup_position,position_min,position_max,position_check\n";
       auto ns = [&](int64_t value, bool relative) -> std::string {
-        return value ? std::to_string(relative ? value - origin : value) : "";
-      };
+          return value ? std::to_string(relative ? value - origin : value) : "";
+        };
       auto write = [&](const std::vector<std::string> & fields) {
-        for (size_t i = 0; i < fields.size(); ++i) {
-          if (i) {out << ',';}
-          out << '"';
-          for (char c : fields[i]) {if (c == '"') {out << '"';} out << c;}
-          out << '"';
-        }
-        out << '\n';
-      };
-      for (const auto & axis : axes) {
-        auto base = [&]() {
-          std::vector<std::string> fields(23);
-          fields[0] = axis.bus; fields[1] = std::to_string(axis.id);
-          fields[4] = ns(axis.enable_dequeue, true); fields[5] = ns(axis.last_enable, true);
-          fields[6] = ns(axis.settle_end, true); fields[7] = std::to_string(axis.settle_wait);
-          fields[8] = axis.controls.size() > 1 ? "1" : "0";
-          return fields;
-        };
-        auto rows = [&](const char * stage, const std::vector<InitialAttempt> & attempts) {
-          for (const auto & attempt : attempts) {
-            const auto & o = attempt.observation;
-            const auto rejected = std::count_if(o.replies.begin(), o.replies.end(),
-              [](const auto & r) {return !r.accepted;});
-            for (size_t j = 0; j < std::max<size_t>(1, o.replies.size()); ++j) {
-              auto fields = base(); fields[2] = stage; fields[3] = std::to_string(attempt.number);
-              fields[9] = ns(o.tx_call_steady_ns, true); fields[10] = ns(o.tx_call_realtime_ns, false);
-              fields[15] = "NOT_EVALUATED";
-              if (j < o.replies.size()) {
-                const auto & reply = o.replies[j];
-                fields[11] = ns(reply.rx_dequeue_steady_ns, true);
-                fields[12] = ns(reply.rx_kernel_realtime_ns, false);
-                if (o.tx_call_steady_ns) {
-                  fields[13] = std::to_string(reply.rx_dequeue_steady_ns - o.tx_call_steady_ns);
-                }
-                if (!attempts.empty() && attempts.front().observation.tx_call_steady_ns) {
-                  fields[14] = std::to_string(reply.rx_dequeue_steady_ns - attempts.front().observation.tx_call_steady_ns);
-                }
-                fields[15] = kernelVsSend(reply.rx_kernel_realtime_ns, o.tx_call_realtime_ns);
-                fields[16] = reply.accepted ? "1" : "0";
-                fields[17] = std::to_string(reply.can_id); fields[18] = std::to_string(reply.dlc);
-              }
-              fields[19] = std::to_string(o.replies.size()); fields[20] = std::to_string(rejected);
-              fields[21] = o.result; fields[22] = attempt.reason; write(fields);
-            }
+          for (size_t i = 0; i < fields.size(); ++i) {
+            if (i) {out << ',';}
+            out << '"';
+            for (char c : fields[i]) {if (c == '"') {out << '"';} out << c;}
+            out << '"';
           }
+          out << '\n';
         };
-        rows("enable", axis.enables); rows("initial_control", axis.controls);
-        auto fields = base(); fields[2] = "summary"; fields[22] = axis.reason; write(fields);
+      for (const auto & axis : axes) {
+        auto precise = [](double value) {
+            std::ostringstream text;
+            text << std::setprecision(17) << value;
+            return text.str();
+          };
+        auto base = [&]() {
+            std::vector<std::string> fields(28);
+            fields[0] = axis.bus;
+            fields[1] = std::to_string(axis.id);
+            fields[4] = ns(axis.enable_dequeue, true);
+            fields[5] = ns(axis.last_enable, true);
+            fields[6] = ns(axis.settle_end, true);
+            fields[7] = std::to_string(axis.settle_wait);
+            fields[8] = axis.controls.size() > 1 ? "1" : "0";
+            fields[23] = axis.joint_name;
+            if (std::isfinite(axis.startup_position)) {fields[24] = precise(axis.startup_position);}
+            if (std::isfinite(axis.position_min)) {fields[25] = precise(axis.position_min);}
+            if (std::isfinite(axis.position_max)) {fields[26] = precise(axis.position_max);}
+            fields[27] = axis.position_check;
+            return fields;
+          };
+        auto rows = [&](const char * stage, const std::vector<InitialAttempt> & attempts) {
+            for (const auto & attempt : attempts) {
+              const auto & o = attempt.observation;
+              const auto rejected = std::count_if(o.replies.begin(), o.replies.end(),
+                  [](const auto & r) {return !r.accepted;});
+              for (size_t j = 0; j < std::max<size_t>(1, o.replies.size()); ++j) {
+                auto fields = base();
+                fields[2] = stage;
+                fields[3] = std::to_string(attempt.number);
+                fields[9] = ns(o.tx_call_steady_ns, true);
+                fields[10] = ns(o.tx_call_realtime_ns, false);
+                fields[15] = "NOT_EVALUATED";
+                if (j < o.replies.size()) {
+                  const auto & reply = o.replies[j];
+                  fields[11] = ns(reply.rx_dequeue_steady_ns, true);
+                  fields[12] = ns(reply.rx_kernel_realtime_ns, false);
+                  if (o.tx_call_steady_ns) {
+                    fields[13] = std::to_string(reply.rx_dequeue_steady_ns - o.tx_call_steady_ns);
+                  }
+                  if (!attempts.empty() && attempts.front().observation.tx_call_steady_ns) {
+                    fields[14] = std::to_string(reply.rx_dequeue_steady_ns -
+                        attempts.front().observation.tx_call_steady_ns);
+                  }
+                  fields[15] = kernelVsSend(reply.rx_kernel_realtime_ns, o.tx_call_realtime_ns);
+                  fields[16] = reply.accepted ? "1" : "0";
+                  fields[17] = std::to_string(reply.can_id);
+                  fields[18] = std::to_string(reply.dlc);
+                }
+                fields[19] = std::to_string(o.replies.size());
+                fields[20] = std::to_string(rejected);
+                fields[21] = o.result;
+                fields[22] = attempt.reason;
+                write(fields);
+              }
+            }
+          };
+        rows("enable", axis.enables);
+        rows("initial_control", axis.controls);
+        auto fields = base();
+        fields[2] = "summary";
+        fields[22] = axis.reason;
+        write(fields);
       }
       out.close();
     } catch (const std::exception & e) {
-      RCLCPP_ERROR(logger(), "activation trace save failed (activation result unchanged): %s", e.what());
+      RCLCPP_ERROR(logger(), "activation trace save failed (activation result unchanged): %s",
+            e.what());
     }
   }
+
 };
 }  // namespace
 
@@ -135,15 +174,15 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_init(
   const hardware_interface::HardwareInfo & info)
 {
   if (hardware_interface::SystemInterface::on_init(info) !=
-      hardware_interface::CallbackReturn::SUCCESS)
+    hardware_interface::CallbackReturn::SUCCESS)
   {
     return hardware_interface::CallbackReturn::ERROR;
   }
 
   auto get_param = [&](const std::string & key, const std::string & def) -> std::string {
-    auto it = info_.hardware_parameters.find(key);
-    return (it != info_.hardware_parameters.end()) ? it->second : def;
-  };
+      auto it = info_.hardware_parameters.find(key);
+      return (it != info_.hardware_parameters.end()) ? it->second : def;
+    };
   config_file_ = get_param("config_file", "");
   spec_dir_ = get_param("spec_dir", "");
   if (config_file_.empty()) {
@@ -185,7 +224,9 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_init(
     return hardware_interface::CallbackReturn::ERROR;
   }
 
-  if (!configurePair()) {return hardware_interface::CallbackReturn::ERROR;}
+  if (!configurePair()) {
+    return hardware_interface::CallbackReturn::ERROR;
+  }
 
   RCLCPP_INFO(logger(), "on_init 完了: %zu joints, active_can_buses=%zu",
               n_joints_, active_buses_.size());
@@ -359,7 +400,9 @@ bool BxiSystemInterface::parseConfig()
           transport.separate = value == "separate";
         } else if (key == "tx_trigger") {
           const auto value = item.second.as<std::string>();
-          if (value != "write" && value != "periodic") {return false;}
+          if (value != "write" && value != "periodic") {
+            return false;
+          }
           transport.write_triggered = value == "write";
         } else if (key == "direct_feedback") {
           transport.direct_feedback = item.second.as<bool>();
@@ -538,10 +581,14 @@ bool BxiSystemInterface::loadSpec(const std::string & motor_type)
   }
   std::string reason;
   protocol::MitLimits limits;
-  limits.p_min = s.p_min; limits.p_max = s.p_max;
-  limits.v_min = s.v_min; limits.v_max = s.v_max;
-  limits.kp_max = s.kp_max; limits.kd_max = s.kd_max;
-  limits.torque_min = s.t_min; limits.torque_max = s.t_max;
+  limits.p_min = s.p_min;
+  limits.p_max = s.p_max;
+  limits.v_min = s.v_min;
+  limits.v_max = s.v_max;
+  limits.kp_max = s.kp_max;
+  limits.kd_max = s.kd_max;
+  limits.torque_min = s.t_min;
+  limits.torque_max = s.t_max;
   if (!protocol::validateLimits(limits, &reason)) {
     RCLCPP_ERROR(logger(), "機種spec '%s' のrange不正: %s", path.c_str(), reason.c_str());
     return false;
@@ -579,7 +626,9 @@ BxiSystemInterface::export_state_interfaces()
     v.emplace_back(name, hardware_interface::HW_IF_EFFORT, &st_eff_[i]);
     v.emplace_back(name, HW_IF_TEMPERATURE, &st_temp_[i]);
   }
-  if (pair_mode_) {v.emplace_back("bxi_pair", "accepted_generation", &pair_accepted_);}
+  if (pair_mode_) {
+    v.emplace_back("bxi_pair", "accepted_generation", &pair_accepted_);
+  }
   return v;
 }
 
@@ -595,7 +644,9 @@ BxiSystemInterface::export_command_interfaces()
     v.emplace_back(name, HW_IF_KD, &cmd_kd_[i]);
     v.emplace_back(name, hardware_interface::HW_IF_EFFORT, &cmd_eff_[i]);
   }
-  if (pair_mode_) {v.emplace_back("bxi_pair", "commit_generation", &pair_generation_);}
+  if (pair_mode_) {
+    v.emplace_back("bxi_pair", "commit_generation", &pair_generation_);
+  }
   return v;
 }
 
@@ -614,11 +665,16 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_activate(
   ActivationTrace activation_trace{pair_mode_, std::chrono::duration_cast<std::chrono::nanoseconds>(
       activation_start.time_since_epoch()).count(), "", {}};
   if (pair_mode_) {
+    for (const auto & joint : joints_) {
+      RCLCPP_INFO(logger(), "pair mapping: joint=%s bus=%s id=%d",
+        joint.name.c_str(), joint.can_bus.c_str(), joint.can_id);
+    }
     pair_activation_ns_ = activation_start.time_since_epoch().count();
     pair_safety_.reset(pair_safety_.epoch + 1, n_joints_);
     pair_safety_saved_ = pair_feedback_stale_saved_ = false;
     const auto & transport = bus_transport_.at(joints_[0].can_bus);
-    pair_commit_.reset(pair_activation_ns_, static_cast<int64_t>(transport.first_write_timeout_ms * 1.e6));
+    pair_commit_.reset(pair_activation_ns_,
+        static_cast<int64_t>(transport.first_write_timeout_ms * 1.e6));
     pair_generation_ = pair_accepted_ = 0;
     pair_claimed_ = pair_terminal_ = false;
     for (auto * values : {&cmd_pos_, &cmd_vel_, &cmd_kp_, &cmd_kd_, &cmd_eff_}) {
@@ -626,8 +682,8 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_activate(
     }
   }
   auto is_active = [&](const std::string & b) {
-    return std::find(active_buses_.begin(), active_buses_.end(), b) != active_buses_.end();
-  };
+      return std::find(active_buses_.begin(), active_buses_.end(), b) != active_buses_.end();
+    };
 
   std::map<std::string, std::vector<size_t>> bus_joints;
   for (size_t i = 0; i < n_joints_; ++i) {
@@ -640,7 +696,9 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_activate(
   }
 
   // Configs without can_transport use the existing sequential defaults.
-  for (const auto & entry : bus_joints) {bus_transport_.try_emplace(entry.first);}
+  for (const auto & entry : bus_joints) {
+    bus_transport_.try_emplace(entry.first);
+  }
   safe_stopped_ = false;
   if (bus_joints.empty()) {
     if (std::getenv("BXI_STREAM_TRACE_CYCLES") != nullptr) {
@@ -656,15 +714,16 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_activate(
   }
 
   auto fail_activation = [&]() {
-    releaseResources();
-    return hardware_interface::CallbackReturn::ERROR;
-  };
+      releaseResources();
+      return hardware_interface::CallbackReturn::ERROR;
+    };
   try {
     const char * timing_dir = std::getenv("BXI_WORKER_TIMING_DIR");
     worker_timing_dir_ = timing_dir == nullptr ? "" : timing_dir;
     activation_trace.directory = worker_timing_dir_;
     if (pair_mode_) {
-      RCLCPP_INFO(logger(), "pair activation policy: settle_ns=%lld attempts=%d retry_interval_ns=%lld budget_ns=%lld",
+      RCLCPP_INFO(logger(),
+          "pair activation policy: settle_ns=%lld attempts=%d retry_interval_ns=%lld budget_ns=%lld",
         static_cast<long long>(ActivationPolicy::settle_ns), ActivationPolicy::attempts,
         static_cast<long long>(ActivationPolicy::retry_interval_ns),
         static_cast<long long>(ActivationPolicy::budget_ns));
@@ -688,12 +747,16 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_activate(
       const auto & transport = bus_transport_.at(first.first);
       // Legacy keeps the 1-axis limit. The pair (G) mode records N axes: every trace container is
       // already sized by the axis count, and the CSV writers emit per-axis columns.
-      if ((first.second.size() != 1 && !pair_mode_) || !transport.separate || !transport.broadcast) {
+      if ((first.second.size() != 1 && !pair_mode_) || !transport.separate ||
+        !transport.broadcast)
+      {
         throw std::invalid_argument("expanded trace requires 1-axis separate broadcast");
       }
     }
     if (pair_mode_) {
-      if (worker_timing_dir_.empty()) {return fail_activation();}
+      if (worker_timing_dir_.empty()) {
+        return fail_activation();
+      }
       pair_records_.assign(stream_trace_cycles_, PairRecord{});
       pair_record_count_ = 0;
       pair_records_saved_ = false;
@@ -728,7 +791,9 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_activate(
         if (!worker_timing_dir_.empty()) {
           control.capacity = stream_trace_cycles_;
           const size_t bytes = stream_trace_cycles_ * indices.size() * sizeof(ControlRecord);
-          if (bytes > kStreamTraceMemoryLimit) {throw std::length_error("control trace too large");}
+          if (bytes > kStreamTraceMemoryLimit) {
+            throw std::length_error("control trace too large");
+          }
           control.records.resize(stream_trace_cycles_ * indices.size());
           control.output = std::make_unique<TraceBufferedWriter>(std::make_shared<TraceFileOps>());
         }
@@ -776,11 +841,15 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_activate(
         RCLCPP_INFO(logger(), "[%s] trace prepared before enable: cycles=%zu rx=%zu bytes=%zu "
           "allocation_ns=%lld sizeof_cycle=%zu sizeof_rx=%zu", bus_name.c_str(),
           trace->cycles.size(), trace->rx.size(), trace->payload_bytes,
-          static_cast<long long>(trace->allocation_ns), sizeof(StreamCycleRecord), sizeof(StreamRxRecord));
+          static_cast<long long>(trace->allocation_ns), sizeof(StreamCycleRecord),
+            sizeof(StreamRxRecord));
         prepared_stream_traces_.emplace(bus_name, std::move(trace));
         auto output = prepareTimingOutput(worker_timing_dir_, bus_name);
-        if (!output) {throw std::runtime_error("missing trace output");}
-        RCLCPP_INFO(logger(), "[%s] trace output prepared before enable: %s", bus_name.c_str(), output->stem().c_str());
+        if (!output) {
+          throw std::runtime_error("missing trace output");
+        }
+        RCLCPP_INFO(logger(), "[%s] trace output prepared before enable: %s", bus_name.c_str(),
+            output->stem().c_str());
         for (auto & control : control_streams_) {
           if (control.indices == indices && control.output) {
             control.output_path = output->stem() + "_control.csv";
@@ -837,18 +906,26 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_activate(
           temperature_sensor_fault_below_c_);
 
         ActuatorFeedback fb;
-        if (pair_mode_) {activation_trace.axes.push_back({bus_name, joints_[i].can_id, 0, 0, 0, 0, {}, {}, "not_attempted"});}
+        if (pair_mode_) {
+          activation_trace.axes.push_back({bus_name, joints_[i].can_id, 0, 0, 0, 0, {}, {},
+              "not_attempted", joints_[i].name, kNaN, kNaN, kNaN, "NOT_EVALUATED"});
+        }
         for (int attempt = 0; attempt < kEnableRetries; ++attempt) {
           if (pair_mode_) {
             auto & axis_trace = activation_trace.axes.back();
             axis_trace.enables.push_back({attempt + 1, {}, "exception"});
             auto & record = axis_trace.enables.back();
-            fb = static_cast<BxiActuatorDriver *>(joints_[i].actuator.get())->enableObserved(record.observation);
+            fb =
+              static_cast<BxiActuatorDriver *>(joints_[i].actuator.get())->enableObserved(
+                record.observation);
             record.reason = record.observation.result;
             if (fb.valid && !record.observation.replies.empty()) {
-              axis_trace.enable_dequeue = last_enable_dequeue = record.observation.replies.back().rx_dequeue_steady_ns;
+              axis_trace.enable_dequeue = last_enable_dequeue =
+                record.observation.replies.back().rx_dequeue_steady_ns;
             }
-          } else {fb = joints_[i].actuator->enable();}
+          } else {
+            fb = joints_[i].actuator->enable();
+          }
           if (fb.valid) {
             break;
           }
@@ -890,19 +967,25 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_activate(
       }
 
       // G profiles must remain within the codec after the startup offset adjustment.
-      if (pair_mode_ && !configurePair()) {return fail_activation();}
+      if (pair_mode_ && !configurePair()) {
+        return fail_activation();
+      }
       ActivationStartup startup{{[this]() {return activationNow();},
-          [this](int64_t ns) {activationWaitUntil(ns);}},
+        [this](int64_t ns) {activationWaitUntil(ns);}},
         pair_mode_ ? std::min(last_enable_dequeue + ActivationPolicy::budget_ns,
-          pair_activation_ns_ + static_cast<int64_t>(bus_transport_.at(bus_name).first_write_timeout_ms * 1.e6)) : 0,
+          pair_activation_ns_ +
+            static_cast<int64_t>(bus_transport_.at(bus_name).first_write_timeout_ms * 1.e6)) : 0,
         static_cast<int64_t>(control_timeout_ms_) * 1000000};
       if (pair_mode_) {
         const bool settled = startup.settle(last_enable_dequeue);
         for (size_t j = trace_begin; j < activation_trace.axes.size(); ++j) {
           auto & trace = activation_trace.axes[j];
-          trace.last_enable = last_enable_dequeue; trace.settle_end = startup.settle_end;
+          trace.last_enable = last_enable_dequeue;
+          trace.settle_end = startup.settle_end;
           trace.settle_wait = startup.settle_wait;
-          if (!settled) {trace.reason = "deadline";}
+          if (!settled) {
+            trace.reason = "deadline";
+          }
         }
         if (!settled) {
           RCLCPP_ERROR(logger(), "[%s] pair activation settle deadline", bus_name.c_str());
@@ -917,12 +1000,20 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_activate(
           auto & trace = activation_trace.axes[trace_index++];
           bool success = false;
           try {
-            success = startup.initial([&](TransactionObservation & o) {return driver->initialControlObserved(o);},
-              [&]() {return !safe_stopped_ && driver->state() == ActuatorState::kEnabled;}, fb, trace.controls);
-          } catch (...) {trace.reason = "exception"; throw;}
+            success = startup.initial([&](TransactionObservation & o) {
+                  return driver->initialControlObserved(o);
+                                                                                                                },
+                [&]() {
+                  return !safe_stopped_ && driver->state() == ActuatorState::kEnabled;
+                }, fb, trace.controls);
+          } catch (...) {
+            trace.reason = "exception";
+            throw;
+          }
           trace.reason = startup.reason;
           if (trace.controls.size() > 1) {
-            RCLCPP_WARN(logger(), "[%s] id=%d initial control retry used (feedback request attribution unknown)",
+            RCLCPP_WARN(logger(),
+                "[%s] id=%d initial control retry used (feedback request attribution unknown)",
               bus_name.c_str(), joints_[i].can_id);
           }
           if (!success) {
@@ -930,7 +1021,9 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_activate(
               bus_name.c_str(), joints_[i].can_id, startup.reason);
             return fail_activation();
           }
-        } else {fb = joints_[i].actuator->sendControl(0, 0, 0, 0, 0);}
+        } else {
+          fb = joints_[i].actuator->sendControl(0, 0, 0, 0, 0);
+        }
         if (!fb.valid) {
           RCLCPP_ERROR(logger(), "[%s] %s 初期フィードバック取得失敗", bus_name.c_str(),
             joints_[i].name.c_str());
@@ -941,6 +1034,26 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_activate(
             bus_name.c_str(), joints_[i].name.c_str());
           joints_[i].temperature_sensor_fault = true;
           return fail_activation();
+        }
+        if (pair_mode_) {
+          auto & trace = activation_trace.axes[trace_index - 1];
+          trace.joint_name = joints_[i].name;
+          trace.startup_position = fb.position;
+          const auto & ci = info_.joints[i].command_interfaces;
+          const auto position = std::find_if(ci.begin(), ci.end(),
+              [](const auto & item) {return item.name == "position";});
+          trace.position_min = std::stod(position->min);
+          trace.position_max = std::stod(position->max);
+          const bool valid = initialPositionAllowed(fb.position, trace.position_min,
+              trace.position_max);
+          trace.position_check = valid ? "PASS" : "FAIL";
+          if (!valid) {
+            trace.reason = "startup_position_out_of_bounds";
+            RCLCPP_ERROR(logger(),
+                "pair startup position rejected: joint=%s position=%.17g min=%.17g max=%.17g",
+              trace.joint_name.c_str(), fb.position, trace.position_min, trace.position_max);
+            return fail_activation();
+          }
         }
         st_pos_[i] = fb_pos_[i] = tgt_pos_[i] = fb.position;
         st_vel_[i] = fb_vel_[i] = fb.velocity;
@@ -963,7 +1076,8 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_activate(
         }
         continue;
       }
-      WorkerTimingTrace * timing = worker_timing_.count(bus_name) ? worker_timing_.at(bus_name).get() : nullptr;
+      WorkerTimingTrace * timing =
+        worker_timing_.count(bus_name) ? worker_timing_.at(bus_name).get() : nullptr;
       workers_.emplace_back(&BxiSystemInterface::workerLoop, this, bus_name, live, timing);
     }
     // A streamed bus is active only after every motor has answered a streamed command.
@@ -988,7 +1102,9 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_activate(
         &BxiSystemInterface::streamMonitorLoop, this, bus_name, live_joints_[bus_name]);
     }
     for (auto & [bus_name, streamer] : streamers_) {
-      if (streamer->config().write_triggered) {streamer->armWrites();}
+      if (streamer->config().write_triggered) {
+        streamer->armWrites();
+      }
     }
     onStreamFeedbackConfirmed();
     // Any worker or stream may have stopped since its own check; never report a stopped system
@@ -1070,7 +1186,8 @@ void BxiSystemInterface::releaseResources()
   }
   if (pair_mode_ && pair_safety_.feedback_stale.detected && !pair_feedback_stale_saved_) {
     if (worker_timing_dir_.empty() || !pair_safety_.saveFeedbackStale(
-        worker_timing_dir_ + "/pair_feedback_stale.csv")) {
+        worker_timing_dir_ + "/pair_feedback_stale.csv"))
+    {
       RCLCPP_ERROR(logger(), "feedback stale record incomplete, missing, or save failed");
     } else {
       pair_feedback_stale_saved_ = true;
@@ -1211,7 +1328,9 @@ bool BxiSystemInterface::startStream(
   config.first_write_timeout = std::chrono::duration_cast<std::chrono::nanoseconds>(
     std::chrono::duration<double, std::milli>(transport.first_write_timeout_ms));
   for (const auto & [name, storage] : prepared_write_storage_) {
-    if (storage) {config.stop_wake_fds.push_back(storage->event_fd);}
+    if (storage) {
+      config.stop_wake_fds.push_back(storage->event_fd);
+    }
   }
   // Already-started streamers also own FDs needed by this bus's fault fan-out.
   for (const auto & [name, streamer] : streamers_) {
@@ -1283,7 +1402,9 @@ bool BxiSystemInterface::startStream(
     for (size_t axis = 0; axis < indices.size(); ++axis) {
       auto & initial = storage->tx_feedback[axis];
       const auto i = indices[axis];
-      if (!std::isfinite(st_pos_[i])) {return false;}
+      if (!std::isfinite(st_pos_[i])) {
+        return false;
+      }
       initial.feedback.position = st_pos_[i];
       initial.feedback.valid = true;
       // Do not invent a stream RX sequence/time or satisfy waitForFirstFeedback here.
@@ -1308,7 +1429,9 @@ bool BxiSystemInterface::startStream(
     return false;
   }
   for (auto & control : control_streams_) {
-    if (control.indices == indices) {control.streamer = streamer.get();}
+    if (control.indices == indices) {
+      control.streamer = streamer.get();
+    }
   }
   streamers_[bus_name] = std::move(streamer);
   RCLCPP_INFO(logger(), "[%s] 送受信分離を開始 (%zu motors, %s, %dHz, 鮮度しきい値 %.1f ms, "
@@ -1450,7 +1573,8 @@ void BxiSystemInterface::reportStream(const std::string & bus_name)
     RCLCPP_ERROR(logger(), "[%s] %s motor id=%d thermal fault: temperature=%.3f C "
       "both_sensors_failed=%s received_steady_ns=%lld",
       bus_name.c_str(), joints_[i].name.c_str(), joints_[i].can_id, stats.temperature_fault_c,
-      sensors_failed ? "true" : "false", static_cast<long long>(stats.temperature_fault_received_ns));
+      sensors_failed ? "true" : "false",
+        static_cast<long long>(stats.temperature_fault_received_ns));
   }
   onStreamStats(bus_name, stats);
   std::string per_axis;
@@ -1490,7 +1614,9 @@ void BxiSystemInterface::writeStreamTiming(
     }
     std::string cpu_list;
     for (int i = 0; i < CPU_SETSIZE; ++i) {
-      if (CPU_ISSET(i, &cpus)) {cpu_list += (cpu_list.empty() ? "" : ";") + std::to_string(i);}
+      if (CPU_ISSET(i, &cpus)) {
+        cpu_list += (cpu_list.empty() ? "" : ";") + std::to_string(i);
+      }
     }
     RCLCPP_INFO(logger(), "[%s] trace writer: policy=%d priority=%d cpus=%s", bus_name.c_str(),
       ::sched_getscheduler(0), param.sched_priority, cpu_list.c_str());
@@ -1499,13 +1625,16 @@ void BxiSystemInterface::writeStreamTiming(
     RCLCPP_INFO(logger(), "[%s] stream timing: %zu cycles, %zu replies, dropped %zu/%zu; %s",
       bus_name.c_str(), result.cycle_rows, result.rx_rows, result.dropped_cycles, result.dropped_rx,
       output->stem().c_str());
-    RCLCPP_INFO(logger(), "[%s] trace complete: report_to_complete_ns=%lld csv_write_elapsed_ns=%lld",
+    RCLCPP_INFO(logger(),
+        "[%s] trace complete: report_to_complete_ns=%lld csv_write_elapsed_ns=%lld",
       bus_name.c_str(), static_cast<long long>(result.report_to_complete_ns),
       static_cast<long long>(result.csv_write_elapsed_ns));
     if (result.report_to_complete_ns > 2000000000LL) {
       RCLCPP_ERROR(logger(), "[%s] stream timing exceeds 2 second criterion", bus_name.c_str());
     }
-    if (result.tmp_cleanup_failed) {RCLCPP_WARN(logger(), "[%s] complete tmp cleanup failed", bus_name.c_str());}
+    if (result.tmp_cleanup_failed) {
+      RCLCPP_WARN(logger(), "[%s] complete tmp cleanup failed", bus_name.c_str());
+    }
   } catch (const std::exception & e) {
     RCLCPP_ERROR(logger(), "[%s] stream timing CSV 書込失敗: %s", bus_name.c_str(), e.what());
   }
@@ -1572,9 +1701,9 @@ void BxiSystemInterface::workerLoop(
     }
 
     std::vector<double> lp(indices.size()), lv(indices.size()), lkp(indices.size()),
-      lkd(indices.size()), leff(indices.size());
+    lkd(indices.size()), leff(indices.size());
     std::vector<double> ofp(indices.size()), ofv(indices.size()), ofe(indices.size()),
-      oft(indices.size());
+    oft(indices.size());
     if (timing != nullptr) {
       sample.allocation_ns = elapsed_ns(t0, clock::now());
     }
@@ -1587,9 +1716,15 @@ void BxiSystemInterface::workerLoop(
       }
       for (size_t k = 0; k < indices.size(); ++k) {
         size_t i = indices[k];
-        lp[k] = tgt_pos_[i]; lv[k] = tgt_vel_[i]; lkp[k] = tgt_kp_[i];
-        lkd[k] = tgt_kd_[i]; leff[k] = tgt_eff_[i];
-        ofp[k] = fb_pos_[i]; ofv[k] = fb_vel_[i]; ofe[k] = fb_eff_[i]; oft[k] = fb_temp_[i];
+        lp[k] = tgt_pos_[i];
+        lv[k] = tgt_vel_[i];
+        lkp[k] = tgt_kp_[i];
+        lkd[k] = tgt_kd_[i];
+        leff[k] = tgt_eff_[i];
+        ofp[k] = fb_pos_[i];
+        ofv[k] = fb_vel_[i];
+        ofe[k] = fb_eff_[i];
+        oft[k] = fb_temp_[i];
       }
       if (timing != nullptr) {
         sample.target_lock_hold_ns = elapsed_ns(target_lock_acquired, clock::now());
@@ -1631,7 +1766,10 @@ void BxiSystemInterface::workerLoop(
         }
       }
       if (fb.valid) {
-        ofp[k] = fb.position; ofv[k] = fb.velocity; ofe[k] = fb.effort; oft[k] = fb.temperature;
+        ofp[k] = fb.position;
+        ofv[k] = fb.velocity;
+        ofe[k] = fb.effort;
+        oft[k] = fb.temperature;
         if (!std::isfinite(fb.temperature)) {
           RCLCPP_ERROR(logger(), "[%s] %s 両温度センサー故障。全軸を停止します。",
             bus_name.c_str(), joints_[i].name.c_str());
@@ -1665,7 +1803,10 @@ void BxiSystemInterface::workerLoop(
       }
       for (size_t k = 0; k < indices.size(); ++k) {
         size_t i = indices[k];
-        fb_pos_[i] = ofp[k]; fb_vel_[i] = ofv[k]; fb_eff_[i] = ofe[k]; fb_temp_[i] = oft[k];
+        fb_pos_[i] = ofp[k];
+        fb_vel_[i] = ofv[k];
+        fb_eff_[i] = ofe[k];
+        fb_temp_[i] = oft[k];
       }
       if (timing != nullptr) {
         sample.feedback_lock_hold_ns = elapsed_ns(feedback_lock_acquired, clock::now());
@@ -1721,22 +1862,27 @@ hardware_interface::return_type BxiSystemInterface::read(
     }
   }
   const auto copy_legacy = [&] {
-    for (size_t i = 0; i < n_joints_; ++i) {
-      if (!direct_joint_.empty() && direct_joint_[i]) {continue;}
-      st_pos_[i] = fb_pos_[i]; st_vel_[i] = fb_vel_[i];
-      st_eff_[i] = fb_eff_[i]; st_temp_[i] = fb_temp_[i];
-    }
-  };
+      for (size_t i = 0; i < n_joints_; ++i) {
+        if (!direct_joint_.empty() && direct_joint_[i]) {
+          continue;
+        }
+        st_pos_[i] = fb_pos_[i];
+        st_vel_[i] = fb_vel_[i];
+        st_eff_[i] = fb_eff_[i];
+        st_temp_[i] = fb_temp_[i];
+      }
+    };
   bool legacy_read = direct_joint_.empty();
   for (size_t i = 0; i < n_joints_ && !legacy_read; ++i) {
     legacy_read = joints_[i].actuator && !direct_joint_[i];
   }
-  if (legacy_read)
-  {
+  if (legacy_read) {
     std::lock_guard<std::mutex> lk(data_mutex_);
     copy_legacy();
     for (auto & control : control_streams_) {
-      if (control.read_diagnostics) {continue;}
+      if (control.read_diagnostics) {
+        continue;
+      }
       for (size_t axis = 0; axis < control.indices.size(); ++axis) {
         const auto i = control.indices[axis];
         control.feedback[axis].sequence = fb_sequence_[i];
@@ -1750,13 +1896,16 @@ hardware_interface::return_type BxiSystemInterface::read(
       const auto i = control.indices[axis];
       PublishedFeedback scratch;
       unsigned attempts = 0;
-      const bool got = control.read_diagnostics && control.streamer->readFeedback(axis, scratch, &attempts);
+      const bool got = control.read_diagnostics && control.streamer->readFeedback(axis, scratch,
+          &attempts);
       const bool was_unavailable = control.failures[axis] >= 3;
       if (got) {
         control.feedback[axis] = scratch;
         control.failures[axis] = 0;
-        st_pos_[i] = scratch.feedback.position; st_vel_[i] = scratch.feedback.velocity;
-        st_eff_[i] = scratch.feedback.effort; st_temp_[i] = scratch.feedback.temperature;
+        st_pos_[i] = scratch.feedback.position;
+        st_vel_[i] = scratch.feedback.velocity;
+        st_eff_[i] = scratch.feedback.effort;
+        st_temp_[i] = scratch.feedback.temperature;
       } else if (control.read_diagnostics && control.failures[axis] < UINT32_MAX) {
         ++control.failures[axis];
       }
@@ -1778,7 +1927,8 @@ hardware_interface::return_type BxiSystemInterface::read(
         row.rx_sequence = control.feedback[axis].sequence;
         row.rx_received = control.feedback[axis].received_ns;
         row.rx_published = control.feedback[axis].published_ns;
-        row.setAttempts(attempts); row.failures = control.failures[axis];
+        row.setAttempts(attempts);
+        row.failures = control.failures[axis];
       }
     }
   }
@@ -1802,14 +1952,20 @@ hardware_interface::return_type BxiSystemInterface::write(
     return hardware_interface::return_type::ERROR;
   }
   const auto write_start = std::chrono::steady_clock::now().time_since_epoch().count();
-  if (pair_mode_) {return writePair(write_start);}
+  if (pair_mode_) {
+    return writePair(write_start);
+  }
   for (auto & control : control_streams_) {
-    if (control.record_index == SIZE_MAX) {control.record_index = control.record_count++;}
+    if (control.record_index == SIZE_MAX) {
+      control.record_index = control.record_count++;
+    }
   }
   ++control_sequence_;
   // Publish write-triggered buses without entering any legacy worker lock.
   for (auto & control : control_streams_) {
-    if (!control.streamer->config().write_triggered) {continue;}
+    if (!control.streamer->config().write_triggered) {
+      continue;
+    }
     for (size_t axis = 0; axis < control.indices.size(); ++axis) {
       const auto i = control.indices[axis];
       const bool active = std::isfinite(cmd_pos_[i]);
@@ -1822,38 +1978,45 @@ hardware_interface::return_type BxiSystemInterface::write(
       packet.sequence = control_sequence_;
     }
     const auto published = std::chrono::steady_clock::now().time_since_epoch().count();
-    for (auto & packet : control.commands) {packet.published_ns = published;}
+    for (auto & packet : control.commands) {
+      packet.published_ns = published;
+    }
     const auto notify_before = std::chrono::steady_clock::now().time_since_epoch().count();
     const bool ok = control.streamer->publishCommands(control.commands.data());
     const auto notify_after = std::chrono::steady_clock::now().time_since_epoch().count();
     if (control.record_index < control.capacity) {
       for (size_t axis = 0; axis < control.indices.size(); ++axis) {
         auto & row = control.records[control.record_index * control.indices.size() + axis];
-        row.published = published; row.notify_before = notify_before; row.notify_after = notify_after;
+        row.published = published;
+        row.notify_before = notify_before;
+        row.notify_after = notify_after;
       }
     }
-    if (!ok) {return hardware_interface::return_type::ERROR;}
+    if (!ok) {
+      return hardware_interface::return_type::ERROR;
+    }
   }
   bool legacy_write = write_joint_.empty();
   for (size_t i = 0; i < n_joints_ && !legacy_write; ++i) {
     legacy_write = joints_[i].actuator && !write_joint_[i];
   }
-  if (legacy_write)
-  {
+  if (legacy_write) {
     std::lock_guard<std::mutex> lk(data_mutex_);
     for (size_t i = 0; i < n_joints_; ++i) {
       if (!joints_[i].actuator) {
         continue;
       }
       const bool active = std::isfinite(cmd_pos_[i]);
-      const double kp = active ? (std::isfinite(cmd_kp_[i]) ? cmd_kp_[i] : joints_[i].default_kp)
-                               : 0.0;
-      const double kd = active ? (std::isfinite(cmd_kd_[i]) ? cmd_kd_[i] : joints_[i].default_kd)
-                               : 0.0;
+      const double kp = active ? (std::isfinite(cmd_kp_[i]) ? cmd_kp_[i] : joints_[i].default_kp) :
+        0.0;
+      const double kd = active ? (std::isfinite(cmd_kd_[i]) ? cmd_kd_[i] : joints_[i].default_kd) :
+        0.0;
       const double pos = active ? cmd_pos_[i] : st_pos_[i];
       const double vel = (active && std::isfinite(cmd_vel_[i])) ? cmd_vel_[i] : 0.0;
       const double eff = (active && std::isfinite(cmd_eff_[i])) ? cmd_eff_[i] : 0.0;
-      if (!write_joint_.empty() && write_joint_[i]) {continue;}
+      if (!write_joint_.empty() && write_joint_[i]) {
+        continue;
+      }
       tgt_pos_[i] = pos;
       tgt_vel_[i] = vel;
       tgt_kp_[i] = kp;
@@ -1872,8 +2035,12 @@ hardware_interface::return_type BxiSystemInterface::write(
     if (control.record_index < control.capacity) {
       for (size_t axis = 0; axis < control.indices.size(); ++axis) {
         auto & row = control.records[control.record_index * control.indices.size() + axis];
-        row.setCycle(control_sequence_); row.write_start = write_start; row.write_end = write_end;
-        if (!row.published) {row.published = write_end;}
+        row.setCycle(control_sequence_);
+        row.write_start = write_start;
+        row.write_end = write_end;
+        if (!row.published) {
+          row.published = write_end;
+        }
       }
     }
     control.record_index = SIZE_MAX;
@@ -1886,7 +2053,9 @@ void BxiSystemInterface::writeControlTiming()
   // Lifecycle cleanup only: controller_manager has stopped read/write. The safe-stop monitor
   // may report TX/RX earlier, but must never serialize a control-thread-owned trace.
   for (auto & control : control_streams_) {
-    for (size_t event = 0; event < std::min(control.diagnostic_count, control.diagnostics.size()); ++event) {
+    for (size_t event = 0; event < std::min(control.diagnostic_count, control.diagnostics.size());
+      ++event)
+    {
       const auto & d = control.diagnostics[event];
       RCLCPP_WARN(logger(), "%s feedback_snapshot_unavailable=%s cycle=%llu steady_ns=%lld",
         joints_[d.joint].name.c_str(), d.unavailable ? "true" : "false",
@@ -1896,27 +2065,43 @@ void BxiSystemInterface::writeControlTiming()
       RCLCPP_WARN(logger(), "dropped feedback snapshot diagnostic events=%zu",
         control.diagnostic_count - control.diagnostics.size());
     }
-    if (!control.output || control.output_path.empty()) {continue;}
+    if (!control.output || control.output_path.empty()) {
+      continue;
+    }
     try {
       auto & out = *control.output;
       out.open(control.output_path);
       out.text("#format_version=1,dropped_control_cycles=");
-      out.number(control.record_count > control.capacity ? control.record_count - control.capacity : 0);
-      out.text(",payload_bytes="); out.number(control.records.capacity() * sizeof(ControlRecord));
+      out.number(control.record_count >
+          control.capacity ? control.record_count - control.capacity : 0);
+      out.text(",payload_bytes=");
+      out.number(control.records.capacity() * sizeof(ControlRecord));
       out.text(",diagnostic_payload_bytes=");
       out.number(control.diagnostics.capacity() * sizeof(ControlStream::DiagnosticEvent));
-      out.text("\ncycle,joint_index,read_start_ns,read_end_ns,acquired_ns,rx_sequence,rx_received_ns,"
+      out.text(
+          "\ncycle,joint_index,read_start_ns,read_end_ns,acquired_ns,rx_sequence,rx_received_ns,"
         "rx_published_ns,attempts,consecutive_failures,feedback_snapshot_unavailable,write_start_ns,"
         "command_published_ns,notify_before_ns,notify_after_ns,write_end_ns\n");
       for (size_t cycle = 0; cycle < std::min(control.record_count, control.capacity); ++cycle) {
         for (size_t axis = 0; axis < control.indices.size(); ++axis) {
           const auto & r = control.records[cycle * control.indices.size() + axis];
-          out.field(r.cycle()); out.field(control.indices[axis]); out.field(r.read_start);
-          out.field(r.read_done); out.field(r.acquired_ns); out.field(r.rx_sequence);
-          out.field(r.rx_received); out.field(r.rx_published); out.field(r.attempts());
-          out.field(r.failures); out.field(r.failures >= 3 ? 1 : 0); out.field(r.write_start);
-          out.field(r.published); out.field(r.notify_before); out.field(r.notify_after);
-          out.number(r.write_end); out.text("\n");
+          out.field(r.cycle());
+          out.field(control.indices[axis]);
+          out.field(r.read_start);
+          out.field(r.read_done);
+          out.field(r.acquired_ns);
+          out.field(r.rx_sequence);
+          out.field(r.rx_received);
+          out.field(r.rx_published);
+          out.field(r.attempts());
+          out.field(r.failures);
+          out.field(r.failures >= 3 ? 1 : 0);
+          out.field(r.write_start);
+          out.field(r.published);
+          out.field(r.notify_before);
+          out.field(r.notify_after);
+          out.number(r.write_end);
+          out.text("\n");
         }
       }
       out.close();
