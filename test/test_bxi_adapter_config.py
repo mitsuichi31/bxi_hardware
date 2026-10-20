@@ -293,3 +293,132 @@ def test_rejects_measured_start_speed_above_half_motor_limit(tmp_path):
             parameters['measured_start_velocity_limit'] = [6.] * 12
         path.write_text(yaml.safe_dump(configuration))
     assert any('at most half' in error for error in checker.check_adapter(tmp_path, tmp_path / 'robot.urdf'))
+
+
+STAGE56 = [
+    ('real_zero_gain', True, (0., 0.)),
+    ('vcan_zero_gain', False, (0., 0.)),
+    ('real_gain20', True, (20., 1.)),
+    ('vcan_gain20', False, (20., 1.)),
+]
+
+
+@pytest.mark.parametrize('suffix,real,gains', STAGE56)
+def test_stage56_generation_and_configuration_mode(tmp_path, suffix, real, gains):
+    source = PROFILE.with_name('bxi_champ_jtc_' + suffix + '_legs.yaml')
+    original = yaml.safe_load(source.read_text())
+    baseline = yaml.safe_load(VCAN_PROFILE.read_text())
+    # Only profile name and all joint gains may differ from Stage 3.
+    baseline['profile'] = original['profile']
+    for settings in baseline['joint_settings'].values():
+        settings.update(kp=gains[0], kd=gains[1], kp_max=gains[0], kd_max=gains[1])
+    assert original == baseline
+    generator.generate(source, tmp_path)
+    assert checker.check_adapter(tmp_path, tmp_path / 'robot.urdf', real_configuration=real) == []
+    assert checker.check_adapter(tmp_path, tmp_path / 'robot.urdf', real_configuration=not real)
+    note = (tmp_path / 'hardware.yaml').read_text().splitlines()[0]
+    assert note.startswith('# REAL:' if real else '# VCAN ONLY:')
+
+
+@pytest.mark.parametrize('gain', ['zero_gain', 'gain20'])
+def test_stage56_real_vcan_structural_equivalence(tmp_path, gain):
+    directories = [tmp_path / mode for mode in ('real', 'vcan')]
+    for mode, directory in zip(('real', 'vcan'), directories):
+        generator.generate(PROFILE.with_name(f'bxi_champ_jtc_{mode}_{gain}_legs.yaml'), directory)
+    assert {f.name for f in directories[0].iterdir()} == {f.name for f in directories[1].iterdir()}
+    def normalize(value, directory):
+        if isinstance(value, str):
+            return value.replace(str(directory), '@RUN@')
+        if isinstance(value, dict):
+            return {key: normalize(item, directory) for key, item in value.items()}
+        if isinstance(value, list):
+            return [normalize(item, directory) for item in value]
+        return value
+
+    for path in directories[0].iterdir():
+        left = path.read_text()
+        right = (directories[1] / path.name).read_text()
+        if path.suffix == '.yaml':
+            left = normalize(yaml.safe_load(left), directories[0])
+            right = normalize(yaml.safe_load(right), directories[1])
+            if path.name == 'bxi_champ_jtc_legs.yaml':
+                left['profile'] = right['profile'] = '@PROFILE@'
+        else:
+            left = left.replace(str(directories[0]), '@RUN@')
+            right = right.replace(str(directories[1]), '@RUN@')
+            left, right = ET.tostring(ET.fromstring(left)), ET.tostring(ET.fromstring(right))
+        assert left == right, path.name
+
+
+@pytest.mark.parametrize('suffix,real,gains', STAGE56)
+def test_stage56_rejects_changed_declared_gains(tmp_path, suffix, real, gains):
+    generator.generate(PROFILE.with_name('bxi_champ_jtc_' + suffix + '_legs.yaml'), tmp_path)
+    path = tmp_path / 'bxi_champ_jtc_legs.yaml'
+    profile = yaml.safe_load(path.read_text())
+    profile['joint_settings']['FR_collar_joint']['kp'] += 1.
+    path.write_text(yaml.safe_dump(profile))
+    assert any('stage5/6 gains mismatch' in e for e in checker.check_adapter(
+        tmp_path, tmp_path / 'robot.urdf', real_configuration=real))
+
+
+STARTUP = load('stage5_startup', WORKSPACE / 'src/minibexkai_bringup/scripts/start_bxi_champ_jtc.py')
+VCAN_LAUNCH = load('stage5_vcan_launch', WORKSPACE / 'src/minibexkai_bringup/launch/bxi_champ_jtc_vcan.launch.py')
+REAL_LAUNCH = load('stage5_real_launch', WORKSPACE / 'src/minibexkai_bringup/launch/bxi_champ_jtc_real.launch.py')
+
+
+def real_can_link():
+    return [{'flags': ['UP'], 'linkinfo': {'info_kind': 'can', 'info_data': {
+        'state': 'ERROR-ACTIVE', 'bittiming': {'bitrate': 1000000},
+        'data_bittiming': {'bitrate': 5000000}, 'ctrlmode': ['FD']}}}]
+
+
+@pytest.mark.parametrize('entry', ['startup', 'launch'])
+@pytest.mark.parametrize('mutation', ['missing', 'vcan', 'ether', 'down', 'passive', 'busoff', 'bitrate', 'data_bitrate', 'no_fd'])
+def test_stage5_real_guards_reject_before_any_start(tmp_path, monkeypatch, entry, mutation):
+    import json
+    import subprocess
+    link = real_can_link()
+    data = link[0]['linkinfo']['info_data']
+    if mutation == 'missing':
+        link = []
+    elif mutation in ('vcan', 'ether'):
+        link[0]['linkinfo']['info_kind'] = mutation
+    elif mutation == 'down':
+        link[0]['flags'] = []
+    elif mutation in ('passive', 'busoff'):
+        data['state'] = 'ERROR-PASSIVE' if mutation == 'passive' else 'BUS-OFF'
+    elif mutation == 'bitrate':
+        data['bittiming']['bitrate'] = 500000
+    elif mutation == 'data_bitrate':
+        data['data_bittiming']['bitrate'] = 2000000
+    elif mutation == 'no_fd':
+        data['ctrlmode'] = []
+    monkeypatch.setattr(subprocess, 'check_output', lambda *args, **kwargs: json.dumps(link))
+    monkeypatch.setattr(STARTUP.rclpy, 'init', lambda: pytest.fail('ROS started before guard'))
+    if entry == 'startup':
+        directory = tmp_path / 'config'
+        generator.generate(PROFILE.with_name('bxi_champ_jtc_real_zero_gain_legs.yaml'), directory)
+        with pytest.raises(ValueError, match='requires'):
+            STARTUP.run(directory)
+        assert not (directory / 'startup.jsonl').exists()
+    else:
+        # setup must reject before reading launch arguments or making any actions.
+        with pytest.raises(ValueError, match='requires'):
+            REAL_LAUNCH.setup(None)
+
+
+@pytest.mark.parametrize('real', [True, False])
+def test_stage5_valid_link_guard(monkeypatch, real):
+    import json
+    import subprocess
+    link = real_can_link() if real else [{'linkinfo': {'info_kind': 'vcan'}}]
+    monkeypatch.setattr(subprocess, 'check_output', lambda *args, **kwargs: json.dumps(link))
+    STARTUP.validate_can_link(real)
+
+
+def test_stage5_vcan_guard_rejects_real_can(monkeypatch):
+    import json
+    import subprocess
+    monkeypatch.setattr(subprocess, 'check_output', lambda *args, **kwargs: json.dumps(real_can_link()))
+    with pytest.raises(ValueError, match='kind vcan'):
+        VCAN_LAUNCH.setup(None)

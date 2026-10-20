@@ -140,12 +140,18 @@ def check_adapter(directory, urdf, *, real_configuration=False):
         profile = yaml.safe_load((directory / 'bxi_champ_jtc_legs.yaml').read_text())
         controllers = yaml.safe_load((directory / 'controllers.yaml').read_text())
         root = ET.parse(urdf).getroot()
-        stage3 = profile.get('profile') == 'stage3_vcan_provisional'
-        require(not real_configuration and profile.get('profile') in ('stage2_mock_provisional', 'stage3_vcan_provisional'), 'provisional profile forbidden in real configuration')
+        real_profiles = ('stage5_real_zero_gain', 'stage6_real_gain20')
+        vcan_profiles = ('stage3_vcan_provisional', 'stage5_vcan_zero_gain', 'stage6_vcan_gain20')
+        stage3 = profile.get('profile') in real_profiles + vcan_profiles
+        require(profile.get('profile') in (real_profiles if real_configuration else ('stage2_mock_provisional',) + vcan_profiles), 'profile forbidden for requested real_configuration')
         require(profile.get('real_legs') == (['FR'] if stage3 else []), 'provisional real_legs mismatch')
         require(stage3 or 'vcan_provisional_calibration' not in profile, 'vcan provisional calibration requires Stage 3')
         if stage3:
             check_vcan_hardware(directory, profile, root, require)
+        if profile.get('profile') in real_profiles + vcan_profiles[1:]:
+            gains = (0., 0.) if profile['profile'].startswith('stage5_') else (20., 1.)
+            require(all((v['kp'], v['kd'], v['kp_max'], v['kd_max']) == (*gains, *gains)
+                        for v in profile['joint_settings'].values()), 'stage5/6 gains mismatch')
         names = [
             f'{leg}_{kind}_joint' for leg in ('BL', 'BR', 'FL', 'FR')
             for kind in ('collar', 'hip', 'knee')
