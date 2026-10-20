@@ -181,3 +181,75 @@ def test_rejects_jtc_ingestion_setting_changes(tmp_path, upstream, field, value)
         'ingestion readiness settings mismatch' in error
         for error in checker.check_adapter(tmp_path, tmp_path / 'robot.urdf')
     )
+
+
+VCAN_PROFILE = PROFILE.with_name('bxi_champ_jtc_vcan_legs.yaml')
+
+
+@pytest.mark.parametrize('legs', [['FR'], ['FR', 'FL']])
+def test_stage3_valid_vcan_variants(tmp_path, legs):
+    generator.generate(VCAN_PROFILE, tmp_path, legs)
+    assert checker.check_adapter(tmp_path, tmp_path / 'robot.urdf') == []
+    assert checker.check_adapter(tmp_path, tmp_path / 'robot.urdf', real_configuration=True)
+
+
+@pytest.mark.parametrize('mutation', ['profile', 'calibration', 'age_missing', 'age_zero', 'feedback', 'trigger', 'rx', 'broadcast', 'grace', 'first_timeout', 'bus', 'direction', 'offset'])
+def test_stage3_rejects_unsafe_configuration(tmp_path, mutation):
+    generator.generate(VCAN_PROFILE, tmp_path)
+    profile_path = tmp_path / 'bxi_champ_jtc_legs.yaml'
+    hw_path = tmp_path / 'hardware.yaml'
+    profile = yaml.safe_load(profile_path.read_text())
+    hw = yaml.safe_load(hw_path.read_text())
+    transport = hw['can_transport']['can0']
+    if mutation == 'profile':
+        profile['profile'] = 'stage2_mock_provisional'
+        profile['real_legs'] = []
+    elif mutation == 'calibration':
+        profile['vcan_provisional_calibration']['motor_dir'] = -1
+    elif mutation == 'age_missing':
+        del transport['stream_command_max_age_ms']
+    elif mutation == 'age_zero':
+        transport['stream_command_max_age_ms'] = 0.0
+    elif mutation == 'feedback':
+        transport['stream_feedback_max_age_ms'] = 4.0
+    elif mutation == 'trigger':
+        transport['tx_trigger'] = 'timer'
+    elif mutation == 'rx':
+        transport['rx_mode'] = 'sequential'
+    elif mutation == 'broadcast':
+        transport['tx_frame'] = 'unicast'
+    elif mutation == 'grace':
+        transport['stream_write_grace_ms'] = 1.0
+    elif mutation == 'first_timeout':
+        transport['stream_first_write_timeout_ms'] = 2000.0
+    elif mutation == 'bus':
+        hw['joints']['FR_collar_joint']['can_bus'] = 'can1'
+    elif mutation == 'direction':
+        hw['joints']['FR_collar_joint']['motor_dir'] = -1
+    elif mutation == 'offset':
+        hw['joints']['FR_collar_joint']['offset_angle'] = 0.1
+    profile_path.write_text(yaml.safe_dump(profile))
+    hw_path.write_text(yaml.safe_dump(hw))
+    assert checker.check_adapter(tmp_path, tmp_path / 'robot.urdf')
+
+
+def test_generator_rejects_vcan_calibration_outside_stage3(tmp_path):
+    profile = yaml.safe_load(PROFILE.read_text())
+    profile['vcan_provisional_calibration'] = {'motor_dir': 1, 'offset_angle': 0.0}
+    # Keep the configuration under the package so relative model paths stay valid.
+    source = tmp_path / 'invalid-profile.yaml'
+    source.write_text(yaml.safe_dump(profile))
+    with pytest.raises(ValueError, match='calibration requires Stage 3'):
+        generator.generate(source, tmp_path / 'output')
+
+
+def test_rejects_measured_interpolation_start(tmp_path):
+    generator.generate(PROFILE, tmp_path)
+    path = tmp_path / 'controllers.yaml'
+    controllers = yaml.safe_load(path.read_text())
+    trajectory = controllers['joint_trajectory_controller']['ros__parameters']
+    assert trajectory['interpolate_from_desired_state'] is True
+    trajectory['interpolate_from_desired_state'] = False
+    path.write_text(yaml.safe_dump(controllers))
+    errors = checker.check_adapter(tmp_path, tmp_path / 'robot.urdf')
+    assert any('interpolate_from_desired_state must be true' in error for error in errors)

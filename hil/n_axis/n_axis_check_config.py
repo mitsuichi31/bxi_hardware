@@ -109,6 +109,26 @@ def check(directory, urdf):
         errors.append(str(e))
     return errors
 
+
+def check_vcan_hardware(directory, profile, root, require):
+    """Check the isolated-only FR transport without opening any interface."""
+    require(profile.get('vcan_provisional_calibration') == {'motor_dir': 1, 'offset_angle': 0.0}, 'explicit vcan-only calibration required')
+    template = Path(__file__).resolve().parent / 'hardware.yaml.in'
+    expected = yaml.safe_load(template.read_text().replace('@CAN_BUS@', 'can0'))
+    hw = yaml.safe_load((directory / 'hardware.yaml').read_text())
+    require(hw.get('active_can_buses') == ['can0'] and hw.get('can_frame_format') == expected['can_frame_format'], 'Stage 3 bus/frame mismatch')
+    require(hw.get('can_transport') == expected['can_transport'], 'Stage 3 transport must explicitly equal G4 including watchdog ages')
+    require(hw.get('defaults') == expected['defaults'], 'Stage 3 hardware defaults differ from G4')
+    names = profile['legs']['FR']['joints']
+    require(set(hw['joints']) == set(names), 'Stage 3 hardware joint set mismatch')
+    for index, name in enumerate(names, 1):
+        limits = profile['joint_settings'][name]
+        require(hw['joints'][name] == dict(enabled=True, can_bus='can0', can_id=index, motor_type='MOTOR_70', motor_dir=1, offset_angle=0.0, lower=limits['position_min'], upper=limits['position_max'], default_kp=0.0, default_kd=0.0), name + ': vcan hardware mapping mismatch')
+    system = root.find("ros2_control[@name='" + profile['legs']['FR']['hardware_name'] + "']")
+    params = {x.get('name'): x.text for x in system.findall('hardware/param')}
+    require(Path(params.get('config_file', '')).resolve() == (directory / 'hardware.yaml').resolve() and params.get('command_commit_mode') == 'pair_generation_v1', 'Stage 3 HWIF configuration/commit mismatch')
+
+
 def check_adapter(directory, urdf, *, real_configuration=False):
     """Check the provisional mock profile; runtime ownership/wiring remain unproven."""
     errors = []
@@ -120,18 +140,19 @@ def check_adapter(directory, urdf, *, real_configuration=False):
         profile = yaml.safe_load((directory / 'bxi_champ_jtc_legs.yaml').read_text())
         controllers = yaml.safe_load((directory / 'controllers.yaml').read_text())
         root = ET.parse(urdf).getroot()
-        require(
-            not real_configuration and profile.get('profile') == 'stage2_mock_provisional',
-            'provisional mock profile forbidden in real configuration'
-        )
-        require(profile.get('real_legs') == [], 'Stage 2 requires real_legs=[]')
+        stage3 = profile.get('profile') == 'stage3_vcan_provisional'
+        require(not real_configuration and profile.get('profile') in ('stage2_mock_provisional', 'stage3_vcan_provisional'), 'provisional profile forbidden in real configuration')
+        require(profile.get('real_legs') == (['FR'] if stage3 else []), 'provisional real_legs mismatch')
+        require(stage3 or 'vcan_provisional_calibration' not in profile, 'vcan provisional calibration requires Stage 3')
+        if stage3:
+            check_vcan_hardware(directory, profile, root, require)
         names = [
             f'{leg}_{kind}_joint' for leg in ('BL', 'BR', 'FL', 'FR')
             for kind in ('collar', 'hip', 'knee')
         ]
         require(profile['joints'] == names, '12-joint order mismatch')
         adapted = profile['adapter_legs']
-        require(adapted in (['FR'], ['BL', 'BR', 'FL', 'FR'], []), 'unsupported adapter legs')
+        require(adapted in ((['FR'], ['FR', 'FL']) if stage3 else (['FR'], ['BL', 'BR', 'FL', 'FR'], [])), 'unsupported adapter legs')
         require(
             profile.get('publisher') in ('champ', 'rl') and profile.get('publisher_count') == 1,
             'exactly one upstream publisher required'
@@ -177,6 +198,8 @@ def check_adapter(directory, urdf, *, real_configuration=False):
             'is_async'
         ):
             require(trajectory.get(key) is False, f'JTC {key} must be false')
+        require(trajectory.get('interpolate_from_desired_state') is True,
+                'JTC interpolate_from_desired_state must be true')
         timeout, goal = trajectory['cmd_timeout'], trajectory['constraints']['goal_time']
         require(
             all(math.isfinite(value) for value in (timeout, goal)) and timeout > 0 and timeout > goal,
@@ -216,7 +239,8 @@ def check_adapter(directory, urdf, *, real_configuration=False):
             if len(matches) != 1:
                 continue
             system = matches[0]
-            plugin = 'bxi_hardware/BxiPairMockSystem' if leg in adapted else 'mock_components/GenericSystem'
+            plugin = ('bxi_hardware/BxiSystemInterface' if stage3 and leg == 'FR' else
+                      'bxi_hardware/BxiPairMockSystem' if leg in adapted else 'mock_components/GenericSystem')
             require(
                 system.findtext('hardware/plugin') == plugin and system.get('type') == 'system',
                 f'{leg}: unexpected hardware plugin'

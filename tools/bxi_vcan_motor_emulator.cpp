@@ -54,6 +54,9 @@ struct Options
   bool startup_delay = false;
   bool mode_text = false;
   std::set<int> silent_control_ids;
+  std::map<int, double> initial_positions;
+  std::map<int, std::pair<double, int>> position_steps;
+  std::map<int, int> silent_after_ms;
 };
 
 // Emulated joint state for --follow (under the shared mutex).
@@ -71,6 +74,7 @@ void usage()
     " [--replies-per-command 1] [--follow 0|1] [--follow-time-constant-ms 50]\n"
     " [--startup-window-ms 1:4,2:20,3:0] [--startup-action drop|delay]"
     " [--mode-text 0|1] [--silent-control-ids 1,2,3]\n"
+    " [--initial-positions id:rad,...] [--position-step id:rad@ms] [--silent-after-ms id@ms]\n"
     "  vcan interfaces only. Stop with Ctrl+C; counts are printed on exit.\n");
 }
 
@@ -79,7 +83,38 @@ bool parse(int argc, char ** argv, Options & o)
   for (int i = 1; i + 1 < argc; i += 2) {
     const std::string key = argv[i];
     const std::string value = argv[i + 1];
-    if (key == "--iface") {
+    if (key == "--initial-positions" || key == "--position-step" || key == "--silent-after-ms") {
+      std::stringstream list(value);
+      for (std::string item; std::getline(list, item, ','); ) {
+        try {
+          const auto colon = item.find(':');
+          const auto at = item.find('@');
+          const auto delimiter = key == "--silent-after-ms" ? at : colon;
+          if (delimiter == std::string::npos) {return false;}
+          size_t used = 0;
+          const int id = std::stoi(item.substr(0, delimiter), &used);
+          if (used != delimiter || id < 1 || id > int(protocol::kMaxSupportedMotorCanId)) {return false;}
+          if (key != "--silent-after-ms") {
+            const auto end = key == "--position-step" ? at : item.size();
+            if (end == std::string::npos || end <= colon + 1) {return false;}
+            const auto text = item.substr(colon + 1, end - colon - 1);
+            const double rad = std::stod(text, &used);
+            if (used != text.size() || !std::isfinite(rad)) {return false;}
+            if (key == "--initial-positions") {o.initial_positions[id] = rad;}
+            else {o.position_steps[id].first = rad;}
+          }
+          if (key != "--initial-positions") {
+            if (at == std::string::npos) {return false;}
+            const auto text = item.substr(at + 1);
+            const int ms = std::stoi(text, &used);
+            if (used != text.size() || ms < 0 || ms > 600000) {return false;}
+            if (key == "--position-step") {o.position_steps[id].second = ms;}
+            else {o.silent_after_ms[id] = ms;}
+          }
+        } catch (const std::exception &) {return false;}
+      }
+      if (value.empty() || value.back() == ',') {return false;}
+    } else if (key == "--iface") {
       o.iface = value;
     } else if (key == "--startup-window-ms") {
       std::stringstream list(value);
@@ -140,6 +175,12 @@ bool parse(int argc, char ** argv, Options & o)
   }
   const bool ids_ok = !o.ids.empty() && *o.ids.begin() >= 1 &&
     *o.ids.rbegin() <= static_cast<int>(protocol::kMaxSupportedMotorCanId);
+  for (const auto & entry : o.initial_positions) {
+    const protocol::MitLimits limits;
+    if (!o.ids.count(entry.first) || entry.second < limits.p_min || entry.second > limits.p_max) {return false;}
+  }
+  for (const auto & entry : o.position_steps) {if (!o.ids.count(entry.first)) {return false;}}
+  for (const auto & entry : o.silent_after_ms) {if (!o.ids.count(entry.first)) {return false;}}
   return argc % 2 == 1 && o.iface.rfind("vcan", 0) == 0 && ids_ok && o.delay_us >= 0 &&
          o.replies_per_command >= 1 && o.replies_per_command <= 10;
 }
@@ -217,6 +258,21 @@ int main(int argc, char ** argv)
     const protocol::MitLimits limits;
     joints[id].position = protocol::uintToFloat(0x7FFF, limits.p_min, limits.p_max, 16);
   }
+  for (const auto & entry : options.initial_positions) {joints[entry.first].position = entry.second;}
+  const auto started = clock_type::now();
+  std::set<int> stepped;
+  auto silent = [&](int id, clock_type::time_point now) {
+      const auto it = options.silent_after_ms.find(id);
+      return it != options.silent_after_ms.end() && now - started >= std::chrono::milliseconds(it->second);
+    };
+  auto apply_steps = [&](clock_type::time_point now) {
+      for (const auto & entry : options.position_steps) {
+        if (!stepped.count(entry.first) && now - started >= std::chrono::milliseconds(entry.second.second)) {
+          joints[entry.first].position += entry.second.first;
+          stepped.insert(entry.first);
+        }
+      }
+    };
   std::atomic<long> unicast_frames{0};
   std::atomic<long> broadcast_frames{0};
   std::atomic<long> replies_sent{0};
@@ -238,6 +294,10 @@ int main(int argc, char ** argv)
         }
         const int id = pending.begin()->second;
         pending.erase(pending.begin());
+        const auto reply_now = clock_type::now();
+        const int reply_id = id < 0 ? (-id - 1) / 16 : id;
+        if (silent(reply_id, reply_now)) {continue;}
+        apply_steps(reply_now);
         CanFrame reply;
         if (id < 0) {
           // Existing pending queue also carries immutable text chunks encoded as negative IDs.
@@ -247,7 +307,7 @@ int main(int argc, char ** argv)
           reply.dlc = 8;
           const size_t offset = static_cast<size_t>(chunk) * 8;
           std::memcpy(reply.data.data(), text + offset, std::min<size_t>(8, sizeof(text) - 1 - offset));
-        } else {reply = feedbackFrame(id, options.follow ? &joints[id] : nullptr);}
+        } else {reply = feedbackFrame(id, (options.follow || !options.initial_positions.empty() || !options.position_steps.empty()) ? &joints[id] : nullptr);}
         lock.unlock();
         if (tx_bus.send(reply)) {
           ++replies_sent;
@@ -267,6 +327,7 @@ int main(int argc, char ** argv)
     const auto now = clock_type::now();
     const int id = static_cast<int>(frame.id);
     std::lock_guard<std::mutex> lock(mutex);
+    apply_steps(now);
     if (options.ids.count(id) != 0 && frame.dlc == 8) {
       ++unicast_frames;
       const bool enable = frame.data8() == protocol::encodeSpecialCommand(protocol::SpecialCommand::kEnable);
