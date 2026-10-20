@@ -98,7 +98,7 @@ def test_rejects_mutations(tmp_path, mutation):
     elif mutation == 'position_bounds':
         system.find("joint/command_interface/param[@name='min']").text = '-1'
     elif mutation == 'initial_outside':
-        profile['initial_positions'][joint] = .31
+        profile['initial_positions'][joint] = profile['joint_settings'][joint]['position_max'] + .01
     elif mutation == 'gain':
         adapter['joint_settings'][joint]['kp'] = 11.
     elif mutation == 'bus':
@@ -253,3 +253,43 @@ def test_rejects_measured_interpolation_start(tmp_path):
     path.write_text(yaml.safe_dump(controllers))
     errors = checker.check_adapter(tmp_path, tmp_path / 'robot.urdf')
     assert any('interpolate_from_desired_state must be true' in error for error in errors)
+
+
+@pytest.mark.parametrize('upstream', ['champ', 'rl'])
+@pytest.mark.parametrize('mutation', ['copy_motor_limit', 'mismatch'])
+def test_rejects_measured_start_speed_mismatch(tmp_path, upstream, mutation):
+    profile = generator.generate(PROFILE, tmp_path)
+    # Read the generated profile; the upstream interpolation limit stays independent.
+    profile = yaml.safe_load((tmp_path / 'bxi_champ_jtc_legs.yaml').read_text())
+    path = tmp_path / (upstream + '.yaml')
+    configuration = yaml.safe_load(path.read_text())
+    parameters = configuration['/**']['ros__parameters']
+    expected = [profile['measured_start_velocity_limit']] * 12
+    actual = parameters['measured_start']['velocity_limit'] if upstream == 'champ' else parameters['measured_start_velocity_limit']
+    assert actual == expected == [.7] * 12
+    assert all(profile['joint_settings'][name]['velocity_limit'] > .7 for name in profile['joints'])
+    replacement = [profile['joint_settings'][name]['velocity_limit'] for name in profile['joints']] if mutation == 'copy_motor_limit' else [1.] * 12
+    if upstream == 'champ':
+        parameters['measured_start']['velocity_limit'] = replacement
+    else:
+        parameters['measured_start_velocity_limit'] = replacement
+    path.write_text(yaml.safe_dump(configuration))
+    assert any('measured-start velocity must match profile' in error for error in checker.check_adapter(tmp_path, tmp_path / 'robot.urdf'))
+
+
+def test_rejects_measured_start_speed_above_half_motor_limit(tmp_path):
+    generator.generate(PROFILE, tmp_path)
+    path = tmp_path / 'bxi_champ_jtc_legs.yaml'
+    profile = yaml.safe_load(path.read_text())
+    profile['measured_start_velocity_limit'] = 6.
+    path.write_text(yaml.safe_dump(profile))
+    for upstream in ['champ', 'rl']:
+        path = tmp_path / (upstream + '.yaml')
+        configuration = yaml.safe_load(path.read_text())
+        parameters = configuration['/**']['ros__parameters']
+        if upstream == 'champ':
+            parameters['measured_start']['velocity_limit'] = [6.] * 12
+        else:
+            parameters['measured_start_velocity_limit'] = [6.] * 12
+        path.write_text(yaml.safe_dump(configuration))
+    assert any('at most half' in error for error in checker.check_adapter(tmp_path, tmp_path / 'robot.urdf'))

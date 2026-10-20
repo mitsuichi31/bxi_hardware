@@ -176,8 +176,27 @@ def check_adapter(directory, urdf, *, real_configuration=False):
             max_time_from_start=.010,
             timeout=10.
         )
+        start_speed = profile.get('measured_start_velocity_limit')
+        valid_start_speed = (
+            isinstance(start_speed, (int, float)) and not isinstance(start_speed, bool) and
+            math.isfinite(start_speed) and start_speed > 0
+        )
+        require(valid_start_speed, 'invalid measured_start_velocity_limit')
+        if valid_start_speed:
+            require(
+                all(start_speed <= profile['joint_settings'][name]['velocity_limit'] / 2 for name in names),
+                'measured_start_velocity_limit must be at most half each joint velocity_limit'
+            )
         for upstream in ('champ', 'rl'):
             parameters = yaml.safe_load((directory / (upstream + '.yaml')).read_text())['/**']['ros__parameters']
+            generated_start_speed = (
+                parameters.get('measured_start', {}).get('velocity_limit') if upstream == 'champ'
+                else parameters.get('measured_start_velocity_limit')
+            )
+            require(
+                generated_start_speed == [start_speed] * len(names),
+                f'{upstream}: measured-start velocity must match profile'
+            )
             require(
                 parameters.get('measured_start_enabled') is True and
                 parameters.get('jtc_ingestion') == expected_ingestion,
