@@ -310,6 +310,8 @@ def test_stage56_generation_and_configuration_mode(tmp_path, suffix, real, gains
     baseline = yaml.safe_load(VCAN_PROFILE.read_text())
     # Only profile name and all joint gains may differ from Stage 3.
     baseline['profile'] = original['profile']
+    if original['profile'] in ('stage6_real_gain20', 'stage6_vcan_gain20'):
+        baseline['standup_resync_tolerance'] = .2
     for settings in baseline['joint_settings'].values():
         settings.update(kp=gains[0], kd=gains[1], kp_max=gains[0], kd_max=gains[1])
     assert original == baseline
@@ -480,3 +482,42 @@ def test_stage6_manual_launch_has_no_upstream_or_verifier(tmp_path, monkeypatch,
     assert len(handlers) == 1
     assert handlers[0]['on_exit'](SimpleNamespace(returncode=0), context) == []
     assert handlers[0]['on_exit'](SimpleNamespace(returncode=1), context)
+
+
+@pytest.mark.parametrize('real', [False, True])
+@pytest.mark.parametrize('value', [.05, .2, .249, 0., -.1, .25, .3, float('nan'), float('inf')])
+def test_stage7_gain20_resync_torque_bound(tmp_path, real, value):
+    source = PROFILE.with_name('bxi_champ_jtc_' + ('real' if real else 'vcan') + '_gain20_legs.yaml')
+    generator.generate(source, tmp_path)
+    f = tmp_path / 'bxi_champ_jtc_legs.yaml'
+    profile = yaml.safe_load(f.read_text())
+    profile['standup_resync_tolerance'] = value
+    f.write_text(yaml.safe_dump(profile))
+    errors = checker.check_adapter(tmp_path, tmp_path / 'robot.urdf', real_configuration=real)
+    if value in [.05, .2, .249]:
+        assert errors == []
+    else:
+        assert any('gain20 resync tolerance' in e for e in errors)
+
+
+@pytest.mark.parametrize('name,real', [
+    ('bxi_champ_jtc_legs.yaml', False), ('bxi_champ_jtc_vcan_legs.yaml', False),
+    ('bxi_champ_jtc_real_zero_gain_legs.yaml', True), ('bxi_champ_jtc_vcan_zero_gain_legs.yaml', False)])
+@pytest.mark.parametrize('value', [.15, .2])
+def test_stage7_older_profiles_keep_resync_point05(tmp_path, name, real, value):
+    generator.generate(PROFILE.with_name(name), tmp_path)
+    f = tmp_path / 'bxi_champ_jtc_legs.yaml'
+    profile = yaml.safe_load(f.read_text())
+    assert profile['standup_resync_tolerance'] == .05
+    profile['standup_resync_tolerance'] = value
+    f.write_text(yaml.safe_dump(profile))
+    assert any('synchronization thresholds differ' in e for e in checker.check_adapter(
+        tmp_path, tmp_path / 'robot.urdf', real_configuration=real))
+
+
+@pytest.mark.parametrize('real', [False, True])
+def test_stage7_generated_champ_resync_point2(tmp_path, real):
+    generator.generate(PROFILE.with_name('bxi_champ_jtc_' + ('real' if real else 'vcan') + '_gain20_legs.yaml'), tmp_path)
+    champ = yaml.safe_load((tmp_path / 'champ.yaml').read_text())['/**']['ros__parameters']
+    assert champ['measured_start']['resync_tolerance'] == .2
+    assert checker.check_adapter(tmp_path, tmp_path / 'robot.urdf', real_configuration=real) == []

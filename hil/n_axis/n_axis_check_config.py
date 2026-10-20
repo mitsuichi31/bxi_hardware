@@ -375,10 +375,18 @@ def check_adapter(directory, urdf, *, real_configuration=False):
                 {name for name in names if name.split('_')[0] in adapted},
                 'extra adapter group/joint'
             )
-        require(
-            profile.get('joint_states_max_age') == .2 and profile.get('standup_resync_tolerance') == .05,
-            'Stage 2 synchronization thresholds differ'
-        )
+        tolerance = profile.get('standup_resync_tolerance')
+        if profile.get('profile') in ('stage6_real_gain20', 'stage6_vcan_gain20'):
+            valid_tolerance = (isinstance(tolerance, (int, float)) and not isinstance(tolerance, bool)
+                               and math.isfinite(tolerance) and tolerance > 0)
+            require(valid_tolerance and all(
+                profile['joint_settings'][name]['kp_max'] * tolerance <
+                profile['joint_settings'][name]['torque_limit']
+                for name in profile['legs']['FR']['joints']),
+                'gain20 resync tolerance must be positive and below each FR torque bound')
+        else:
+            require(tolerance == .05, 'Stage 2 synchronization thresholds differ')
+        require(profile.get('joint_states_max_age') == .2, 'Stage 2 synchronization thresholds differ')
     except (ValueError, OSError, KeyError, TypeError, AttributeError, ET.ParseError) as exception:
         errors.append(str(exception))
     return errors
