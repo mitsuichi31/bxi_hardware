@@ -521,3 +521,100 @@ def test_stage7_generated_champ_resync_point2(tmp_path, real):
     champ = yaml.safe_load((tmp_path / 'champ.yaml').read_text())['/**']['ros__parameters']
     assert champ['measured_start']['resync_tolerance'] == .2
     assert checker.check_adapter(tmp_path, tmp_path / 'robot.urdf', real_configuration=real) == []
+
+
+@pytest.mark.parametrize('real', [False, True])
+def test_stage8_generation_and_mode(tmp_path, monkeypatch, real):
+    source = PROFILE.with_name('bxi_champ_jtc_' + ('real' if real else 'vcan') + '_walk_legs.yaml')
+    generator.generate(source, tmp_path)
+    assert checker.check_adapter(tmp_path, tmp_path / 'robot.urdf', real_configuration=real) == []
+    assert checker.check_adapter(tmp_path, tmp_path / 'robot.urdf', real_configuration=not real)
+    profile = yaml.safe_load((tmp_path / 'bxi_champ_jtc_legs.yaml').read_text())
+    import json
+    import subprocess
+    calls = []
+    link = real_can_link() if real else [{'linkinfo': {'info_kind': 'vcan'}}]
+    def check_output(command, **kwargs):
+        calls.append(command)
+        return json.dumps(link)
+    monkeypatch.setattr(subprocess, 'check_output', check_output)
+    STARTUP.validate_startup_profile(profile)
+    assert calls == [['ip', '-details', '-json', 'link', 'show', 'can0']]
+    link = [{'linkinfo': {'info_kind': 'vcan'}}] if real else real_can_link()
+    calls.clear()
+    with pytest.raises(ValueError, match='requires'):
+        STARTUP.validate_startup_profile(profile)
+    assert calls == [['ip', '-details', '-json', 'link', 'show', 'can0']]
+    champ = yaml.safe_load((tmp_path / 'champ.yaml').read_text())['/**']['ros__parameters']
+    assert champ['gait']['swing_height'] == profile['champ_gait']['swing_height']
+    assert champ['measured_start']['walk_rate_limit'] == 2.
+    profile['publisher'] = 'manual'
+    (tmp_path / 'bxi_champ_jtc_legs.yaml').write_text(yaml.safe_dump(profile))
+    assert checker.check_adapter(tmp_path, tmp_path / 'robot.urdf', real_configuration=real)
+
+@pytest.mark.parametrize('value', [0, -.01, .050001, float('nan'), float('inf'), True])
+def test_stage8_reject_invalid_height(tmp_path, value):
+    source = PROFILE.with_name('bxi_champ_jtc_vcan_walk_legs.yaml')
+    generator.generate(source, tmp_path)
+    profile = yaml.safe_load((tmp_path / 'bxi_champ_jtc_legs.yaml').read_text())
+    profile['champ_gait']['swing_height'] = value
+    (tmp_path / 'bxi_champ_jtc_legs.yaml').write_text(yaml.safe_dump(profile))
+    assert checker.check_adapter(tmp_path, tmp_path / 'robot.urdf')
+
+@pytest.mark.parametrize('value', [5., 7.4, 15., 15.1])
+def test_stage8_reject_torque(tmp_path, value):
+    generator.generate(PROFILE.with_name('bxi_champ_jtc_vcan_walk_legs.yaml'), tmp_path)
+    profile = yaml.safe_load((tmp_path / 'bxi_champ_jtc_legs.yaml').read_text())
+    profile['joint_settings']['FR_collar_joint']['torque_limit'] = value
+    (tmp_path / 'bxi_champ_jtc_legs.yaml').write_text(yaml.safe_dump(profile))
+    assert checker.check_adapter(tmp_path, tmp_path / 'robot.urdf')
+
+@pytest.mark.parametrize('filename', ['bxi_champ_jtc_legs.yaml', 'bxi_champ_jtc_vcan_legs.yaml',
+    'bxi_champ_jtc_real_zero_gain_legs.yaml', 'bxi_champ_jtc_vcan_zero_gain_legs.yaml',
+    'bxi_champ_jtc_real_gain20_legs.yaml', 'bxi_champ_jtc_vcan_gain20_legs.yaml'])
+def test_stage8_reject_gait_on_previous_profiles(tmp_path, filename):
+    generator.generate(PROFILE.with_name(filename), tmp_path)
+    profile = yaml.safe_load((tmp_path / 'bxi_champ_jtc_legs.yaml').read_text())
+    profile['champ_gait'] = {'swing_height': .01}
+    (tmp_path / 'bxi_champ_jtc_legs.yaml').write_text(yaml.safe_dump(profile))
+    assert checker.check_adapter(tmp_path, tmp_path / 'robot.urdf', real_configuration='_real_' in filename)
+    # Generator rejects before touching a destination; keep source beside its model/config tree.
+    import unittest.mock
+    with unittest.mock.patch.object(generator.yaml, 'safe_load', return_value=profile):
+        with pytest.raises(ValueError, match='champ_gait'):
+            generator.generate(PROFILE.with_name(filename), tmp_path / 'rejected')
+
+@pytest.mark.parametrize('value', [0., 1., float('inf'), float('nan')])
+def test_stage8_reject_generated_rate(tmp_path, value):
+    generator.generate(PROFILE.with_name('bxi_champ_jtc_vcan_walk_legs.yaml'), tmp_path)
+    f=tmp_path/'champ.yaml';data=yaml.safe_load(f.read_text())
+    data['/**']['ros__parameters']['measured_start']['walk_rate_limit']=value
+    f.write_text(yaml.safe_dump(data))
+    assert checker.check_adapter(tmp_path, tmp_path/'robot.urdf')
+
+@pytest.mark.parametrize('filename', ['bxi_champ_jtc_legs.yaml', 'bxi_champ_jtc_vcan_legs.yaml',
+    'bxi_champ_jtc_real_zero_gain_legs.yaml', 'bxi_champ_jtc_vcan_zero_gain_legs.yaml',
+    'bxi_champ_jtc_real_gain20_legs.yaml', 'bxi_champ_jtc_vcan_gain20_legs.yaml'])
+def test_stage8_old_generation_only_adds_walk_rate(tmp_path, filename):
+    import copy
+    # Execute the saved Stage7 generator under a distinct module identity.
+    import subprocess
+    baseline=tmp_path/'stage7_generator.py'
+    baseline.write_bytes(subprocess.check_output(['git','-C',str(WORKSPACE),'show','e9669b3:src/minibexkai_bringup/scripts/make_bxi_champ_jtc_config.py']))
+    old=load('stage7_saved_generator', baseline)
+    source=PROFILE.with_name(filename)
+    old.generate(source,tmp_path/'old');generator.generate(source,tmp_path/'new')
+    def norm(v, root):
+        if isinstance(v,str):return v.replace(str(root),'@RUN@')
+        if isinstance(v,list):return [norm(x,root) for x in v]
+        if isinstance(v,dict):return {k:norm(x,root) for k,x in v.items()}
+        return v
+    for f in (tmp_path/'old').iterdir():
+        a=f.read_text();b=(tmp_path/'new'/f.name).read_text()
+        if f.suffix=='.yaml':
+            a=norm(yaml.safe_load(a),tmp_path/'old');b=norm(yaml.safe_load(b),tmp_path/'new')
+            if f.name=='champ.yaml':assert b['/**']['ros__parameters']['measured_start'].pop('walk_rate_limit')==2.
+        else:
+            a=ET.tostring(ET.fromstring(a.replace(str(tmp_path/'old'),'@RUN@')))
+            b=ET.tostring(ET.fromstring(b.replace(str(tmp_path/'new'),'@RUN@')))
+        assert a==b,f.name

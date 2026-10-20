@@ -140,8 +140,8 @@ def check_adapter(directory, urdf, *, real_configuration=False):
         profile = yaml.safe_load((directory / 'bxi_champ_jtc_legs.yaml').read_text())
         controllers = yaml.safe_load((directory / 'controllers.yaml').read_text())
         root = ET.parse(urdf).getroot()
-        real_profiles = ('stage5_real_zero_gain', 'stage6_real_gain20')
-        vcan_profiles = ('stage3_vcan_provisional', 'stage5_vcan_zero_gain', 'stage6_vcan_gain20')
+        real_profiles = ('stage5_real_zero_gain', 'stage6_real_gain20', 'stage8_real_walk')
+        vcan_profiles = ('stage3_vcan_provisional', 'stage5_vcan_zero_gain', 'stage6_vcan_gain20', 'stage8_vcan_walk')
         stage3 = profile.get('profile') in real_profiles + vcan_profiles
         require(profile.get('profile') in (real_profiles if real_configuration else ('stage2_mock_provisional',) + vcan_profiles), 'profile forbidden for requested real_configuration')
         require(profile.get('real_legs') == (['FR'] if stage3 else []), 'provisional real_legs mismatch')
@@ -152,6 +152,21 @@ def check_adapter(directory, urdf, *, real_configuration=False):
             gains = (0., 0.) if profile['profile'].startswith('stage5_') else (20., 1.)
             require(all((v['kp'], v['kd'], v['kp_max'], v['kd_max']) == (*gains, *gains)
                         for v in profile['joint_settings'].values()), 'stage5/6 gains mismatch')
+        walk = profile.get('profile') in ('stage8_real_walk', 'stage8_vcan_walk')
+        gait = profile.get('champ_gait', {})
+        height = gait.get('swing_height') if isinstance(gait, dict) else None
+        if walk:
+            require(isinstance(gait, dict) and set(gait) == {'swing_height'} and
+                    isinstance(height, (int, float)) and not isinstance(height, bool) and
+                    math.isfinite(height) and 0 < height <= .05, 'invalid stage8 swing_height')
+            require(all(v['torque_limit'] == 7.5 and v['torque_limit'] <= 15
+                        for v in profile['joint_settings'].values()), 'stage8 torque_limit must be 7.5 <= rated 15')
+        else:
+            require('champ_gait' not in profile, 'champ_gait is stage8 only')
+        champ = yaml.safe_load((directory / 'champ.yaml').read_text())['/**']['ros__parameters']
+        require(champ.get('measured_start', {}).get('walk_rate_limit') == 2.0, 'Champ walk_rate_limit must be 2.0')
+        if walk:
+            require(champ['gait']['swing_height'] == height, 'Champ swing_height differs from profile')
         names = [
             f'{leg}_{kind}_joint' for leg in ('BL', 'BR', 'FL', 'FR')
             for kind in ('collar', 'hip', 'knee')
@@ -376,7 +391,7 @@ def check_adapter(directory, urdf, *, real_configuration=False):
                 'extra adapter group/joint'
             )
         tolerance = profile.get('standup_resync_tolerance')
-        if profile.get('profile') in ('stage6_real_gain20', 'stage6_vcan_gain20'):
+        if profile.get('profile') in ('stage6_real_gain20', 'stage6_vcan_gain20', 'stage8_real_walk', 'stage8_vcan_walk'):
             valid_tolerance = (isinstance(tolerance, (int, float)) and not isinstance(tolerance, bool)
                                and math.isfinite(tolerance) and tolerance > 0)
             require(valid_tolerance and all(
