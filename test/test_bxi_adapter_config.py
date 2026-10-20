@@ -422,3 +422,61 @@ def test_stage5_vcan_guard_rejects_real_can(monkeypatch):
     monkeypatch.setattr(subprocess, 'check_output', lambda *args, **kwargs: json.dumps(real_can_link()))
     with pytest.raises(ValueError, match='kind vcan'):
         VCAN_LAUNCH.setup(None)
+
+
+@pytest.mark.parametrize('profile_name,real', [
+    ('bxi_champ_jtc_legs.yaml', False),
+    ('bxi_champ_jtc_vcan_legs.yaml', False),
+    ('bxi_champ_jtc_real_zero_gain_legs.yaml', True),
+    ('bxi_champ_jtc_vcan_zero_gain_legs.yaml', False),
+    ('bxi_champ_jtc_real_gain20_legs.yaml', True),
+    ('bxi_champ_jtc_vcan_gain20_legs.yaml', False),
+])
+@pytest.mark.parametrize('publisher', ['champ', 'rl', 'manual'])
+def test_stage6_manual_profile_combinations(tmp_path, profile_name, real, publisher):
+    generator.generate(PROFILE.with_name(profile_name), tmp_path)
+    path = tmp_path / 'bxi_champ_jtc_legs.yaml'
+    profile = yaml.safe_load(path.read_text())
+    profile['publisher'] = publisher
+    path.write_text(yaml.safe_dump(profile))
+    errors = checker.check_adapter(tmp_path, tmp_path / 'robot.urdf', real_configuration=real)
+    allowed = publisher != 'manual' or profile['profile'] in ('stage6_real_gain20', 'stage6_vcan_gain20')
+    assert (not errors) == allowed, errors
+
+
+@pytest.mark.parametrize('real', [False, True])
+def test_stage6_manual_launch_has_no_upstream_or_verifier(tmp_path, monkeypatch, real):
+    from launch import LaunchContext
+    import json
+    import subprocess
+    from types import SimpleNamespace
+    context = LaunchContext()
+    context.launch_configurations.update({
+        'profile': 'bxi_champ_jtc_' + ('real' if real else 'vcan') + '_gain20_legs.yaml',
+        'real_legs': '[FR]', 'adapter_legs': 'FR', 'publisher': 'manual',
+        'output_dir': str(tmp_path / 'generated'), 'initial_positions_file': ''})
+    monkeypatch.setattr(subprocess, 'check_output', lambda *args, **kwargs: json.dumps(
+        real_can_link() if real else [{'linkinfo': {'info_kind': 'vcan'}}]))
+    created_nodes = []
+    processes = []
+    handlers = []
+    def node(**kwargs):
+        created_nodes.append(kwargs)
+        return object()
+    def process(**kwargs):
+        processes.append(kwargs)
+        return object()
+    def handler(**kwargs):
+        handlers.append(kwargs)
+        return object()
+    monkeypatch.setattr(VCAN_LAUNCH, 'Node', node)
+    monkeypatch.setattr(VCAN_LAUNCH, 'ExecuteProcess', process)
+    monkeypatch.setattr(VCAN_LAUNCH, 'OnProcessExit', handler)
+    monkeypatch.setattr(VCAN_LAUNCH, 'RegisterEventHandler', lambda item: item)
+    VCAN_LAUNCH.setup(context, real_configuration=real)
+    assert [item['package'] for item in created_nodes] == ['controller_manager', 'robot_state_publisher']
+    assert len(processes) == 1
+    assert '--verify-upstream' not in processes[0]['cmd']
+    assert len(handlers) == 1
+    assert handlers[0]['on_exit'](SimpleNamespace(returncode=0), context) == []
+    assert handlers[0]['on_exit'](SimpleNamespace(returncode=1), context)

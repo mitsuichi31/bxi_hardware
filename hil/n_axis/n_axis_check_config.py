@@ -160,7 +160,9 @@ def check_adapter(directory, urdf, *, real_configuration=False):
         adapted = profile['adapter_legs']
         require(adapted in ((['FR'], ['FR', 'FL']) if stage3 else (['FR'], ['BL', 'BR', 'FL', 'FR'], [])), 'unsupported adapter legs')
         require(
-            profile.get('publisher') in ('champ', 'rl') and profile.get('publisher_count') == 1,
+            (profile.get('publisher') in ('champ', 'rl') or
+             (profile.get('publisher') == 'manual' and profile.get('profile') in
+              ('stage6_real_gain20', 'stage6_vcan_gain20'))) and profile.get('publisher_count') == 1,
             'exactly one upstream publisher required'
         )
         cm = controllers['controller_manager']['ros__parameters']
