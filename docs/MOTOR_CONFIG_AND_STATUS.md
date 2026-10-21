@@ -47,6 +47,8 @@ BXI モーター（1軸の HIL では BXI7010-19、`can_id` 1）の設定とス�
 
 `bxi_hardware` が前提にしている設定（ID、`can_timeout`、MIT の範囲）は、交換の前後で同じだった。
 
+**`can_timeout` は、モーターごとに違うことがある。** FRの3台（SN-0016／0014／0010、ID 1〜3）は、2026-10-21 に 200 ms に設定した（ワークスペース側の `docs/test-reports/2026-10-21-bxi-can-timeout-c1-c6.md`）。ほかのモーターは 0 として扱い、`scripts/bxi_can_timeout.py read` で確かめる。意味は [`PROTOCOL_AND_SAFETY.md`](PROTOCOL_AND_SAFETY.md) の「モーター側の通信の期限」。
+
 `bxi_hardware` には、モーター本体の設定を読む機能はない。ワークスペースの `scripts/` に、CAN で文字コマンドを使うスクリプトがある（[`scripts/README.md`](../../../scripts/README.md)）。**設定の一覧は、文字コマンド `s` で読む**（下記「文字コマンドで読む」）。
 
 | 方法 | 内容 | 注意 |
@@ -54,7 +56,7 @@ BXI モーター（1軸の HIL では BXI7010-19、`can_id` 1）の設定とス�
 | 文字コマンド `s`（Setup、CAN の `0x7E1`）：[`scripts/show_bxi_motor_info.py`](../../../scripts/show_bxi_motor_info.py) | 全設定の一覧（`[0] config_version` 〜 `[559] crc`。下記）。2026-09-24〜25 は bxi_usb2can 経由で `ESC s ESC` の順に送って読んだ | 送るとモーターが `07 SETUP` に入り、Motor Mode が解除される。**SETUP の間に送った文字は設定の書き込み（`項目 = 値`）として扱われるので、`s` の後は Esc だけを送る** |
 | BXI_Tool（Windows、USB シリアル 115200 bps）の Config 画面 | すべての設定を一覧で読める | 読み書きはシリアルのコマンドで行われ、モーターの状態が `07 SETUP` → `01 MENU` に移り、Motor Mode が解除される |
 | 電源を入れたときの起動ログ：[`scripts/capture_bxi_boot.py`](../../../scripts/capture_bxi_boot.py)（CAN、受信だけ） | BOOT INFO（ビルド、ファームウェアの版、起動時の CAN ID、HW、センサーの確認、エンコーダー）、状態、文字コマンドの一覧（下記）。**設定の一覧は出ない**（`s` で読む）。2026-09-27 に PCAN から記録した（`log/bxi_boot_20260927_*.log`） | 起動スクリプトを動かしてから、モーターの電源を入れる。何も送らない |
-| CAN のレジスタ読み出し（`REG_READ`、ID `(0x17 << 4) + can_id` = `0x171`） | 2026-09-25 の調査スクリプト（`minibexkai_docs/research/logs/20260925_bxi_socketcan/scripts/can_motor.py reg-read <アドレス>`、python-can）で読める。`REG_INFO`（`0x1A1`）では公開レジスタ52、書き込めるもの46 | このファームウェアのレジスタのアドレスの一覧が手元になく、確かめたのは `0x7C`（設定の版 0.2）だけ。**一覧が手に入るまで、書き込み（`0x18`）と保存（`0x19`）は使わない** |
+| CAN のレジスタ読み出し（`REG_READ`、ID `(0x17 << 4) + can_id` = `0x171`） | 2026-09-25 の調査スクリプト（`minibexkai_docs/research/logs/20260925_bxi_socketcan/scripts/can_motor.py reg-read <アドレス>`、python-can）で読める。`REG_INFO`（`0x1A1`）では公開レジスタ52、書き込めるもの46 | レジスタの表は `minibexkai_docs/reference/bxi/0.2.2 - BXI_Wiki.pdf`（2026-10-21 に入手。公開52・書ける46で REG_INFO と一致）。書き込み（`0x18`）と保存（`0x19`）は、[`scripts/bxi_can_timeout.py`](../../../scripts/bxi_can_timeout.py) で `can_timeout`（0x63）に 0 か 200 を書くときだけ使う（2026-10-21 に FR の3台で実施）。**ほかのレジスタは書かない**（値の範囲をモーターが確かめないため） |
 
 ### 文字コマンドで読む（`s` と `p`）
 
