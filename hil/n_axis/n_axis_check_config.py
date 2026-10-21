@@ -141,7 +141,7 @@ def check_adapter(directory, urdf, *, real_configuration=False):
         controllers = yaml.safe_load((directory / 'controllers.yaml').read_text())
         root = ET.parse(urdf).getroot()
         real_profiles = ('stage5_real_zero_gain', 'stage6_real_gain20', 'stage8_real_walk', 'stage8v_real_velocity')
-        vcan_profiles = ('stage3_vcan_provisional', 'stage5_vcan_zero_gain', 'stage6_vcan_gain20', 'stage8_vcan_walk', 'stage8v_vcan_velocity')
+        vcan_profiles = ('stage3_vcan_provisional', 'stage5_vcan_zero_gain', 'stage6_vcan_gain20', 'stage8_vcan_walk', 'stage8v_vcan_velocity', 'prep_vcan_gait_stand')
         velocity = profile.get('profile') in ('stage8v_real_velocity', 'stage8v_vcan_velocity')
         require(profile.get('velocity_feedforward') is True if velocity else 'velocity_feedforward' not in profile,
                 'profile velocity_feedforward mismatch')
@@ -155,7 +155,7 @@ def check_adapter(directory, urdf, *, real_configuration=False):
             gains = (0., 0.) if profile['profile'].startswith('stage5_') else (20., 1.)
             require(all((v['kp'], v['kd'], v['kp_max'], v['kd_max']) == (*gains, *gains)
                         for v in profile['joint_settings'].values()), 'stage5/6 gains mismatch')
-        walk = profile.get('profile') in ('stage8_real_walk', 'stage8_vcan_walk', 'stage8v_real_velocity', 'stage8v_vcan_velocity')
+        walk = profile.get('profile') in ('stage8_real_walk', 'stage8_vcan_walk', 'stage8v_real_velocity', 'stage8v_vcan_velocity', 'prep_vcan_gait_stand')
         gait = profile.get('champ_gait', {})
         height = gait.get('swing_height') if isinstance(gait, dict) else None
         if walk:
@@ -167,6 +167,24 @@ def check_adapter(directory, urdf, *, real_configuration=False):
         else:
             require('champ_gait' not in profile, 'champ_gait is stage8 only')
         champ = yaml.safe_load((directory / 'champ.yaml').read_text())['/**']['ros__parameters']
+        prep = profile.get('profile') == 'prep_vcan_gait_stand'
+        if 'standup_from_gait' in profile or prep:
+            require(prep and profile.get('standup_from_gait') is True,
+                    'standup_from_gait requires prep_vcan_gait_stand and true')
+            if prep and profile.get('standup_from_gait') is True:
+                import importlib.util
+                from ament_index_python.packages import get_package_share_directory
+                module_path = Path(get_package_share_directory('minibexkai_bringup')) / 'scripts/champ_gait_reference.py'
+                spec = importlib.util.spec_from_file_location('champ_gait_reference_check', module_path)
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                reference = module.gait_reference(directory / 'robot.urdf', champ['gait'], champ['joints_map'], profile['joint_settings'])
+                champ_names = [name for leg in ('left_front', 'right_front', 'left_hind', 'right_hind') for name in champ['joints_map'][leg]]
+                angles = champ['default_joint_angles']
+                require(len(angles) == len(champ_names) == 12, 'gait default angle count mismatch')
+                for name, angle in zip(champ_names, angles):
+                    require(abs(angle - reference[name]) <= .001, f'{name}: default_joint_angles differs from gait reference')
+                    require(abs(profile['standup_positions'][name] - reference[name]) <= .001, f'{name}: standup_positions differs from gait reference')
         require(champ.get('measured_start', {}).get('walk_rate_limit') == 2.0, 'Champ walk_rate_limit must be 2.0')
         if walk:
             require(champ['gait']['swing_height'] == height, 'Champ swing_height differs from profile')
@@ -178,7 +196,7 @@ def check_adapter(directory, urdf, *, real_configuration=False):
         adapted = profile['adapter_legs']
         require(adapted in ((['FR'], ['FR', 'FL']) if stage3 else (['FR'], ['BL', 'BR', 'FL', 'FR'], [])), 'unsupported adapter legs')
         require(
-            (profile.get('publisher') in (('champ',) if velocity else ('champ', 'rl')) or
+            (profile.get('publisher') in (('champ',) if velocity or profile.get('profile') == 'prep_vcan_gait_stand' else ('champ', 'rl')) or
              (profile.get('publisher') == 'manual' and profile.get('profile') in
               ('stage6_real_gain20', 'stage6_vcan_gain20', 'stage8v_real_velocity', 'stage8v_vcan_velocity'))) and profile.get('publisher_count') == 1,
             'exactly one upstream publisher required'
@@ -395,7 +413,7 @@ def check_adapter(directory, urdf, *, real_configuration=False):
                 'extra adapter group/joint'
             )
         tolerance = profile.get('standup_resync_tolerance')
-        if profile.get('profile') in ('stage6_real_gain20', 'stage6_vcan_gain20', 'stage8_real_walk', 'stage8_vcan_walk', 'stage8v_real_velocity', 'stage8v_vcan_velocity'):
+        if profile.get('profile') in ('stage6_real_gain20', 'stage6_vcan_gain20', 'stage8_real_walk', 'stage8_vcan_walk', 'stage8v_real_velocity', 'stage8v_vcan_velocity', 'prep_vcan_gait_stand'):
             valid_tolerance = (isinstance(tolerance, (int, float)) and not isinstance(tolerance, bool)
                                and math.isfinite(tolerance) and tolerance > 0)
             require(valid_tolerance and all(
