@@ -140,8 +140,11 @@ def check_adapter(directory, urdf, *, real_configuration=False):
         profile = yaml.safe_load((directory / 'bxi_champ_jtc_legs.yaml').read_text())
         controllers = yaml.safe_load((directory / 'controllers.yaml').read_text())
         root = ET.parse(urdf).getroot()
-        real_profiles = ('stage5_real_zero_gain', 'stage6_real_gain20', 'stage8_real_walk')
-        vcan_profiles = ('stage3_vcan_provisional', 'stage5_vcan_zero_gain', 'stage6_vcan_gain20', 'stage8_vcan_walk')
+        real_profiles = ('stage5_real_zero_gain', 'stage6_real_gain20', 'stage8_real_walk', 'stage8v_real_velocity')
+        vcan_profiles = ('stage3_vcan_provisional', 'stage5_vcan_zero_gain', 'stage6_vcan_gain20', 'stage8_vcan_walk', 'stage8v_vcan_velocity')
+        velocity = profile.get('profile') in ('stage8v_real_velocity', 'stage8v_vcan_velocity')
+        require(profile.get('velocity_feedforward') is True if velocity else 'velocity_feedforward' not in profile,
+                'profile velocity_feedforward mismatch')
         stage3 = profile.get('profile') in real_profiles + vcan_profiles
         require(profile.get('profile') in (real_profiles if real_configuration else ('stage2_mock_provisional',) + vcan_profiles), 'profile forbidden for requested real_configuration')
         require(profile.get('real_legs') == (['FR'] if stage3 else []), 'provisional real_legs mismatch')
@@ -152,7 +155,7 @@ def check_adapter(directory, urdf, *, real_configuration=False):
             gains = (0., 0.) if profile['profile'].startswith('stage5_') else (20., 1.)
             require(all((v['kp'], v['kd'], v['kp_max'], v['kd_max']) == (*gains, *gains)
                         for v in profile['joint_settings'].values()), 'stage5/6 gains mismatch')
-        walk = profile.get('profile') in ('stage8_real_walk', 'stage8_vcan_walk')
+        walk = profile.get('profile') in ('stage8_real_walk', 'stage8_vcan_walk', 'stage8v_real_velocity', 'stage8v_vcan_velocity')
         gait = profile.get('champ_gait', {})
         height = gait.get('swing_height') if isinstance(gait, dict) else None
         if walk:
@@ -175,9 +178,9 @@ def check_adapter(directory, urdf, *, real_configuration=False):
         adapted = profile['adapter_legs']
         require(adapted in ((['FR'], ['FR', 'FL']) if stage3 else (['FR'], ['BL', 'BR', 'FL', 'FR'], [])), 'unsupported adapter legs')
         require(
-            (profile.get('publisher') in ('champ', 'rl') or
+            (profile.get('publisher') in (('champ',) if velocity else ('champ', 'rl')) or
              (profile.get('publisher') == 'manual' and profile.get('profile') in
-              ('stage6_real_gain20', 'stage6_vcan_gain20'))) and profile.get('publisher_count') == 1,
+              ('stage6_real_gain20', 'stage6_vcan_gain20', 'stage8v_real_velocity', 'stage8v_vcan_velocity'))) and profile.get('publisher_count') == 1,
             'exactly one upstream publisher required'
         )
         cm = controllers['controller_manager']['ros__parameters']
@@ -229,7 +232,7 @@ def check_adapter(directory, urdf, *, real_configuration=False):
         command_names = ['bxi_pair_adapter/' + name if name.split('_')[0] in adapted else name for name in names]
         require(
             trajectory['joints'] == names and trajectory['command_joints'] == command_names and
-            trajectory['command_interfaces'] == ['position'] and
+            trajectory['command_interfaces'] == (['position', 'velocity'] if velocity else ['position']) and
             trajectory['state_interfaces'] == ['position', 'velocity'],
             'JTC joint/reference mismatch'
         )
@@ -250,6 +253,7 @@ def check_adapter(directory, urdf, *, real_configuration=False):
         adapter = controllers.get('bxi_pair_adapter', {}).get('ros__parameters', {})
         groups = [profile['legs'][leg]['hardware_name'] for leg in adapted]
         if adapted:
+            require(adapter.get('velocity_feedforward') is velocity, 'adapter velocity_feedforward mismatch')
             require(
                 adapter['hardware_groups'] == groups and adapter.get('is_async') is False and
                 adapter.get('api_max_tries') == 1 and adapter.get('max_period_sec') == .005,
@@ -318,7 +322,7 @@ def check_adapter(directory, urdf, *, real_configuration=False):
                     f'{name}: mechanical bounds mismatch'
                 )
                 commands = joint.findall('command_interface')
-                expected = COMMANDS if leg in adapted else {'position'}
+                expected = COMMANDS if leg in adapted else ({'position', 'velocity'} if velocity else {'position'})
                 require(
                     len(commands) == len(expected) and {item.get('name') for item in commands} == expected,
                     f'{name}: command set mismatch'
@@ -391,7 +395,7 @@ def check_adapter(directory, urdf, *, real_configuration=False):
                 'extra adapter group/joint'
             )
         tolerance = profile.get('standup_resync_tolerance')
-        if profile.get('profile') in ('stage6_real_gain20', 'stage6_vcan_gain20', 'stage8_real_walk', 'stage8_vcan_walk'):
+        if profile.get('profile') in ('stage6_real_gain20', 'stage6_vcan_gain20', 'stage8_real_walk', 'stage8_vcan_walk', 'stage8v_real_velocity', 'stage8v_vcan_velocity'):
             valid_tolerance = (isinstance(tolerance, (int, float)) and not isinstance(tolerance, bool)
                                and math.isfinite(tolerance) and tolerance > 0)
             require(valid_tolerance and all(

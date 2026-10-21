@@ -4,6 +4,11 @@
 #include <cstdlib>
 #include <limits>
 #include <new>
+#include <filesystem>
+#include <chrono>
+#include <cmath>
+#include <fstream>
+#include <sstream>
 #include "bxi_hardware/bxi_pair_adapter.hpp"
 #include "controller_interface/controller_interface_params.hpp"
 namespace
@@ -66,7 +71,8 @@ struct Rig
   std::vector<hardware_interface::CommandInterface::SharedPtr> references;
   Controller controller;
   size_t hardware_count, axes_count;
-  Rig(size_t hardware = 1, size_t axes = 3, int mutation = -1, bool state_mutation = false)
+  Rig(size_t hardware = 1, size_t axes = 3, int mutation = -1, bool state_mutation = false,
+    bool velocity_feedforward = false, const std::string & output = "")
   :hardware_count(hardware), axes_count(axes)
   {
     std::vector<rclcpp::Parameter> params;
@@ -90,6 +96,8 @@ struct Rig
       }
       params.emplace_back("groups." + group_name + ".joints", joint_names);
     }
+    params.emplace_back("velocity_feedforward", velocity_feedforward);
+    params.emplace_back("output_dir", output);
     params.emplace_back("hardware_groups", groups);
     params.emplace_back("record_seconds", .02);
     controller_interface::ControllerInterfaceParams controller_parameters;
@@ -290,6 +298,142 @@ TEST_F(Adapter, UpdateHasNoAllocationAndStaysWithinApiBound)
   EXPECT_EQ(result, Ret::OK);
   EXPECT_EQ(allocations, 0U);
   EXPECT_LE(rig.controller.sets + rig.controller.reads + rig.controller.states, 308U);
+}
+
+TEST_F(Adapter, MissingVelocityFeedforwardFailsConfigure)
+{
+  Controller controller;
+  controller_interface::ControllerInterfaceParams params;
+  params.controller_name = "missing_velocity_parameter";
+  params.update_rate = 1000;
+  ASSERT_EQ(controller.init(params), Ret::OK);
+  EXPECT_EQ(controller.on_configure(rclcpp_lifecycle::State()), CB::ERROR);
+}
+
+TEST_F(Adapter, VelocityReferencesOrderAndBootAndSignedTargets)
+{
+  for (bool enabled : {false, true}) {
+    Rig rig(1, 3, -1, false, enabled);
+    ASSERT_EQ(rig.activate(), CB::SUCCESS);
+    ASSERT_EQ(rig.references.size(), enabled ? 6U : 3U);
+    for (size_t a = 0; a < 3; ++a) {
+      EXPECT_EQ(rig.references[a]->get_name(), "adapter_unit/leg0_joint" + std::to_string(a) + "/position");
+      if (enabled) {
+        EXPECT_EQ(rig.references[3 + a]->get_name(), "adapter_unit/leg0_joint" + std::to_string(a) + "/velocity");
+        rig.references[3 + a]->set_value(.5);
+      }
+    }
+    ASSERT_EQ(rig.step(), Ret::OK);
+    EXPECT_EQ(rig.commands[1], 0.);
+    for (double value : {-.5, .5, 0.}) {
+      rig.ack();
+      if (enabled) rig.references[3]->set_value(value);
+      ASSERT_EQ(rig.step(), Ret::OK);
+      EXPECT_EQ(rig.commands[1], enabled ? value : 0.);
+    }
+  }
+}
+
+TEST_F(Adapter, VelocityInitialNanAndFiniteThenNanAndInfinitiesRelease)
+{
+  for (double invalid : {std::numeric_limits<double>::quiet_NaN(),
+      std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity()}) {
+    Rig rig(1, 3, -1, false, true);
+    ASSERT_EQ(rig.activate(), CB::SUCCESS);
+    ASSERT_EQ(rig.step(), Ret::OK);
+    rig.ack();
+    ASSERT_EQ(rig.step(), Ret::OK);
+    EXPECT_EQ(rig.commands[1], 0.);
+    rig.ack();
+    rig.references[3]->set_value(.5);
+    ASSERT_EQ(rig.step(), Ret::OK);
+    rig.ack();
+    rig.references[3]->set_value(invalid);
+    EXPECT_EQ(rig.step(), Ret::ERROR);
+    for (size_t a = 0; a < 3; ++a) EXPECT_EQ(rig.commands[5 * a + 1], 0.);
+  }
+  for (double invalid : {std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity()}) {
+    Rig rig(1, 3, -1, false, true);
+    ASSERT_EQ(rig.activate(), CB::SUCCESS);
+    rig.references[3]->set_value(invalid);
+    EXPECT_EQ(rig.step(), Ret::ERROR);
+  }
+}
+
+TEST_F(Adapter, VelocitySignedLimitInclusiveAndExcessRelease)
+{
+  for (double sign : {-1., 1.}) {
+    Rig rig(1, 3, -1, false, true);
+    ASSERT_EQ(rig.activate(), CB::SUCCESS);
+    // A large finite velocity at g=1 must still send zero, without reason=6.
+    rig.references[3]->set_value(sign * 1.);
+    ASSERT_EQ(rig.step(), Ret::OK);
+    EXPECT_EQ(rig.commands[1], 0.);
+    rig.ack();
+    rig.references[3]->set_value(sign * .7);
+    ASSERT_EQ(rig.step(), Ret::OK);
+    EXPECT_EQ(rig.commands[1], sign * .7);
+    rig.ack();
+    rig.references[3]->set_value(sign * .700001);
+    EXPECT_EQ(rig.step(), Ret::ERROR);
+    EXPECT_EQ(rig.commands[1], 0.);
+  }
+}
+
+std::vector<std::vector<std::string>> readCsv(const std::filesystem::path & path)
+{
+  std::ifstream file(path);
+  std::vector<std::vector<std::string>> rows;
+  std::string line;
+  while (std::getline(file, line)) {
+    std::vector<std::string> fields;
+    std::istringstream stream(line);
+    std::string field;
+    while (std::getline(stream, field, ',')) fields.push_back(field);
+    rows.push_back(fields);
+  }
+  return rows;
+}
+
+TEST_F(Adapter, VelocityCsvValuesAndReasons)
+{
+  for (bool enabled : {false, true}) for (int fault : {0, 5, 6}) {
+    const auto directory = std::filesystem::temp_directory_path() /
+      ("bxi_stage8v_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    Rig rig(1, 3, -1, false, enabled, directory.string());
+    ASSERT_EQ(rig.activate(), CB::SUCCESS);
+    ASSERT_EQ(rig.step(), Ret::OK);
+    rig.ack();
+    rig.state[1] = .2;
+    rig.references[0]->set_value(.0005);
+    if (enabled) rig.references[3]->set_value(.5);
+    ASSERT_EQ(rig.step(), Ret::OK);
+    rig.ack();
+    if (fault && enabled) {
+      rig.references[3]->set_value(fault == 5 ? std::numeric_limits<double>::quiet_NaN() : .8);
+      EXPECT_EQ(rig.step(), Ret::ERROR);
+    }
+    rig.controller.on_deactivate(rclcpp_lifecycle::State());
+    ASSERT_EQ(rig.controller.on_cleanup(rclcpp_lifecycle::State()), CB::SUCCESS);
+    const auto rows = readCsv(directory / "joint_cycles.csv");
+    ASSERT_GE(rows.size(), 7U);
+    ASSERT_EQ(rows[0].size(), 16U);
+    EXPECT_EQ(rows[0][13], "reference_velocity_raw");
+    EXPECT_EQ(rows[0][14], "target_velocity");
+    EXPECT_EQ(rows[0][15], "torque_proxy_with_kd");
+    EXPECT_EQ(std::stod(rows[1][14]), 0.);
+    if (enabled) EXPECT_EQ(std::stod(rows[4][13]), .5);
+    else EXPECT_TRUE(std::isnan(std::stod(rows[4][13])));
+    EXPECT_EQ(std::stod(rows[4][14]), enabled ? .5 : 0.);
+    EXPECT_NEAR(std::stod(rows[4][15]), std::abs(.005 + (enabled ? .5 : 0.) - .2), 1e-14);
+    const auto cycles = readCsv(directory / "cycles.csv");
+    if (fault && enabled) EXPECT_EQ(std::stoi(cycles.back()[6]), fault);
+    const auto manifest = readCsv(directory / "manifest.csv");
+    EXPECT_TRUE(std::any_of(manifest.begin(), manifest.end(), [enabled](const auto & row) {
+      return row.size() == 4 && row[2] == "velocity_feedforward" && row[3] == (enabled ? "true" : "false");
+    }));
+    std::filesystem::remove_all(directory);
+  }
 }
 
 }

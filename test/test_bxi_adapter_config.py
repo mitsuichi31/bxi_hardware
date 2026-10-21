@@ -614,7 +614,136 @@ def test_stage8_old_generation_only_adds_walk_rate(tmp_path, filename):
         if f.suffix=='.yaml':
             a=norm(yaml.safe_load(a),tmp_path/'old');b=norm(yaml.safe_load(b),tmp_path/'new')
             if f.name=='champ.yaml':assert b['/**']['ros__parameters']['measured_start'].pop('walk_rate_limit')==2.
+            if f.name=='controllers.yaml' and 'bxi_pair_adapter' in b:assert b['bxi_pair_adapter']['ros__parameters'].pop('velocity_feedforward') is False
         else:
             a=ET.tostring(ET.fromstring(a.replace(str(tmp_path/'old'),'@RUN@')))
             b=ET.tostring(ET.fromstring(b.replace(str(tmp_path/'new'),'@RUN@')))
         assert a==b,f.name
+
+
+@pytest.mark.parametrize('real', [False, True])
+@pytest.mark.parametrize('publisher', ['champ', 'manual', 'rl'])
+def test_stage8v_profiles_and_startup(tmp_path, monkeypatch, real, publisher):
+    import json
+    import subprocess
+    source = PROFILE.with_name('bxi_champ_jtc_' + ('real' if real else 'vcan') + '_velocity_legs.yaml')
+    generator.generate(source, tmp_path)
+    path = tmp_path / 'bxi_champ_jtc_legs.yaml'
+    profile = yaml.safe_load(path.read_text())
+    profile['publisher'] = publisher
+    path.write_text(yaml.safe_dump(profile))
+    errors = checker.check_adapter(tmp_path, tmp_path / 'robot.urdf', real_configuration=real)
+    assert (not errors) == (publisher != 'rl'), errors
+    monkeypatch.setattr(subprocess, 'check_output', lambda *args, **kwargs: json.dumps(
+        real_can_link() if real else [{'linkinfo': {'info_kind': 'vcan'}}]))
+    STARTUP.validate_startup_profile(profile)
+    assert checker.check_adapter(tmp_path, tmp_path / 'robot.urdf', real_configuration=not real)
+
+
+@pytest.mark.parametrize('velocity', [False, True])
+@pytest.mark.parametrize('mutation', ['adapter_missing', 'adapter_opposite', 'adapter_integer', 'jtc', 'mock_missing', 'mock_extra', 'mock_bounds', 'profile'])
+def test_stage8v_reject_mixed_interfaces(tmp_path, velocity, mutation):
+    source = PROFILE.with_name('bxi_champ_jtc_vcan_' + ('velocity' if velocity else 'walk') + '_legs.yaml')
+    generator.generate(source, tmp_path)
+    cp = tmp_path / 'controllers.yaml'
+    controllers = yaml.safe_load(cp.read_text())
+    adapter = controllers['bxi_pair_adapter']['ros__parameters']
+    up = tmp_path / 'robot.urdf'
+    tree = ET.parse(up)
+    joint = tree.getroot().find("ros2_control[@name='bxi_BL']/joint")
+    if mutation == 'adapter_missing':
+        del adapter['velocity_feedforward']
+    elif mutation == 'adapter_opposite':
+        adapter['velocity_feedforward'] = not velocity
+    elif mutation == 'adapter_integer':
+        adapter['velocity_feedforward'] = int(velocity)
+    elif mutation == 'jtc':
+        controllers['joint_trajectory_controller']['ros__parameters']['command_interfaces'] = ['position'] if velocity else ['position', 'velocity']
+    elif mutation == 'mock_missing':
+        joint.remove(joint.find("command_interface[@name='velocity']") if velocity else joint.find('command_interface'))
+    elif mutation == 'mock_extra':
+        ET.SubElement(joint, 'command_interface', name='effort')
+    elif mutation == 'mock_bounds':
+        joint.find('command_interface/param').text = '-999'
+    elif mutation == 'profile':
+        pp = tmp_path / 'bxi_champ_jtc_legs.yaml'
+        profile = yaml.safe_load(pp.read_text())
+        profile['velocity_feedforward'] = False
+        pp.write_text(yaml.safe_dump(profile))
+    cp.write_text(yaml.safe_dump(controllers))
+    tree.write(up)
+    assert checker.check_adapter(tmp_path, up)
+
+
+@pytest.mark.parametrize('real', [False, True])
+def test_stage8v_only_declared_generation_differences(tmp_path, real):
+    import copy
+    mode = 'real' if real else 'vcan'
+    baseline = PROFILE.with_name(f'bxi_champ_jtc_{mode}_walk_legs.yaml')
+    source = PROFILE.with_name(f'bxi_champ_jtc_{mode}_velocity_legs.yaml')
+    old_profile = yaml.safe_load(baseline.read_text())
+    new_profile = yaml.safe_load(source.read_text())
+    assert new_profile.pop('velocity_feedforward') is True
+    new_profile['profile'] = old_profile['profile']
+    assert new_profile == old_profile
+    old, new = tmp_path / 'old', tmp_path / 'new'
+    generator.generate(baseline, old)
+    generator.generate(source, new)
+    def norm(value, directory):
+        if isinstance(value, str): return value.replace(str(directory), '@RUN@')
+        if isinstance(value, dict): return {k: norm(v, directory) for k, v in value.items()}
+        if isinstance(value, list): return [norm(v, directory) for v in value]
+        return value
+    for f in old.iterdir():
+        a, b = f.read_text(), (new / f.name).read_text()
+        if f.suffix == '.yaml':
+            a, b = norm(yaml.safe_load(a), old), norm(yaml.safe_load(b), new)
+            if f.name == 'controllers.yaml':
+                assert b['bxi_pair_adapter']['ros__parameters']['velocity_feedforward'] is True
+                assert a['bxi_pair_adapter']['ros__parameters']['velocity_feedforward'] is False
+                b['bxi_pair_adapter']['ros__parameters']['velocity_feedforward'] = False
+                assert b['joint_trajectory_controller']['ros__parameters']['command_interfaces'] == ['position', 'velocity']
+                b['joint_trajectory_controller']['ros__parameters']['command_interfaces'] = ['position']
+            elif f.name == 'bxi_champ_jtc_legs.yaml':
+                assert b.pop('velocity_feedforward') is True
+                b['profile'] = a['profile']
+        else:
+            a = ET.fromstring(a.replace(str(old), '@RUN@'))
+            b = ET.fromstring(b.replace(str(new), '@RUN@'))
+            for system in b.findall('ros2_control'):
+                if system.findtext('hardware/plugin') == 'mock_components/GenericSystem':
+                    for joint in system.findall('joint'):
+                        velocity = joint.find("command_interface[@name='velocity']")
+                        assert velocity is not None
+                        settings = old_profile['joint_settings'][joint.get('name')]
+                        assert [float(velocity.findtext(f"param[@name='{k}']")) for k in ('min', 'max')] == [-settings['velocity_limit'], settings['velocity_limit']]
+                        joint.remove(velocity)
+            # Whitespace around XML children is serialization detail.
+            for tree in (a, b):
+                for item in tree.iter():
+                    if item.text is not None and not item.text.strip(): item.text = None
+                    if item.tail is not None and not item.tail.strip(): item.tail = None
+            a, b = ET.tostring(a), ET.tostring(b)
+        assert a == b, f.name
+
+
+@pytest.mark.parametrize('real', [False, True])
+def test_stage8v_manual_launch(tmp_path, monkeypatch, real):
+    from launch import LaunchContext
+    import json
+    import subprocess
+    context = LaunchContext()
+    context.launch_configurations.update({
+        'profile': 'bxi_champ_jtc_' + ('real' if real else 'vcan') + '_velocity_legs.yaml',
+        'real_legs': '[FR]', 'adapter_legs': 'FR', 'publisher': 'manual',
+        'output_dir': str(tmp_path / 'generated'), 'initial_positions_file': ''})
+    monkeypatch.setattr(subprocess, 'check_output', lambda *args, **kwargs: json.dumps(
+        real_can_link() if real else [{'linkinfo': {'info_kind': 'vcan'}}]))
+    nodes, processes = [], []
+    monkeypatch.setattr(VCAN_LAUNCH, 'Node', lambda **kwargs: nodes.append(kwargs) or object())
+    monkeypatch.setattr(VCAN_LAUNCH, 'ExecuteProcess', lambda **kwargs: processes.append(kwargs) or object())
+    monkeypatch.setattr(VCAN_LAUNCH, 'OnProcessExit', lambda **kwargs: object())
+    monkeypatch.setattr(VCAN_LAUNCH, 'RegisterEventHandler', lambda item: item)
+    VCAN_LAUNCH.setup(context, real_configuration=real)
+    assert [x['package'] for x in nodes] == ['controller_manager', 'robot_state_publisher']
+    assert len(processes) == 1 and '--verify-upstream' not in processes[0]['cmd']

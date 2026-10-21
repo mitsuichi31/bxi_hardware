@@ -35,6 +35,15 @@ BxiPairAdapter::CB BxiPairAdapter::on_configure(const rclcpp_lifecycle::State &)
 {
   if (activated_once_) return CB::ERROR;
   auto node = get_node();
+  try {
+    if (!node->has_parameter("velocity_feedforward"))
+      node->declare_parameter("velocity_feedforward", rclcpp::ParameterType::PARAMETER_BOOL);
+    const auto velocity_parameter = node->get_parameter("velocity_feedforward");
+    if (velocity_parameter.get_type() != rclcpp::ParameterType::PARAMETER_BOOL) return CB::ERROR;
+    velocity_feedforward_ = velocity_parameter.as_bool();
+  } catch (const rclcpp::exceptions::ParameterUninitializedException &) {
+    return CB::ERROR;
+  }
   const auto names = node->get_parameter("hardware_groups").as_string_array();
   if (names.empty() || names.size() > 4) return CB::ERROR;
   std::set<std::string> hardware, gpios, joints;
@@ -99,7 +108,7 @@ BxiPairAdapter::CB BxiPairAdapter::on_configure(const rclcpp_lifecycle::State &)
     seconds < 0 ||
     seconds > 600 || !std::isfinite(max_period_) || max_period_ <= 0 || max_period_ > .005)
     return CB::ERROR;
-  reference_interfaces_.assign(joints_.size(), nan);
+  reference_interfaces_.assign(joints_.size() * (velocity_feedforward_ ? 2 : 1), nan);
   rows_.assign(static_cast<size_t>(std::ceil(seconds * 1000.)), Row{});
   return CB::SUCCESS;
 }
@@ -121,6 +130,10 @@ std::vector<hardware_interface::CommandInterface> BxiPairAdapter::on_export_refe
   for (size_t a = 0; a < joints_.size();
     ++a)
     refs.emplace_back(get_node()->get_name(), joints_[a] + "/position", &reference_interfaces_[a]);
+  if (velocity_feedforward_)
+    for (size_t a = 0; a < joints_.size(); ++a)
+      refs.emplace_back(get_node()->get_name(), joints_[a] + "/velocity",
+        &reference_interfaces_[joints_.size() + a]);
   return refs;
 }
 
@@ -190,6 +203,7 @@ BxiPairAdapter::CB BxiPairAdapter::on_activate(const rclcpp_lifecycle::State &)
   }
   std::fill(reference_interfaces_.begin(), reference_interfaces_.end(), nan);
   seen_reference_.fill(false);
+  seen_velocity_.fill(false);
   deviation_count_.fill(0);
   count_ = 0;
   cycle_ = 0;
@@ -255,7 +269,7 @@ bool BxiPairAdapter::writeBatch(Row & row, bool release)
       const auto axis = hardware_group.first + a;
       const bool zero = release || hardware_group.generation == 0;
       const double values[] = {release ? row.states[hardware_group.state + 4 *
-          a] : row.target[axis], 0., zero ? 0. : limits_[axis].kp, zero ? 0. : limits_[axis].kd,
+          a] : row.target[axis], zero ? 0. : row.target_velocity[axis], zero ? 0. : limits_[axis].kp, zero ? 0. : limits_[axis].kd,
         0.};
       for (size_t f = 0; f < 5;
         ++f)
@@ -325,6 +339,14 @@ BxiPairAdapter::Ret BxiPairAdapter::update_and_write_commands(
       const double position = row.states[hardware_group.state + 4 * a],
         temp = row.states[hardware_group.state + 4 * a + 3];
       row.raw[axis] = reference_interfaces_[axis];
+      row.raw_velocity[axis] = velocity_feedforward_ ? reference_interfaces_[joints_.size() + axis] : nan;
+      double target_velocity = velocity_feedforward_ ? row.raw_velocity[axis] : 0.;
+      if (std::isnan(target_velocity) && !seen_velocity_[axis]) target_velocity = 0.;
+      else if (std::isfinite(target_velocity)) seen_velocity_[axis] = true;
+      if (!std::isfinite(target_velocity)) row.reason = 5;
+      if (!boot && std::isfinite(target_velocity) && std::abs(target_velocity) > joint_limits.velocity)
+        row.reason = 6;
+      row.target_velocity[axis] = boot ? 0. : target_velocity;
       row.previous[axis] = previous_[axis];
       double target = reference_interfaces_[axis];
       if (std::isnan(target) && !seen_reference_[axis]) target = boot_[axis];
@@ -340,6 +362,8 @@ BxiPairAdapter::Ret BxiPairAdapter::update_and_write_commands(
       row.delta[axis] = target - previous_[axis];
       row.velocity[axis] = std::abs(row.delta[axis]) / row.dt;
       row.torque[axis] = std::abs(joint_limits.kp * (target - position));
+      row.torque_with_kd[axis] = std::abs((boot ? 0. : joint_limits.kp) * (target - position) +
+        (boot ? 0. : joint_limits.kd) * (row.target_velocity[axis] - row.states[hardware_group.state + 4 * a + 1]));
       if (!std::isfinite(target) || target < joint_limits.position_min ||
         target > joint_limits.position_max || !std::isfinite(position) ||
         position < joint_limits.position_min || position > joint_limits.position_max)
@@ -365,6 +389,8 @@ BxiPairAdapter::Ret BxiPairAdapter::update_and_write_commands(
   if (!row.reason && !writeBatch(row, false)) row.reason = 10;
   if (row.reason) {
     terminal_ = true;
+    row.target_velocity.fill(0.);
+    row.torque_with_kd.fill(0.);
     writeBatch(row, true);
     record(row);
     return Ret::ERROR;
@@ -409,12 +435,13 @@ void BxiPairAdapter::save() noexcept
     cycles <<
       "schema_version,activation,cycle,start_ns,end_ns,period,reason,state_ok,reference_ok,dropped\n";
     joints <<
-      "cycle,axis,position,velocity,effort,temperature,reference_raw,target,previous,delta,delta_velocity,torque_proxy,deviation_count\n";
+      "cycle,axis,position,velocity,effort,temperature,reference_raw,target,previous,delta,delta_velocity,torque_proxy,deviation_count,reference_velocity_raw,target_velocity,torque_proxy_with_kd\n";
     groups <<
       "cycle,group,previous_g,candidate_g,accepted,commit_touched,release_missing,normal_set_ns,normal_read_ns,release_set_ns,release_read_ns\n";
     commands <<
       "cycle,attempt,key,value,readback,write_attempted,write_ok,read_attempted,read_ok,unavailable,mismatch\n";
     manifest << "kind,index,name,detail\n";
+    manifest << "parameter,0,velocity_feedforward," << (velocity_feedforward_ ? "true" : "false") << '\n';
     for (size_t a = 0; a < joints_.size(); ++a) {
       const auto & joint_limits = limits_[a];
       manifest << "joint," << a << ',' << joints_[a] << ",bounds=" << joint_limits.position_min <<
@@ -454,7 +481,8 @@ void BxiPairAdapter::save() noexcept
             joints << ',' << recorded_row.raw[axis] << ',' << recorded_row.target[axis] << ',' <<
               recorded_row.previous[axis] << ',' << recorded_row.delta[axis] << ',' <<
               recorded_row.velocity[axis] << ',' << recorded_row.torque[axis] << ',' <<
-              recorded_row.deviation_count[axis] << '\n';
+              recorded_row.deviation_count[axis] << ',' << recorded_row.raw_velocity[axis] << ',' <<
+              recorded_row.target_velocity[axis] << ',' << recorded_row.torque_with_kd[axis] << '\n';
           }
         }
         for (int a = 0; a < 2; ++a) {
