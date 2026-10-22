@@ -4,7 +4,7 @@
 //
 // Real-time side (update()): no allocation, no blocking lock (try_lock only), no exception, no
 // logging. Requests, keepalives and status cross over through try-locked mailboxes and atomics.
-// Plan: docs/plans/20260929_bxi_rt_trajectory_controller_plan.md (workspace).
+// Plan: docs/bxi/worker-hil/plans/2026-09-29-rt-trajectory-controller-plan.md (workspace).
 #ifndef BXI_HARDWARE__HIL_TRAJECTORY_CONTROLLER_HPP_
 #define BXI_HARDWARE__HIL_TRAJECTORY_CONTROLLER_HPP_
 

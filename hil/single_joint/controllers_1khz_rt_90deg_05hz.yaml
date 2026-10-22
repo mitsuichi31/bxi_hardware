@@ -7,7 +7,7 @@ controller_manager:
     lock_memory: true
     # 更新スレッドを P コアの CPU 11 に固定する（2026-09-30、案B）。固定しないと E コアで動く周期があり、
     # vcan で update() の最大が約 50 µs になった。送受信スレッド（CPU 9）とは別の物理コア。
-    # 検討：docs/plans/20260930_bxi_cpu_affinity_plan.md（ワークスペース側）
+    # 検討：docs/bxi/worker-hil/plans/2026-09-30-cpu-affinity-plan.md（ワークスペース側）
     cpu_affinity: 11
 
     joint_state_broadcaster:

@@ -4,7 +4,7 @@
          base_class_type="controller_interface::ControllerInterface">
     <description>
       1軸の HIL 用。ramp と SIN 波の目標を controller_manager の update() の中で毎周期計算する
-      （計画：ワークスペースの docs/plans/20260929_bxi_rt_trajectory_controller_plan.md）。
+      （計画：ワークスペースの docs/bxi/worker-hil/plans/2026-09-29-rt-trajectory-controller-plan.md）。
     </description>
   </class>
 </library>

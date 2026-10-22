@@ -1,7 +1,7 @@
 // Single-joint HIL trajectories: the same formulas as hil/single_joint/ramp_command.py
 // (ramp_setpoint) and sine_command.py (Trajectory, friction_torque), for use inside a
 // controller's update(). at() and frictionTorque() do not allocate or throw.
-// Plan: docs/plans/20260929_bxi_rt_trajectory_controller_plan.md (workspace)
+// Plan: docs/bxi/worker-hil/plans/2026-09-29-rt-trajectory-controller-plan.md (workspace)
 #ifndef BXI_HARDWARE__HIL_TRAJECTORY_HPP_
 #define BXI_HARDWARE__HIL_TRAJECTORY_HPP_
 

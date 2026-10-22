@@ -1,5 +1,5 @@
 // 送受信分離: 1本のCANバスを送信スレッドと受信スレッドで周期運転する。
-// 計画: docs/plans/20260928_bxi_worker_stream_broadcast_plan.md
+// 計画: docs/bxi/worker-hil/plans/2026-09-28-worker-stream-broadcast-plan.md
 #ifndef BXI_HARDWARE__BUS_STREAMER_HPP_
 #define BXI_HARDWARE__BUS_STREAMER_HPP_
 

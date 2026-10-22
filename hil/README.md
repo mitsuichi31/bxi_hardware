@@ -37,7 +37,7 @@ ip -details -statistics link show can0      # state ERROR-ACTIVE を確認
 
 9/25の記録は個体・配線・終端が10/6以降の試験と同一か未確認の履歴であり、近い旧条件（SP80%）で後に受信スタッフエラーが再発しているため、再現性の根拠にはしない。
 
-現在の固定条件はISO FD、公称1M/SP75%/SJW20（250 ns）、データ5M/SP75%/SJW4（50 ns）、80 MHz/BRP1、listen-only OFF、berr-reporting OFF、restart-ms0。`ip -details -statistics`でSP・SJW・クロック・BRPも確認する。BRSは送信アプリのフレーム設定で指定する。ワークスペースの `docs/test-reports/2026-10-12-pcan-brs-fixed-condition.md` が根拠で、PCAN第1ch・今回の配線・1 kHzゼロゲインの確認結果。動作負荷時や他チャンネルの確認は別に行う。通常のros2_control/candumpではberr-reporting OFFのバスエラーが見えず、試験用PCIe kprobe監視は通常運用には無い。事前確認の80 MHz/BRP1/SJW20・4判定もPCAN-M.2第1ch向けで、他アダプタの数値表現が異なるとNGになる。起動時の過去のエラーは解消未確定であり、TEC/REC0だけでエラーなしと判定しない。
+現在の固定条件はISO FD、公称1M/SP75%/SJW20（250 ns）、データ5M/SP75%/SJW4（50 ns）、80 MHz/BRP1、listen-only OFF、berr-reporting OFF、restart-ms0。`ip -details -statistics`でSP・SJW・クロック・BRPも確認する。BRSは送信アプリのフレーム設定で指定する。ワークスペースの `docs/bxi/brs-canfd/reports/2026-10-12-pcan-brs-fixed-condition.md` が根拠で、PCAN第1ch・今回の配線・1 kHzゼロゲインの確認結果。動作負荷時や他チャンネルの確認は別に行う。通常のros2_control/candumpではberr-reporting OFFのバスエラーが見えず、試験用PCIe kprobe監視は通常運用には無い。事前確認の80 MHz/BRP1/SJW20・4判定もPCAN-M.2第1ch向けで、他アダプタの数値表現が異なるとNGになる。起動時の過去のエラーは解消未確定であり、TEC/REC0だけでエラーなしと判定しない。
 
 - モーターの電源出力が ON で、MENU の状態（`STATE : 01 MENU`）であることを確認する。前の試験から出力を維持した場合も再確認する。
 - モーターの `can_timeout` は 0（通信が止まっても最後の指令を出し続ける）として扱う。**試験中にプロセスを強制終了すると、最後の指令が残る。**（2026-10-21 に、FR の3台だけは 200 ms に設定した。ほかのモーターの値は `scripts/bxi_can_timeout.py read` で確かめる。`docs/PROTOCOL_AND_SAFETY.md` の「モーター側の通信の期限」） 停止の順序は下記「段階6 実機試験前の確認」の「止めるとき」に従う。
@@ -143,13 +143,13 @@ sudo ip link del vcan0
 
 vcan 上の値は、ホストのスケジューリングの比較であり、実機の CAN の送受信時間を含まない。
 
-2026-09-27 の指令なし1軸 HIL ベースラインでは、6,756周期の平均開始間隔が5.1108 ms（約195.7 Hz）、worker 作業時間の中央値1.3127 ms・最大1.5377 ms、CAN 取引時間の中央値1.3082 ms・最大1.5330 msだった。5 msを超えた作業周期、無効応答、計測バッファ欠測は0。計測オン・オフの短い CAN 時刻比較では明確な悪化は観測されなかった。条件、p99などの分布、生データはワークスペース側の `docs/test-reports/2026-09-27-bxi-worker-baseline.md` に記録した。これは worker の優先度を変更する前の値で、指令送信時やタイムアウト時の遅れは含まない。
+2026-09-27 の指令なし1軸 HIL ベースラインでは、6,756周期の平均開始間隔が5.1108 ms（約195.7 Hz）、worker 作業時間の中央値1.3127 ms・最大1.5377 ms、CAN 取引時間の中央値1.3082 ms・最大1.5330 msだった。5 msを超えた作業周期、無効応答、計測バッファ欠測は0。計測オン・オフの短い CAN 時刻比較では明確な悪化は観測されなかった。条件、p99などの分布、生データはワークスペース側の `docs/bxi/worker-hil/reports/2026-09-27-worker-baseline.md` に記録した。これは worker の優先度を変更する前の値で、指令送信時やタイムアウト時の遅れは含まない。
 
-同じ条件で `can_frame_format.can0` だけを変えた CAN FD / CAN FD+BRS の実測は、ワークスペース側の `docs/test-reports/2026-09-27-bxi-worker-can-fd.md` に記録した。CAN取引時間の中央値は、Classic 1.3082 ms、FD（BRSなし）1.3272 ms、FD+BRS 1.2572 ms。3モードとも worker の作業時間は5 ms以内だが、周期開始間隔は約5.1 msのままだった。既定の `bxi_hardware.yaml` は Classic CAN のままにしている。
+同じ条件で `can_frame_format.can0` だけを変えた CAN FD / CAN FD+BRS の実測は、ワークスペース側の `docs/bxi/worker-hil/reports/2026-09-27-worker-can-fd.md` に記録した。CAN取引時間の中央値は、Classic 1.3082 ms、FD（BRSなし）1.3272 ms、FD+BRS 1.2572 ms。3モードとも worker の作業時間は5 ms以内だが、周期開始間隔は約5.1 msのままだった。既定の `bxi_hardware.yaml` は Classic CAN のままにしている。
 
 ## 段階6 実機試験前の確認（送受信分離、1 kHz）
 
-`bxi_hardware_stream_1khz.yaml` と `controllers_1khz.yaml` で実機を動かす前に、毎回この節を確認し、その結果を試験のレポートに残す。前提と段階は、ワークスペース側の `docs/plans/20260928_bxi_worker_stream_broadcast_plan.md` の「HILの前提と段階」を参照。
+`bxi_hardware_stream_1khz.yaml` と `controllers_1khz.yaml` で実機を動かす前に、毎回この節を確認し、その結果を試験のレポートに残す。前提と段階は、ワークスペース側の `docs/bxi/worker-hil/plans/2026-09-28-worker-stream-broadcast-plan.md` の「HILの前提と段階」を参照。
 
 **決まっていること（2026-09-29）**
 
@@ -173,7 +173,7 @@ vcan 上の値は、ホストのスケジューリングの比較であり、実
 
 **0以外の指令の範囲**
 
-2026-09-25 の HIL（classic・200 Hz・逐次）で使った値と、指令スクリプトの中止条件を上限にする。送受信分離・1 kHz では、2026-09-29 に次の値だけを使った。HIL 段階3の `ramp_command.py`（Kp 10・Kd 2・0.3 rad/s、0〜+0.2 rad）と、段階4の `ramp_command.py`（Kp 20・Kd 1、保持のみ）・`sine_command.py`（Kp 20・Kd 1、振幅 0.1 rad・0.5 Hz、摩擦の打ち消しなし）である（ワークスペース側の `docs/test-reports/2026-09-29-bxi-hil-stage3-ramp.md`、`2026-09-29-bxi-hil-stage4-sine.md`）。それより大きい振幅・周波数や摩擦の打ち消しはまだ使っていないので、小さい値から段階的に上げる。
+2026-09-25 の HIL（classic・200 Hz・逐次）で使った値と、指令スクリプトの中止条件を上限にする。送受信分離・1 kHz では、2026-09-29 に次の値だけを使った。HIL 段階3の `ramp_command.py`（Kp 10・Kd 2・0.3 rad/s、0〜+0.2 rad）と、段階4の `ramp_command.py`（Kp 20・Kd 1、保持のみ）・`sine_command.py`（Kp 20・Kd 1、振幅 0.1 rad・0.5 Hz、摩擦の打ち消しなし）である（ワークスペース側の `docs/bxi/worker-hil/reports/2026-09-29-hil-stage3-ramp.md`、`2026-09-29-hil-stage4-sine.md`）。それより大きい振幅・周波数や摩擦の打ち消しはまだ使っていないので、小さい値から段階的に上げる。
 
 | 項目 | 上限 | 根拠 |
 |---|---|---|
@@ -197,7 +197,7 @@ vcan 上の値は、ホストのスケジューリングの比較であり、実
 
 位置±1.65 rad、Kp20・Kd1、上乗せ／摩擦補償0、トルク保護式5 N·m（Kdを含む総トルク上限ではない）、電源24 V・電流制限5 A、周期・心拍・lease・disable等を維持する。旧0.05／0.1／0.15／0.2／0.3 Hzの設定・判定は変更しない。実速度は操作B全区間のbagで**事後に6.0 rad/s以内**を判定する。実速度6.0超・実位置±1.65超それ自体による自動停止はない。異常時は本人が先に電源出力を切る。NGは収録・停止の成否と分けて報告し、事後の基準緩和・同条件再試行を行わず、原因・対応のレビュー後に新しいpreflightで再開する。
 
-境界・controller全軌道と拒否試験、正常／操作B途中Ctrl+Cのvcan、復元可能rawを用意し、準備レビュー承認後に本人が実機を行う。実機前は0 radの物理姿勢、±1.65 rad全域の接触・配線巻き込みなし、重力負荷なし、電源出力スイッチへの即時アクセスを本人が実物で確認する。今回動画なし。実機結果は別途レビューする。ワークスペースの `docs/plans/20261002_bxi_90deg_05hz_plan.md` を参照。
+境界・controller全軌道と拒否試験、正常／操作B途中Ctrl+Cのvcan、復元可能rawを用意し、準備レビュー承認後に本人が実機を行う。実機前は0 radの物理姿勢、±1.65 rad全域の接触・配線巻き込みなし、重力負荷なし、電源出力スイッチへの即時アクセスを本人が実物で確認する。今回動画なし。実機結果は別途レビューする。ワークスペースの `docs/bxi/worker-hil/plans/2026-10-02-90deg-05hz-plan.md` を参照。
 
 0.5 Hzの最初の正常vcanは、既定50 msの模擬追従遅れにより約4.018秒でトルク保護中止となった。失敗原本を保存し、正常合格とは扱わない。vcan専用の模擬モーターは既定50 msを維持し、今回の正常経路／途中Ctrl+C検証だけ `--follow-time-constant-ms 10` を明示した。10 msは検証用の仮定で、実機の追従性能・安全性を示さない。実機controllerの保護値・軌道・旧設定を変更して通したものではない。時定数を条件JSON・emulator.logへ記録し、模擬ソース・実行ファイルSHA256も保存する。
 
@@ -207,7 +207,7 @@ vcan 上の値は、ホストのスケジューリングの比較であり、実
 
 位置±1.65 rad、Kp20・Kd1、上乗せ／摩擦補償0、トルク保護式5 N·m（Kdを含む総トルク上限ではない）、電源24 V・電流制限5 A、周期・心拍・lease・disable等を維持する。0.05／0.1／0.15／0.2 Hzの設定・判定は変更しない。実速度は操作B全区間のbagで**事後に3.5 rad/s以内**を判定する。実速度3.5超・実位置±1.65超それ自体に基づく自動停止はない。異常時は本人が先に電源出力を切る。NGは収録・停止の成否と分けて報告し、事後の閾値緩和・同条件再試行は行わず、原因・対応のレビュー後に新しいpreflightで再開する。
 
-CSV／bag境界試験、controller全軌道・拒否試験、正常／途中Ctrl+Cのvcanと復元可能rawを準備し、準備レビュー承認後に本人が実機を行う。実機前は0 radの物理姿勢、±1.65 rad全域の接触・配線巻き込みなし、重力で回る負荷なし、電源出力スイッチへの即時アクセスを本人が実物で確認する。今回動画なし。実機結果は別途レビューする。ワークスペースの `docs/plans/20261002_bxi_90deg_03hz_plan.md` を参照。
+CSV／bag境界試験、controller全軌道・拒否試験、正常／途中Ctrl+Cのvcanと復元可能rawを準備し、準備レビュー承認後に本人が実機を行う。実機前は0 radの物理姿勢、±1.65 rad全域の接触・配線巻き込みなし、重力で回る負荷なし、電源出力スイッチへの即時アクセスを本人が実物で確認する。今回動画なし。実機結果は別途レビューする。ワークスペースの `docs/bxi/worker-hil/plans/2026-10-02-90deg-03hz-plan.md` を参照。
 
 ### 2026-10-02追記：±90°・0.2 Hz専用の指令範囲
 
@@ -229,7 +229,7 @@ CSV／bag境界試験、controller全軌道・拒否試験、正常／途中Ctrl
 
 `can_timeout=0`なので（2026-10-21 に 200 ms にした FR の3台を除く）、ホスト停止・プロセス異常やCAN通信異常では最後の位置・Kp・Kdの指令が残り、±90°付近で力を出し続ける可能性がある。ソフトウェアの心拍・lease・disableだけではホスト故障時の停止を保証しない。制御できない動き、振動・異音、ホスト／指令プロセス異常、CAN ERROR-PASSIVE・bus-offなど通信経路に異常がある場合は**先に電源装置の出力を直ちに切る**。その後でランナー・launchを止める。通常の中止はCtrl+Cで脱力・disableを確認し、確認できなければ電源出力を切る。
 
-通信異常後は電源を切ったままログを保全し、電源・配線・CAN設定と状態を確認する。ERROR-ACTIVEへ戻ったことだけで試験を再開しない。原因と対処を確認・レビューしてから、新しいpreflightで再開する。自動再試行や閾値の緩和は行わない。手順・試験結果はワークスペースの `docs/plans/20261001_bxi_90deg_sine_plan.md` と `docs/test-reports/2026-10-01-bxi-90deg-validation.md` を参照する。
+通信異常後は電源を切ったままログを保全し、電源・配線・CAN設定と状態を確認する。ERROR-ACTIVEへ戻ったことだけで試験を再開しない。原因と対処を確認・レビューしてから、新しいpreflightで再開する。自動再試行や閾値の緩和は行わない。手順・試験結果はワークスペースの `docs/bxi/worker-hil/plans/2026-10-01-90deg-sine-plan.md` と `docs/bxi/worker-hil/reports/2026-10-01-90deg-validation.md` を参照する。
 
 
 **止めるとき**
@@ -290,7 +290,7 @@ ros2 run bxi_hardware bxi_probe --iface can0 --can-id 1 --format fd_brs --count 
   | tee /ws/log/bxi_probe_fd_brs_$(date +%Y%m%d_%H%M%S).log
 ```
 
-12軸・1 kHzの[事前検証計画](../../../docs/plans/20260927_bxi_1000hz_12axis_feasibility_plan.md)では、ベンダーCAN通信ガイド§3のFDブロードキャストを1軸で確認する。`bxi_probe` の `--broadcast` はCAN FDのID `0x7FF` にモーターID 1用の8バイト無トルク指令を載せる。最初は `--menu-only` を併用する。このモードはEscの後に個別IDへdisableを送り、モーターID 1のMIT応答がある場合だけ無トルク指令を送る。明示的に `02 MOTOR` が表示された場合は送らない。enableは送らない。文字の `STATE` 行がない場合はMENU表示の確認はできていないと記録する。2026-09-28の実機では、disableの応答はあったが `STATE` 行は出なかった。実機の固定・電源遮断手段・競合プロセス不在を確認し、まず短い低レート試験で応答の有無を記録する。モーターID 2以上や24バイトの3軸指令は、このオプションの対象外。
+12軸・1 kHzの[事前検証計画](../../../docs/bxi/worker-hil/plans/2026-09-27-1000hz-12axis-feasibility-plan.md)では、ベンダーCAN通信ガイド§3のFDブロードキャストを1軸で確認する。`bxi_probe` の `--broadcast` はCAN FDのID `0x7FF` にモーターID 1用の8バイト無トルク指令を載せる。最初は `--menu-only` を併用する。このモードはEscの後に個別IDへdisableを送り、モーターID 1のMIT応答がある場合だけ無トルク指令を送る。明示的に `02 MOTOR` が表示された場合は送らない。enableは送らない。文字の `STATE` 行がない場合はMENU表示の確認はできていないと記録する。2026-09-28の実機では、disableの応答はあったが `STATE` 行は出なかった。実機の固定・電源遮断手段・競合プロセス不在を確認し、まず短い低レート試験で応答の有無を記録する。モーターID 2以上や24バイトの3軸指令は、このオプションの対象外。
 
 `bxi_probe` は実送信開始間隔と有効応答取込間隔から、設定値とは別に実測Hzと間隔分布を表示する。`--menu-only` では無応答または送信失敗を検出した時点で追加の指令を止める。間隔の値はユーザー空間の単調時計によるもので、CAN上の送出・到着時刻ではない。
 
@@ -298,7 +298,7 @@ ros2 run bxi_hardware bxi_probe --iface can0 --can-id 1 --format fd_brs --count 
 
 実機の送受信分離診断は1 kHz・100周期で100送信/100応答・スキップ0だったが、応答取込間隔の最大は2.081 msだった。以後の出力にはカーネル受信時刻の間隔も表示し、受信がカーネルに届く段階の遅れとユーザー空間への取込遅れを分ける。カーネル受信時刻は`CLOCK_REALTIME`、送信開始とユーザー空間取込は単調時計なので、異なる時計の絶対値を直接比較しない。
 
-新表示を使った1 kHz・100周期の再測定でも100送信/100応答・スキップ0だったが、応答取込の最大間隔は2.009 ms、カーネル受信の最大間隔も2.011 msだった。平均送信1 kHzと全数応答だけで「毎1 msに新しいフィードバック」を達成したとは判断しない。ソフトウェア受信時刻はオンワイヤ到着時刻ではないため、モーター・アダプタ・ドライバの切り分けにはハードウェアタイムスタンプまたは外部計測が必要となる。[診断レポート](../../../docs/test-reports/2026-09-28-bxi-1000hz-feasibility.md)に現在の判定をまとめた。すべてdisable応答後、enableなしの試験である。
+新表示を使った1 kHz・100周期の再測定でも100送信/100応答・スキップ0だったが、応答取込の最大間隔は2.009 ms、カーネル受信の最大間隔も2.011 msだった。平均送信1 kHzと全数応答だけで「毎1 msに新しいフィードバック」を達成したとは判断しない。ソフトウェア受信時刻はオンワイヤ到着時刻ではないため、モーター・アダプタ・ドライバの切り分けにはハードウェアタイムスタンプまたは外部計測が必要となる。[診断レポート](../../../docs/bxi/worker-hil/reports/2026-09-28-1000hz-feasibility.md)に現在の判定をまとめた。すべてdisable応答後、enableなしの試験である。
 
 `peak_pciefd` の上流Linux 6.8ソースには、受信DMA割り込みの既定条件に約1 msの時限がある。原因かどうかは、次の診断で同じフレームのrawハードウェア受信間隔とソフトウェア受信間隔を比較する。新しい出力の「周期開始時の最新受信経過」は、制御側がその時点で読める最後のフィードバックの経過時間で、モーター内部の測定時刻は分からない。ハードウェア受信時刻が欠測すれば失敗扱いになる。実機の固定は確認済み。電源遮断は試験者が担当するが、その手段と直前の確認時刻を記録してから実行する。`restart-ms 100` の設定意図は未確認であり、bus-off後の自動復帰があり得る。
 
@@ -311,7 +311,7 @@ ros2 run bxi_hardware bxi_probe --iface can0 --can-id 1 --format fd_brs \
 
 2026-09-28の200 Hz実機結果は20送信/20応答、ハードウェア時刻20/20、ハードウェア受信間隔の中央値4.999 ms・最大5.119 msだった。周期開始時の最新受信経過は19件で中央値3.723 ms・最大3.859 ms（初回1件欠測）。この試験で時刻取得を確認した。電源遮断手段と確認時刻はまだ記録されていない。
 
-同条件の1 kHz・100周期では100送信/100応答、ハードウェア時刻100/100、送信スキップ0。ハードウェア受信間隔は0.911〜1.048 ms、カーネルソフトウェア受信間隔は0〜2.032 msだった。周期開始時の最新受信経過は最大1.712 ms、1 ms超過38/98。ハードウェア受信時刻付与後のホスト経路で受信のまとまりが発生している。受信DMA割り込み時限が有力な原因だが、変更前後の比較はまだ行っていない。詳しくは[診断レポート](../../../docs/test-reports/2026-09-28-bxi-1000hz-feasibility.md)。
+同条件の1 kHz・100周期では100送信/100応答、ハードウェア時刻100/100、送信スキップ0。ハードウェア受信間隔は0.911〜1.048 ms、カーネルソフトウェア受信間隔は0〜2.032 msだった。周期開始時の最新受信経過は最大1.712 ms、1 ms超過38/98。ハードウェア受信時刻付与後のホスト経路で受信のまとまりが発生している。受信DMA割り込み時限が有力な原因だが、変更前後の比較はまだ行っていない。詳しくは[診断レポート](../../../docs/bxi/worker-hil/reports/2026-09-28-1000hz-feasibility.md)。
 
 ```bash
 ros2 run bxi_hardware bxi_probe --iface can0 --can-id 1 --format fd_brs \
@@ -424,9 +424,9 @@ ros2 run bxi_hardware sine_command_cpp --amplitude 0.3 --frequency 0.2 --cycles 
 
 ### RT 軌道 controller（`bxi_hardware/HilTrajectoryController`）
 
-ramp と SIN 波の目標を、トピック経由のスクリプトではなく、controller_manager の `update()`（1 kHz）の中で毎周期計算する controller。計画はワークスペース側の `docs/plans/20260929_bxi_rt_trajectory_controller_plan.md`、vcan での結果は `docs/test-reports/2026-09-29-bxi-rt-trajectory-vcan-step4.md`（手順4、2026-09-30 に完了）。段階3R・4R用の `controllers_1khz_rt.yaml` で、2026-09-30 に実機の段階3R（ramp）・段階4R（SIN 波の最初の条件）に合格した（ワークスペース側の `docs/test-reports/2026-09-30-bxi-hil-stage3r-rt-ramp.md`・`2026-09-30-bxi-hil-stage4r-rt-sine.md`）。既存の `controllers_1khz.yaml` は変更していない。controller の一覧と組み合わせ方は [`docs/CONTROLLERS.md`](../docs/CONTROLLERS.md)。
+ramp と SIN 波の目標を、トピック経由のスクリプトではなく、controller_manager の `update()`（1 kHz）の中で毎周期計算する controller。計画はワークスペース側の `docs/bxi/worker-hil/plans/2026-09-29-rt-trajectory-controller-plan.md`、vcan での結果は `docs/bxi/worker-hil/reports/2026-09-29-rt-trajectory-vcan-step4.md`（手順4、2026-09-30 に完了）。段階3R・4R用の `controllers_1khz_rt.yaml` で、2026-09-30 に実機の段階3R（ramp）・段階4R（SIN 波の最初の条件）に合格した（ワークスペース側の `docs/bxi/worker-hil/reports/2026-09-30-hil-stage3r-rt-ramp.md`・`2026-09-30-hil-stage4r-rt-sine.md`）。既存の `controllers_1khz.yaml` は変更していない。controller の一覧と組み合わせ方は [`docs/CONTROLLERS.md`](../docs/CONTROLLERS.md)。
 
-- 実行環境：`single_joint_hil.launch.py` は `ros2_control_node` に `LD_BIND_NOW=1` を渡す（遅延バインディングのままだと、開始の周期の `update()` で動的リンカがシンボルを解決し、35〜92 µs かかった）。`controllers_1khz_rt.yaml` は controller_manager の更新スレッドを CPU 11 に、`bxi_hardware_stream_1khz.yaml` は送受信スレッドを CPU 9 に固定する（`cpu_affinity`・`thread_cpus`。ワークスペース側の `docs/plans/20260930_bxi_cpu_affinity_plan.md`）。vcan での `update()` の最大は 31.1 µs。
+- 実行環境：`single_joint_hil.launch.py` は `ros2_control_node` に `LD_BIND_NOW=1` を渡す（遅延バインディングのままだと、開始の周期の `update()` で動的リンカがシンボルを解決し、35〜92 µs かかった）。`controllers_1khz_rt.yaml` は controller_manager の更新スレッドを CPU 11 に、`bxi_hardware_stream_1khz.yaml` は送受信スレッドを CPU 9 に固定する（`cpu_affinity`・`thread_cpus`。ワークスペース側の `docs/bxi/worker-hil/plans/2026-09-30-cpu-affinity-plan.md`）。vcan での `update()` の最大は 31.1 µs。
 
 - 使うインターフェース：command は `<joint>/position`・`velocity`・`kp`・`kd`・`effort`、state は `<joint>/position`・`velocity`・`effort`（`joint1_command` と同じ command を使うので、同時には有効にできない）。
 - パラメータ：`joint`（既定 `joint1`）、`lower` / `upper`（±0.5 rad）、`max_kp`（20、30 まで）、`max_torque`（5 N·m）、`max_velocity`（2 rad/s）、`max_period`（5 ms）、`arm_timeout`（1 秒）、`record_tail`（0.5 秒）、`record_seconds`（120 秒）、`max_run_seconds`（60 秒）、`output_dir`（空なら環境変数 `BXI_WORKER_TIMING_DIR`）。

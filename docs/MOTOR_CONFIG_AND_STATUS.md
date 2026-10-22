@@ -47,7 +47,7 @@ BXI モーター（1軸の HIL では BXI7010-19、`can_id` 1）の設定とス�
 
 `bxi_hardware` が前提にしている設定（ID、`can_timeout`、MIT の範囲）は、交換の前後で同じだった。
 
-**`can_timeout` は、モーターごとに違うことがある。** FRの3台（SN-0016／0014／0010、ID 1〜3）は、2026-10-21 に 200 ms に設定した（ワークスペース側の `docs/test-reports/2026-10-21-bxi-can-timeout-c1-c6.md`）。ほかのモーターは 0 として扱い、`scripts/bxi_can_timeout.py read` で確かめる。意味は [`PROTOCOL_AND_SAFETY.md`](PROTOCOL_AND_SAFETY.md) の「モーター側の通信の期限」。
+**`can_timeout` は、モーターごとに違うことがある。** FRの3台（SN-0016／0014／0010、ID 1〜3）は、2026-10-21 に 200 ms に設定した（ワークスペース側の `docs/bxi/fr-leg-champ-jtc/reports/2026-10-21-can-timeout-c1-c6.md`）。ほかのモーターは 0 として扱い、`scripts/bxi_can_timeout.py read` で確かめる。意味は [`PROTOCOL_AND_SAFETY.md`](PROTOCOL_AND_SAFETY.md) の「モーター側の通信の期限」。
 
 `bxi_hardware` には、モーター本体の設定を読む機能はない。ワークスペースの `scripts/` に、CAN で文字コマンドを使うスクリプトがある（[`scripts/README.md`](../../../scripts/README.md)）。**設定の一覧は、文字コマンド `s` で読む**（下記「文字コマンドで読む」）。
 

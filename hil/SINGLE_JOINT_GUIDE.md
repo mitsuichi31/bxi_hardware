@@ -151,9 +151,9 @@ ros2 run bxi_hardware hil_trajectory.py --kp 20 --kd 1 --amplitude 0.1 --frequen
 
 | スクリプト | 内容 | 手順書（ワークスペース側） |
 |---|---|---|
-| `tools/hil_stage3.sh` | 段階3：`ramp_command.py` で保持 → +0.2 rad → 0 rad（Kp 10・Kd 2） | [`docs/plans/20260929_bxi_hil_stage3_procedure.md`](../../../docs/plans/20260929_bxi_hil_stage3_procedure.md) |
-| `tools/hil_stage4.sh` | 段階4：保持と `sine_command.py` の SIN 波（Kp 20・Kd 1、0.1 rad・0.5 Hz） | [`docs/plans/20260929_bxi_hil_stage4_procedure.md`](../../../docs/plans/20260929_bxi_hil_stage4_procedure.md) |
-| `tools/hil_stage3r.sh` | 段階3R：段階3と同じ動きを RT 軌道 controller で | [`docs/plans/20260930_bxi_hil_stage3r_4r_procedure.md`](../../../docs/plans/20260930_bxi_hil_stage3r_4r_procedure.md) |
+| `tools/hil_stage3.sh` | 段階3：`ramp_command.py` で保持 → +0.2 rad → 0 rad（Kp 10・Kd 2） | [`docs/bxi/worker-hil/procedures/2026-09-29-hil-stage3-procedure.md`](../../../docs/bxi/worker-hil/procedures/2026-09-29-hil-stage3-procedure.md) |
+| `tools/hil_stage4.sh` | 段階4：保持と `sine_command.py` の SIN 波（Kp 20・Kd 1、0.1 rad・0.5 Hz） | [`docs/bxi/worker-hil/procedures/2026-09-29-hil-stage4-procedure.md`](../../../docs/bxi/worker-hil/procedures/2026-09-29-hil-stage4-procedure.md) |
+| `tools/hil_stage3r.sh` | 段階3R：段階3と同じ動きを RT 軌道 controller で | [`docs/bxi/worker-hil/procedures/2026-09-30-hil-stage3r-4r-procedure.md`](../../../docs/bxi/worker-hil/procedures/2026-09-30-hil-stage3r-4r-procedure.md) |
 | `tools/hil_stage4r.sh` | 段階4R：段階4と同じ動きを RT 軌道 controller で | 同上 |
 
 ```bash
@@ -206,7 +206,7 @@ tools/hil_stage3r.sh            # 例
 - [`../docs/CONTROLLERS.md`](../docs/CONTROLLERS.md)：controller の一覧と違い
 - [`../docs/MOTOR_CONFIG_AND_STATUS.md`](../docs/MOTOR_CONFIG_AND_STATUS.md)：モーターの設定（yaml とモーター本体）とステータスの確認方法
 - [`../docs/PROTOCOL_AND_SAFETY.md`](../docs/PROTOCOL_AND_SAFETY.md)：MIT プロトコルと安全上の判断
-- ワークスペース側の `docs/test-reports/`：各段階の試験レポート
+- ワークスペース側の `docs/bxi/worker-hil/reports/`：各段階の試験レポート
 
 ## 起動ログの見方
 

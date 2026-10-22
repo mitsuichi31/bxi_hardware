@@ -16,7 +16,7 @@
 - 上限：Kp 20（最大 30）、Kp × \|目標 − 位置\| + \|上乗せ\| 5 N·m、目標速度 2 rad/s、位置 ±0.5 rad、周期 5 ms、1回の実行 60 秒。中止・停止ではその周期のうちに Kp=Kd=0 を書く。
 - 記録：毎周期の記録（最大120秒分）を CSV に書き出す。
 - 試験専用のパラメータ `test_fault.start_delay`・`stop_delay`・`finish_delay`（サービスの遅延）は、`BXI_ALLOW_TEST_FAULTS=1` のときだけ使える。
-- 詳細は [`hil/README.md`](../hil/README.md) の「RT 軌道 controller」。計画と結果はワークスペース側の `docs/plans/20260929_bxi_rt_trajectory_controller_plan.md` と `docs/test-reports/2026-09-30-bxi-hil-stage3r-rt-ramp.md`・`2026-09-30-bxi-hil-stage4r-rt-sine.md`。
+- 詳細は [`hil/README.md`](../hil/README.md) の「RT 軌道 controller」。計画と結果はワークスペース側の `docs/bxi/worker-hil/plans/2026-09-29-rt-trajectory-controller-plan.md` と `docs/bxi/worker-hil/reports/2026-09-30-hil-stage3r-rt-ramp.md`・`2026-09-30-hil-stage4r-rt-sine.md`。
 
 ## 2. 設定で使っている外部の controller（ros2_controllers）
 

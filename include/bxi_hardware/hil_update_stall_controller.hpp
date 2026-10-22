@@ -5,7 +5,7 @@
 //
 // It claims no interfaces. It is built into its own library (bxi_hil_test_controllers) and
 // refuses to configure unless BXI_ALLOW_TEST_FAULTS=1 (only the explicit vcan test path sets it).
-// Plan: docs/plans/20260929_bxi_rt_trajectory_controller_plan.md, step 4 (workspace).
+// Plan: docs/bxi/worker-hil/plans/2026-09-29-rt-trajectory-controller-plan.md, step 4 (workspace).
 #ifndef BXI_HARDWARE__HIL_UPDATE_STALL_CONTROLLER_HPP_
 #define BXI_HARDWARE__HIL_UPDATE_STALL_CONTROLLER_HPP_
 
