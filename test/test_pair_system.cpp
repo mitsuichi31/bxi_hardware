@@ -149,6 +149,74 @@ hardware_interface::HardwareInfo info(bool pair = true, bool gpio = true, size_t
   return h;
 }
 
+hardware_interface::HardwareInfo busInfo(const std::string & bus)
+{
+  auto h = info();
+  const auto path = h.hardware_parameters["config_file"];
+  std::ifstream input(path);
+  std::string text((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+  size_t at = 0;
+  while ((at = text.find("can0", at)) != std::string::npos) {
+    text.replace(at, 4, bus); at += bus.size();
+  }
+  std::ofstream output(path); output << text; output.close();
+  return h;
+}
+
+TEST(PairFourBus, AcceptSingleNamedBusAndDefaultGpio)
+{
+  for (const auto & bus : {"can0", "can1", "can2", "can3"}) {
+    auto h = busInfo(bus); BxiSystemInterface system;
+    ASSERT_EQ(system.on_init(h), H::SUCCESS);
+    auto commands = system.export_command_interfaces();
+    EXPECT_EQ(commands.back().get_name(), "bxi_pair/commit_generation");
+  }
+}
+
+TEST(PairFourBus, RejectTwoBuses)
+{
+  auto h = busInfo("can0");
+  const auto path = h.hardware_parameters["config_file"];
+  std::ifstream input(path); std::string text((std::istreambuf_iterator<char>(input)), {});
+  text.replace(text.find("active_can_buses: [can0]"), 24, "active_can_buses: [can0, can1]");
+  std::ofstream output(path); output << text; output.close();
+  BxiSystemInterface system; EXPECT_EQ(system.on_init(h), H::ERROR);
+}
+
+TEST(PairFourBus, RejectJointOnDifferentBus)
+{
+  auto h = busInfo("can1");
+  const auto path = h.hardware_parameters["config_file"];
+  std::ifstream input(path); std::string text((std::istreambuf_iterator<char>(input)), {});
+  const auto at = text.find("can_bus: can1"); text.replace(at, 13, "can_bus: can0");
+  std::ofstream output(path); output << text; output.close();
+  BxiSystemInterface system; EXPECT_EQ(system.on_init(h), H::ERROR);
+}
+
+TEST(PairFourBus, NamedGpioExportsAndCommitClaim)
+{
+  auto h = busInfo("can3"); h.hardware_parameters["pair_gpio_name"] = "bxi_pair_BL";
+  h.gpios[0].name = "bxi_pair_BL"; BxiSystemInterface system;
+  ASSERT_EQ(system.on_init(h), H::SUCCESS);
+  auto commands = system.export_command_interfaces(); auto states = system.export_state_interfaces();
+  EXPECT_EQ(commands.back().get_name(), "bxi_pair_BL/commit_generation");
+  EXPECT_EQ(states.back().get_name(), "bxi_pair_BL/accepted_generation");
+  std::vector<std::string> keys;
+  for (const auto & command : commands) {keys.push_back(command.get_name());}
+  EXPECT_EQ(system.prepare_command_mode_switch(keys, {}), Ret::OK);
+  keys.back() = "bxi_pair/commit_generation";
+  EXPECT_EQ(system.prepare_command_mode_switch(keys, {}), Ret::ERROR);
+}
+
+TEST(PairFourBus, RejectInvalidGpioNames)
+{
+  for (const auto & name : {"", "1pair", "pair/name", "pair-name", "pair name"}) {
+    auto h = info(); h.hardware_parameters["pair_gpio_name"] = name; h.gpios[0].name = name;
+    BxiSystemInterface system; EXPECT_EQ(system.on_init(h), H::ERROR);
+  }
+}
+
+
 std::vector<std::string> keys(BxiSystemInterface & system)
 {
   std::vector<std::string> result;

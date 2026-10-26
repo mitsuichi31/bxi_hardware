@@ -138,6 +138,14 @@ def check_adapter(directory, urdf, *, real_configuration=False):
     try:
         directory = Path(directory)
         profile = yaml.safe_load((directory / 'bxi_champ_jtc_legs.yaml').read_text())
+        if profile.get('profile','').startswith('robot_'):
+            from ament_index_python.packages import get_package_share_directory
+            path=Path(get_package_share_directory('minibexkai_bringup'))/'scripts/robot_champ_profile.py'
+            from importlib import util as robot_import_util
+            spec=robot_import_util.spec_from_file_location('robot_profile_checker',path)
+            module=robot_import_util.module_from_spec(spec);spec.loader.exec_module(module)
+            return module.check_generated(directory,urdf,real_configuration)
+
         controllers = yaml.safe_load((directory / 'controllers.yaml').read_text())
         root = ET.parse(urdf).getroot()
         real_profiles = ('stage5_real_zero_gain', 'stage6_real_gain20', 'stage8_real_walk', 'stage8v_real_velocity')

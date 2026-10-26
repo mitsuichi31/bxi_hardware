@@ -195,6 +195,17 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_init(
     return hardware_interface::CallbackReturn::ERROR;
   }
   pair_mode_ = mode == "pair_generation_v1";
+  pair_gpio_name_ = get_param("pair_gpio_name", "bxi_pair");
+  const auto initial = [](char c) {
+      return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_';
+    };
+  if (pair_gpio_name_.empty() || !initial(pair_gpio_name_[0]) ||
+    !std::all_of(pair_gpio_name_.begin(), pair_gpio_name_.end(), [&](char c) {
+      return initial(c) || (c >= '0' && c <= '9');
+    }))
+  {
+    return hardware_interface::CallbackReturn::ERROR;
+  }
   n_joints_ = info_.joints.size();
   joints_.resize(n_joints_);
 
@@ -627,7 +638,7 @@ BxiSystemInterface::export_state_interfaces()
     v.emplace_back(name, HW_IF_TEMPERATURE, &st_temp_[i]);
   }
   if (pair_mode_) {
-    v.emplace_back("bxi_pair", "accepted_generation", &pair_accepted_);
+    v.emplace_back(pair_gpio_name_, "accepted_generation", &pair_accepted_);
   }
   return v;
 }
@@ -645,7 +656,7 @@ BxiSystemInterface::export_command_interfaces()
     v.emplace_back(name, hardware_interface::HW_IF_EFFORT, &cmd_eff_[i]);
   }
   if (pair_mode_) {
-    v.emplace_back("bxi_pair", "commit_generation", &pair_generation_);
+    v.emplace_back(pair_gpio_name_, "commit_generation", &pair_generation_);
   }
   return v;
 }

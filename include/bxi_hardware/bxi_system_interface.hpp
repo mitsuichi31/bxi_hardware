@@ -179,6 +179,7 @@ private:
   void notifyPairSafety();
   hardware_interface::return_type writePair(int64_t now);
   void savePairRecords();
+  std::string pair_gpio_name_ = "bxi_pair";
   bool pair_mode_ = false;
   std::atomic<bool> pair_claimed_{false}, pair_terminal_{false};
   double pair_generation_ = 0, pair_accepted_ = 0;

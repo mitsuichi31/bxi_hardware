@@ -54,7 +54,7 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_configure(
 bool BxiSystemInterface::configurePair()
 {
   const auto gpio = std::find_if(info_.gpios.begin(), info_.gpios.end(),
-      [](const auto & item) {return item.name == "bxi_pair";});
+      [this](const auto & item) {return item.name == pair_gpio_name_;});
   if (!pair_mode_) {
     return gpio == info_.gpios.end();
   }
@@ -65,12 +65,14 @@ bool BxiSystemInterface::configurePair()
     gpio->command_interfaces[0].data_type != "double" ||
     gpio->state_interfaces[0].data_type != "double" ||
     n_joints_<2 || n_joints_> PairCommit::kMaxAxes ||
-    active_buses_.size() != 1 || active_buses_[0] != "can0" ||
-    bus_formats_.at("can0") != CanFrameFormat::kFdBrs)
+    active_buses_.size() != 1 ||
+    (active_buses_[0] != "can0" && active_buses_[0] != "can1" &&
+    active_buses_[0] != "can2" && active_buses_[0] != "can3") ||
+    bus_formats_.at(active_buses_[0]) != CanFrameFormat::kFdBrs)
   {
     return false;
   }
-  const auto bus = bus_transport_.find("can0");
+  const auto bus = bus_transport_.find(active_buses_[0]);
   if (bus == bus_transport_.end() || !bus->second.separate || !bus->second.broadcast ||
     !bus->second.write_triggered || !bus->second.direct_feedback || can_hz_ != 1000 ||
     bus->second.stream_command_max_age_ms != 5.0 || bus->second.stream_feedback_max_age_ms != 3.0)
@@ -91,7 +93,7 @@ bool BxiSystemInterface::configurePair()
   for (size_t axis = 0; axis < n_joints_; ++axis) {
     const auto & joint = info_.joints[axis];
     const auto & runtime = joints_[axis];
-    if (runtime.can_bus != "can0" ||
+    if (runtime.can_bus != active_buses_[0] ||
       !runtime.enabled || runtime.can_id != static_cast<int>(axis + 1) ||
       joint.command_interfaces.size() != 5 || !loadSpec(runtime.motor_type))
     {
@@ -138,7 +140,7 @@ bool BxiSystemInterface::configurePair()
   if (!pair_commit_.axes(n_joints_)) {
     return false;
   }
-  pair_keys_[pair_commit_.valueCount()] = "bxi_pair/commit_generation";
+  pair_keys_[pair_commit_.valueCount()] = pair_gpio_name_ + "/commit_generation";
   pair_commit_.bounds(bounds);
   return true;
 }
