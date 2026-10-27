@@ -320,7 +320,6 @@ BxiPairAdapter::Ret BxiPairAdapter::update_and_write_commands(
   }
   if (row.state_ok != ((uint64_t{1} << state_keys_.size()) - 1)) row.reason = 1;
   if (!std::isfinite(row.dt) || row.dt <= 0 || row.dt > max_period_) row.reason = 2;
-  if (count_ >= rows_.size()) row.reason = 3;
   bool boot = false;
   for (size_t h = 0; h < group_count_; ++h) {
     const auto & hardware_group = groups_[h];
@@ -455,6 +454,7 @@ void BxiPairAdapter::save() noexcept
       ++h)
       manifest << "hardware," << h << ',' << groups_[h].name << ',' << groups_[h].gpio << '\n';
     manifest << "row_bytes,0,Row," << sizeof(Row) << "\ncapacity,0,rows," << rows_.size() << '\n';
+    // Reason 3 is retained for compatibility but is no longer emitted.
     manifest <<
       "reason,0,none,OK\nreason,1,state,unavailable\nreason,2,period,invalid\nreason,3,capacity,full\nreason,4,accepted,mismatch\nreason,5,position_or_reference,invalid\nreason,6,delta_or_velocity,exceeded\nreason,7,torque,exceeded\nreason,8,deviation,exceeded\nreason,9,temperature,exceeded\nreason,10,write_readback,failed\nreason,11,generation,exhausted\n";
     auto emit = [&](const Row & recorded_row){

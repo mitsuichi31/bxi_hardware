@@ -436,4 +436,55 @@ TEST_F(Adapter, VelocityCsvValuesAndReasons)
   }
 }
 
+TEST_F(Adapter, FullRecordingContinuesNormalOutputAndCountsDroppedCycles)
+{
+  const auto directory = std::filesystem::temp_directory_path() /
+    ("bxi_capacity_normal_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+  Rig rig(1, 3, -1, false, false, directory.string());
+  ASSERT_EQ(rig.activate(), CB::SUCCESS);
+  for (int cycle = 1; cycle <= 30; ++cycle) {
+    if (cycle > 1) rig.references[0]->set_value((cycle - 1) * .0001);
+    ASSERT_EQ(rig.step(), Ret::OK);
+    EXPECT_NEAR(rig.commands[0], (cycle - 1) * .0001, 1e-14);
+    EXPECT_EQ(rig.commands[15], cycle);
+    if (cycle > 1) EXPECT_EQ(rig.commands[2], 10.);
+    rig.ack();
+  }
+  rig.controller.on_deactivate(rclcpp_lifecycle::State());
+  ASSERT_EQ(rig.controller.on_cleanup(rclcpp_lifecycle::State()), CB::SUCCESS);
+  const auto cycles = readCsv(directory / "cycles.csv");
+  ASSERT_EQ(cycles.size(), 22U);
+  for (size_t i = 1; i < cycles.size(); ++i) {
+    EXPECT_EQ(std::stoi(cycles[i][6]), 0);
+    EXPECT_EQ(std::stoi(cycles[i][9]), 10);
+    EXPECT_EQ(std::stoi(cycles[i][2]), i <= 20 ? static_cast<int>(i) : 30);
+  }
+  std::filesystem::remove_all(directory);
+}
+
+TEST_F(Adapter, FullRecordingStillReleasesOnVelocityLimit)
+{
+  const auto directory = std::filesystem::temp_directory_path() /
+    ("bxi_capacity_limit_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+  Rig rig(1, 3, -1, false, true, directory.string());
+  ASSERT_EQ(rig.activate(), CB::SUCCESS);
+  for (int cycle = 1; cycle < 25; ++cycle) {
+    ASSERT_EQ(rig.step(), Ret::OK);
+    rig.ack();
+  }
+  rig.references[3]->set_value(.700001);
+  EXPECT_EQ(rig.step(), Ret::ERROR);
+  for (size_t axis = 0; axis < 3; ++axis) {
+    for (size_t field = 1; field < 5; ++field) EXPECT_EQ(rig.commands[5 * axis + field], 0.);
+  }
+  rig.controller.on_deactivate(rclcpp_lifecycle::State());
+  ASSERT_EQ(rig.controller.on_cleanup(rclcpp_lifecycle::State()), CB::SUCCESS);
+  const auto cycles = readCsv(directory / "cycles.csv");
+  ASSERT_EQ(cycles.size(), 22U);
+  EXPECT_EQ(std::stoi(cycles.back()[2]), 25);
+  EXPECT_EQ(std::stoi(cycles.back()[6]), 6);
+  EXPECT_EQ(std::stoi(cycles.back()[9]), 5);
+  std::filesystem::remove_all(directory);
+}
+
 }
