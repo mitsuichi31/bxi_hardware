@@ -86,6 +86,7 @@ struct PairSystemTestAccess
     }
   }
 
+  static std::string timingDirectory(const BxiSystemInterface & s) {return s.worker_timing_dir_;}
   static bool safetySaved(const BxiSystemInterface & s) {return s.pair_safety_saved_;}
   static bool staleSaved(const BxiSystemInterface & s) {return s.pair_feedback_stale_saved_;}
   static size_t recordCapacity(const BxiSystemInterface & s) {return s.pair_records_.size();}
@@ -1885,6 +1886,64 @@ TEST(ActivationRemaining, TraceSaveFailureDoesNotChangeSuccessfulActivation)
     system.on_deactivate(rclcpp_lifecycle::State());
     EXPECT_EQ(std::filesystem::is_regular_file(directory + "/activation_trace.csv"), !blocked);
   }
+}
+
+// No socket: fail at the bus boundary after recording-directory selection.
+class TimingDirectoryProbe : public BxiSystemInterface
+{
+public:
+  std::string selected;
+protected:
+  std::shared_ptr<CanBus> makeBus(CanFrameFormat) override
+  {
+    selected = PairSystemTestAccess::timingDirectory(*this);
+    throw std::runtime_error("directory test stops before CAN open");
+  }
+};
+
+TEST(WorkerTimingDirectory, ParameterOverridesEnvironment)
+{
+  const auto environment = freshDirectory("timing_env");
+  const auto parameter = freshDirectory("timing_param");
+  EnvGuard env("BXI_WORKER_TIMING_DIR", environment.c_str());
+  TimingDirectoryProbe system;
+  auto hardware = info(); hardware.hardware_parameters["worker_timing_dir"] = parameter;
+  ASSERT_EQ(system.on_init(hardware), H::SUCCESS);
+  EXPECT_EQ(system.on_activate(rclcpp_lifecycle::State()), H::ERROR);
+  EXPECT_EQ(system.selected, parameter);
+  EXPECT_TRUE(std::filesystem::is_regular_file(parameter + "/activation_trace.csv"));
+  EXPECT_FALSE(std::filesystem::exists(environment + "/activation_trace.csv"));
+}
+
+TEST(WorkerTimingDirectory, AbsentParameterKeepsEnvironment)
+{
+  const auto directory = freshDirectory("timing_fallback");
+  EnvGuard env("BXI_WORKER_TIMING_DIR", directory.c_str());
+  TimingDirectoryProbe system;
+  ASSERT_EQ(system.on_init(info()), H::SUCCESS);
+  EXPECT_EQ(system.on_activate(rclcpp_lifecycle::State()), H::ERROR);
+  EXPECT_EQ(system.selected, directory);
+  EXPECT_TRUE(std::filesystem::is_regular_file(directory + "/activation_trace.csv"));
+}
+
+TEST(WorkerTimingDirectory, TwoHardwareInstancesWriteAllThreeRecordsSeparately)
+{
+  const auto environment = freshDirectory("timing_unused");
+  EnvGuard env("BXI_WORKER_TIMING_DIR", environment.c_str());
+  for (const auto & name : {"timing_first", "timing_second"}) {
+    const auto directory = freshDirectory(name);
+    TimingDirectoryProbe system;
+    auto hardware = info(); hardware.hardware_parameters["worker_timing_dir"] = directory;
+    ASSERT_EQ(system.on_init(hardware), H::SUCCESS);
+    EXPECT_EQ(system.on_activate(rclcpp_lifecycle::State()), H::ERROR);
+    ASSERT_EQ(system.selected, directory);
+    PairSystemTestAccess::seedSafety(system, system.selected, true, true);
+    PairSystemTestAccess::release(system);
+    for (const auto & file : {"activation_trace.csv", "pair_safety.csv", "pair_feedback_stale.csv"}) {
+      EXPECT_GT(std::filesystem::file_size(directory + "/" + file), 0U);
+    }
+  }
+  EXPECT_FALSE(std::filesystem::exists(environment + "/activation_trace.csv"));
 }
 
 }  // namespace

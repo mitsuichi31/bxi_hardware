@@ -730,7 +730,9 @@ hardware_interface::CallbackReturn BxiSystemInterface::on_activate(
     };
   try {
     const char * timing_dir = std::getenv("BXI_WORKER_TIMING_DIR");
-    worker_timing_dir_ = timing_dir == nullptr ? "" : timing_dir;
+    const auto parameter = info_.hardware_parameters.find("worker_timing_dir");
+    worker_timing_dir_ = parameter != info_.hardware_parameters.end() ?
+      parameter->second : (timing_dir == nullptr ? "" : timing_dir);
     activation_trace.directory = worker_timing_dir_;
     if (pair_mode_) {
       RCLCPP_INFO(logger(),
