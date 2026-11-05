@@ -72,7 +72,8 @@ struct Rig
   Controller controller;
   size_t hardware_count, axes_count;
   Rig(size_t hardware = 1, size_t axes = 3, int mutation = -1, bool state_mutation = false,
-    bool velocity_feedforward = false, const std::string & output = "")
+    bool velocity_feedforward = false, const std::string & output = "",
+    double kp = 10., double torque_limit = 5.)
   :hardware_count(hardware), axes_count(axes)
   {
     std::vector<rclcpp::Parameter> params;
@@ -88,8 +89,8 @@ struct Rig
         const std::string parameter_prefix = "joint_settings." + joint_name + ".";
         for (auto parameter_entry: std::vector<std::pair<std::string, double>>{{"position_min",
             -1.},
-            {"position_max", 1.}, {"velocity_limit", .7}, {"kp", 10.}, {"kd", 1.}, {"kp_max", 20.},
-            {"kd_max", 1.}, {"max_target_delta_per_cycle", .001}, {"torque_limit", 5.},
+            {"position_max", 1.}, {"velocity_limit", .7}, {"kp", kp}, {"kd", 1.}, {"kp_max", std::max(20., kp)},
+            {"kd_max", 1.}, {"max_target_delta_per_cycle", .001}, {"torque_limit", torque_limit},
             {"deviation_limit_rad", .7}, {"temperature_limit_c", 75.}})
           params.emplace_back(parameter_prefix + parameter_entry.first, parameter_entry.second);
         params.emplace_back(parameter_prefix + "deviation_cycles", 15);
@@ -251,7 +252,7 @@ TEST_F(Adapter, AllSetterAndReadbackFailuresLatchAndNeverRetry)
     }
 }
 
-TEST_F(Adapter, FrozenAcceptedAndRangeDeltaTorqueTemperatureAndNonfiniteStop)
+TEST_F(Adapter, FrozenAcceptedAndRangeDeltaTemperatureNonfiniteStopAndTorqueClamp)
 {
   {
     Rig rig;
@@ -269,7 +270,11 @@ TEST_F(Adapter, FrozenAcceptedAndRangeDeltaTorqueTemperatureAndNonfiniteStop)
     if (fault == 2) rig.state[0] = -.6;
     if (fault == 3) rig.state[3] = 75.;
     if (fault == 4) rig.references[0]->set_value(std::numeric_limits<double>::infinity());
-    EXPECT_EQ(rig.step(), Ret::ERROR);
+    EXPECT_EQ(rig.step(), fault == 2 ? Ret::OK : Ret::ERROR);
+    if (fault == 2) {
+      EXPECT_NEAR(rig.commands[0], -.1, 1e-14);
+      EXPECT_EQ(rig.commands[2], 10.);
+    }
   }
 }
 
@@ -417,7 +422,7 @@ TEST_F(Adapter, VelocityCsvValuesAndReasons)
     ASSERT_EQ(rig.controller.on_cleanup(rclcpp_lifecycle::State()), CB::SUCCESS);
     const auto rows = readCsv(directory / "joint_cycles.csv");
     ASSERT_GE(rows.size(), 7U);
-    ASSERT_EQ(rows[0].size(), 16U);
+    ASSERT_EQ(rows[0].size(), 18U);
     EXPECT_EQ(rows[0][13], "reference_velocity_raw");
     EXPECT_EQ(rows[0][14], "target_velocity");
     EXPECT_EQ(rows[0][15], "torque_proxy_with_kd");
@@ -485,6 +490,121 @@ TEST_F(Adapter, FullRecordingStillReleasesOnVelocityLimit)
   EXPECT_EQ(std::stoi(cycles.back()[6]), 6);
   EXPECT_EQ(std::stoi(cycles.back()[9]), 5);
   std::filesystem::remove_all(directory);
+}
+
+
+TEST_F(Adapter, TorqueClampTracksFastMeasurementButChecksUpstreamDelta)
+{
+  for (double sign : {-1., 1.}) {
+    Rig rig;
+    ASSERT_EQ(rig.activate(), CB::SUCCESS);
+    ASSERT_EQ(rig.step(), Ret::OK);
+    rig.ack();
+    for (double magnitude : {.6, .62, .7}) {
+      rig.state[0] = sign * magnitude;
+      ASSERT_EQ(rig.step(), Ret::OK);
+      EXPECT_NEAR(rig.commands[0], sign * (magnitude - .5), 1e-14);
+      EXPECT_EQ(rig.commands[2], 10.);
+      rig.ack();
+    }
+    rig.references[0]->set_value(.002);
+    EXPECT_EQ(rig.step(), Ret::ERROR);
+    EXPECT_EQ(rig.commands[2], 0.);
+  }
+}
+
+TEST_F(Adapter, TorqueClampKeepsDeviationProtectionOnOriginalTarget)
+{
+  Rig rig;
+  ASSERT_EQ(rig.activate(), CB::SUCCESS);
+  ASSERT_EQ(rig.step(), Ret::OK);
+  rig.ack();
+  rig.state[0] = -.7;
+  for (int cycle = 0; cycle < 16; ++cycle) {
+    ASSERT_EQ(rig.step(), Ret::OK);
+    rig.ack();
+  }
+  rig.state[0] = -.71;
+  for (int cycle = 1; cycle <= 15; ++cycle) {
+    EXPECT_EQ(rig.step(), cycle == 15 ? Ret::ERROR : Ret::OK);
+    if (cycle < 15) EXPECT_NEAR(rig.commands[0], -.21, 1e-14);
+    else EXPECT_EQ(rig.commands[2], 0.);
+    rig.ack();
+  }
+}
+
+TEST_F(Adapter, TorqueClampBoundsAndBoot)
+{
+  for (double sign : {-1., 1.}) {
+    Rig rig;
+    rig.state[0] = sign;
+    ASSERT_EQ(rig.activate(), CB::SUCCESS);
+    rig.references[0]->set_value(-sign);
+    ASSERT_EQ(rig.step(), Ret::OK);
+    EXPECT_EQ(rig.commands[0], sign);
+    EXPECT_EQ(rig.commands[2], 0.);
+    rig.ack();
+    rig.references[0]->set_value(sign * .9995);
+    rig.state[0] = sign * .3995;
+    ASSERT_EQ(rig.step(), Ret::OK);
+    EXPECT_NEAR(rig.commands[0], sign * .8995, 1e-14);
+    EXPECT_LE(rig.commands[0], 1.);
+    EXPECT_GE(rig.commands[0], -1.);
+  }
+}
+
+TEST_F(Adapter, TorqueClampCsvPreservesRequestedTargetAndDoesNotLimitKd)
+{
+  const auto directory = std::filesystem::temp_directory_path() /
+    ("bxi_torque_clamp_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+  Rig rig(1, 3, -1, false, true, directory.string());
+  ASSERT_EQ(rig.activate(), CB::SUCCESS);
+  ASSERT_EQ(rig.step(), Ret::OK);
+  rig.ack();
+  rig.references[0]->set_value(0.);
+  rig.state[0] = -.6;
+  rig.state[1] = -2.;
+  rig.references[3]->set_value(.5);
+  ASSERT_EQ(rig.step(), Ret::OK);
+  EXPECT_NEAR(rig.commands[0], -.1, 1e-14);
+  EXPECT_EQ(rig.commands[1], .5);
+  rig.ack();
+  rig.state[0] = -.2;
+  ASSERT_EQ(rig.step(), Ret::OK);
+  EXPECT_EQ(rig.commands[0], 0.);
+  rig.controller.on_deactivate(rclcpp_lifecycle::State());
+  ASSERT_EQ(rig.controller.on_cleanup(rclcpp_lifecycle::State()), CB::SUCCESS);
+  const auto rows = readCsv(directory / "joint_cycles.csv");
+  ASSERT_EQ(rows[0].size(), 18U);
+  EXPECT_EQ(rows[0][16], "command");
+  EXPECT_EQ(rows[0][17], "torque_limited");
+  EXPECT_EQ(std::stod(rows[4][7]), 0.);
+  EXPECT_EQ(std::stod(rows[4][11]), 6.);
+  EXPECT_NEAR(std::stod(rows[4][15]), 7.5, 1e-14);
+  EXPECT_NEAR(std::stod(rows[4][16]), -.1, 1e-14);
+  EXPECT_EQ(rows[4][17], "1");
+  EXPECT_EQ(rows[7][17], "0");
+  EXPECT_EQ(std::stod(rows[7][16]), std::stod(rows[7][7]));
+  const auto cycles = readCsv(directory / "cycles.csv");
+  for (size_t i = 1; i < cycles.size(); ++i) {
+    EXPECT_EQ(cycles[i][0], "2");
+    EXPECT_EQ(cycles[i][6], "0");
+  }
+  std::filesystem::remove_all(directory);
+}
+
+TEST_F(Adapter, TorqueClampHandlesZeroKpAndFloor50Nm)
+{
+  for (double kp : {0., 100.}) {
+    Rig rig(1, 3, -1, false, false, "", kp, 50.);
+    ASSERT_EQ(rig.activate(), CB::SUCCESS);
+    ASSERT_EQ(rig.step(), Ret::OK);
+    rig.ack();
+    rig.state[0] = -.6;
+    ASSERT_EQ(rig.step(), Ret::OK);
+    EXPECT_NEAR(rig.commands[0], kp == 0. ? 0. : -.1, 1e-14);
+    EXPECT_EQ(rig.commands[2], kp);
+  }
 }
 
 }

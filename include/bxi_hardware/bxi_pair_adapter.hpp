@@ -79,6 +79,8 @@ private:
     std::array<double, 52> states{};
     std::array<double, 12> raw{}, target{}, previous{}, delta{}, velocity{}, torque{};
     std::array<double, 12> raw_velocity{}, target_velocity{}, torque_with_kd{};
+    std::array<double, 12> command{};
+    std::array<bool, 12> torque_limited{};
     std::array<unsigned, 12> deviation_count{};
     std::array<uint64_t, 4> previous_g{}, candidate_g{};
     Attempt normal{}, release{};

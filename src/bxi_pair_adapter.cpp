@@ -252,7 +252,7 @@ bool BxiPairAdapter::writeBatch(Row & row, bool release)
     }
     for (size_t a = 0; a < hardware_group.axes; ++a) {
       const auto axis = hardware_group.first + a;
-      const double position = release ? row.states[hardware_group.state + 4 * a] : row.target[axis];
+      const double position = release ? row.states[hardware_group.state + 4 * a] : row.command[axis];
       if (!std::isfinite(position) || position < limits_[axis].position_min ||
         position > limits_[axis].position_max)
       {
@@ -269,7 +269,7 @@ bool BxiPairAdapter::writeBatch(Row & row, bool release)
       const auto axis = hardware_group.first + a;
       const bool zero = release || hardware_group.generation == 0;
       const double values[] = {release ? row.states[hardware_group.state + 4 *
-          a] : row.target[axis], zero ? 0. : row.target_velocity[axis], zero ? 0. : limits_[axis].kp, zero ? 0. : limits_[axis].kd,
+          a] : row.command[axis], zero ? 0. : row.target_velocity[axis], zero ? 0. : limits_[axis].kp, zero ? 0. : limits_[axis].kd,
         0.};
       for (size_t f = 0; f < 5;
         ++f)
@@ -361,7 +361,17 @@ BxiPairAdapter::Ret BxiPairAdapter::update_and_write_commands(
       row.delta[axis] = target - previous_[axis];
       row.velocity[axis] = std::abs(row.delta[axis]) / row.dt;
       row.torque[axis] = std::abs(joint_limits.kp * (target - position));
-      row.torque_with_kd[axis] = std::abs((boot ? 0. : joint_limits.kp) * (target - position) +
+      // Only the transmitted position is limited. Reference delta/deviation and
+      // previous_ continue to describe the unmodified upstream target.
+      double command = target;
+      if (!boot && joint_limits.kp > 0. && std::isfinite(target) && std::isfinite(position)) {
+        const double error_limit = joint_limits.torque / joint_limits.kp;
+        command = std::clamp(target, position - error_limit, position + error_limit);
+        command = std::clamp(command, joint_limits.position_min, joint_limits.position_max);
+      }
+      row.command[axis] = command;
+      row.torque_limited[axis] = command != target;
+      row.torque_with_kd[axis] = std::abs((boot ? 0. : joint_limits.kp) * (command - position) +
         (boot ? 0. : joint_limits.kd) * (row.target_velocity[axis] - row.states[hardware_group.state + 4 * a + 1]));
       if (!std::isfinite(target) || target < joint_limits.position_min ||
         target > joint_limits.position_max || !std::isfinite(position) ||
@@ -371,7 +381,6 @@ BxiPairAdapter::Ret BxiPairAdapter::update_and_write_commands(
         (std::abs(row.delta[axis]) > joint_limits.delta ||
         row.velocity[axis] > joint_limits.velocity))
         row.reason = 6;
-      if (!boot && row.torque[axis] > joint_limits.torque) row.reason = 7;
       if (std::abs(target - position) > joint_limits.deviation) {
         if (deviation_count_[axis] < joint_limits.cycles) ++deviation_count_[axis];
       } else deviation_count_[axis] = 0;
@@ -388,6 +397,13 @@ BxiPairAdapter::Ret BxiPairAdapter::update_and_write_commands(
   if (!row.reason && !writeBatch(row, false)) row.reason = 10;
   if (row.reason) {
     terminal_ = true;
+    for (size_t h = 0; h < group_count_; ++h) {
+      const auto & group = groups_[h];
+      for (size_t a = 0; a < group.axes; ++a) {
+        row.command[group.first + a] = row.states[group.state + 4 * a];
+        row.torque_limited[group.first + a] = false;
+      }
+    }
     row.target_velocity.fill(0.);
     row.torque_with_kd.fill(0.);
     writeBatch(row, true);
@@ -434,7 +450,7 @@ void BxiPairAdapter::save() noexcept
     cycles <<
       "schema_version,activation,cycle,start_ns,end_ns,period,reason,state_ok,reference_ok,dropped\n";
     joints <<
-      "cycle,axis,position,velocity,effort,temperature,reference_raw,target,previous,delta,delta_velocity,torque_proxy,deviation_count,reference_velocity_raw,target_velocity,torque_proxy_with_kd\n";
+      "cycle,axis,position,velocity,effort,temperature,reference_raw,target,previous,delta,delta_velocity,torque_proxy,deviation_count,reference_velocity_raw,target_velocity,torque_proxy_with_kd,command,torque_limited\n";
     groups <<
       "cycle,group,previous_g,candidate_g,accepted,commit_touched,release_missing,normal_set_ns,normal_read_ns,release_set_ns,release_read_ns\n";
     commands <<
@@ -454,11 +470,11 @@ void BxiPairAdapter::save() noexcept
       ++h)
       manifest << "hardware," << h << ',' << groups_[h].name << ',' << groups_[h].gpio << '\n';
     manifest << "row_bytes,0,Row," << sizeof(Row) << "\ncapacity,0,rows," << rows_.size() << '\n';
-    // Reason 3 is retained for compatibility but is no longer emitted.
+    // Reasons 3 and 7 are retained for compatibility but are no longer emitted.
     manifest <<
       "reason,0,none,OK\nreason,1,state,unavailable\nreason,2,period,invalid\nreason,3,capacity,full\nreason,4,accepted,mismatch\nreason,5,position_or_reference,invalid\nreason,6,delta_or_velocity,exceeded\nreason,7,torque,exceeded\nreason,8,deviation,exceeded\nreason,9,temperature,exceeded\nreason,10,write_readback,failed\nreason,11,generation,exhausted\n";
     auto emit = [&](const Row & recorded_row){
-        cycles << 1 << ',' << recorded_row.activation << ',' << recorded_row.cycle << ',' <<
+        cycles << 2 << ',' << recorded_row.activation << ',' << recorded_row.cycle << ',' <<
           recorded_row.start << ',' << recorded_row.end << ',' << recorded_row.dt << ',' <<
           recorded_row.reason << ',' << recorded_row.state_ok << ',' << recorded_row.reference_ok <<
           ',' << dropped_ << '\n';
@@ -482,7 +498,8 @@ void BxiPairAdapter::save() noexcept
               recorded_row.previous[axis] << ',' << recorded_row.delta[axis] << ',' <<
               recorded_row.velocity[axis] << ',' << recorded_row.torque[axis] << ',' <<
               recorded_row.deviation_count[axis] << ',' << recorded_row.raw_velocity[axis] << ',' <<
-              recorded_row.target_velocity[axis] << ',' << recorded_row.torque_with_kd[axis] << '\n';
+              recorded_row.target_velocity[axis] << ',' << recorded_row.torque_with_kd[axis] << ',' <<
+              recorded_row.command[axis] << ',' << recorded_row.torque_limited[axis] << '\n';
           }
         }
         for (int a = 0; a < 2; ++a) {
