@@ -4,7 +4,7 @@
   <name>bxi_hardware</name>
   <version>0.1.0</version>
   <description>BXI モーター ros2_control ハードウェアIF（MIT制御 / SocketCAN）</description>
-  <maintainer email="hiratsuka31@gmail.com">mitz</maintainer>
+  <maintainer email="mitz@soraworks.jp">Sora Works Inc.</maintainer>
   <license>MIT</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
